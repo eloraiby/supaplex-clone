@@ -117,6 +117,15 @@ struct DecodedPng {
     pixels: Vec<u8>,
 }
 
+/// Treatment applied to black source pixels before an image becomes an SDL texture.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum BlackPixelPolicy {
+    /// Preserve opaque black so a rectangular DOS blit can erase prior artwork.
+    Opaque,
+    /// Convert black to zero alpha for modern overlay-only atlas rendering.
+    Transparent,
+}
+
 /// Textures and mapping logic needed to draw one game snapshot.
 pub struct Renderer<'textures> {
     /// Repacked actor sprite atlas loaded from `RocksSP.png`.
@@ -137,9 +146,30 @@ impl<'textures> Renderer<'textures> {
     pub fn new(
         texture_creator: &'textures TextureCreator<WindowContext>,
     ) -> Result<Self, RenderError> {
-        let sprites = load_texture(texture_creator, ROCKS_SP_PNG, 512, 480, "RocksSP.png")?;
-        let moving = load_texture(texture_creator, MOVING_PNG, 320, 462, "assets/moving.png")?;
-        let font = load_texture(texture_creator, CHARS8_PNG, 512, 8, "assets/chars8.png")?;
+        let sprites = load_texture(
+            texture_creator,
+            ROCKS_SP_PNG,
+            512,
+            480,
+            "RocksSP.png",
+            BlackPixelPolicy::Transparent,
+        )?;
+        let moving = load_texture(
+            texture_creator,
+            MOVING_PNG,
+            320,
+            462,
+            "assets/moving.png",
+            BlackPixelPolicy::Opaque,
+        )?;
+        let font = load_texture(
+            texture_creator,
+            CHARS8_PNG,
+            512,
+            8,
+            "assets/chars8.png",
+            BlackPixelPolicy::Transparent,
+        )?;
 
         Ok(Self {
             sprites,
@@ -285,9 +315,12 @@ impl<'textures> Renderer<'textures> {
         frame: u8,
         camera: Camera,
     ) -> Result<(), RenderError> {
-        // Movement descriptors depend on the original target that was visible
-        // before its tile identity became Murphy. Restore that fixed backdrop;
-        // horizontal collection composites then draw transparently over it.
+        // The DOS level bitmap persisted between frames, so target pixels not
+        // yet reached by a narrow vertical descriptor remained visible. This
+        // stateless renderer must reconstruct that untouched target because its
+        // logical cell already contains Murphy from frame zero. MOVING.DAT is
+        // then copied opaquely over it: black pixels erase the traversed area,
+        // and every final movement rectangle covers the complete target cell.
         if let MurphyAnimation::Move { target, .. } = action {
             let background_tile = match target {
                 MurphyMoveTarget::Empty => None,
@@ -296,6 +329,8 @@ impl<'textures> Renderer<'textures> {
                 MurphyMoveTarget::RedDisk | MurphyMoveTarget::PlantedRedDisk => Some(20),
             };
             if let Some(tile) = background_tile {
+                // Draw only the semantic target cell. The following opaque
+                // descriptor supplies the already-consumed portions and Murphy.
                 let destination = Rect::new(
                     position.x as i32 * TILE_SIZE as i32 - camera.x,
                     position.y as i32 * TILE_SIZE as i32 - camera.y,
@@ -308,6 +343,8 @@ impl<'textures> Renderer<'textures> {
             }
         }
 
+        // Each descriptor is a complete opaque rectangle rather than a
+        // transparent sprite layer, exactly matching the original byte copy.
         let parts = sprite_parts(action, frame);
         self.draw_murphy_part(canvas, position, parts.primary, camera)?;
         if let Some(secondary) = parts.secondary {
@@ -776,14 +813,17 @@ fn text_width(text: &str) -> u32 {
         .saturating_mul(FONT_CELL_SIZE * FONT_SCALE)
 }
 
-/// Loads one RGBA PNG, applies the DOS black colorkey, and uploads a texture.
+/// Loads one RGBA PNG, applies its requested black-pixel policy, and uploads it.
 fn load_texture<'textures>(
     texture_creator: &'textures TextureCreator<WindowContext>,
     png_bytes: &[u8],
     expected_width: u32,
     expected_height: u32,
     asset_name: &'static str,
+    black_pixel_policy: BlackPixelPolicy,
 ) -> Result<Texture<'textures>, RenderError> {
+    // Validate the decoded geometry before applying any pixel transformation so
+    // malformed embedded resources report their dimensions without mutation.
     let mut image = decode_png(png_bytes)?;
     if image.width != expected_width || image.height != expected_height {
         return Err(RenderError::UnexpectedDimensions {
@@ -795,10 +835,35 @@ fn load_texture<'textures>(
         });
     }
 
-    // The supplied artwork is fully opaque even though black is its intended
-    // transparent colorkey. Removing black permits moving sprites to interpolate
-    // over the cleared board without drawing a travelling black rectangle.
-    let (pixels, remainder) = image.pixels.as_chunks_mut::<4>();
+    // MOVING.DAT requires opaque black because each frame was historically a
+    // rectangular byte copy. Atlas and font images remain overlay-oriented and
+    // use the modern colorkey behavior selected by their caller.
+    apply_black_pixel_policy(&mut image.pixels, black_pixel_policy);
+
+    // Upload the transformed straight-alpha bytes without filtering; the
+    // logical-size canvas supplies the only integer enlargement afterwards.
+    let mut texture = texture_creator
+        .create_texture_streaming(PixelFormatEnum::RGBA32, image.width, image.height)
+        .map_err(|error| RenderError::Sdl(error.to_string()))?;
+    texture
+        .update(None, &image.pixels, image.width as usize * 4)
+        .map_err(|error| RenderError::Sdl(error.to_string()))?;
+    texture.set_blend_mode(BlendMode::Blend);
+    Ok(texture)
+}
+
+/// Applies opaque-copy or black-colorkey semantics to tightly packed RGBA pixels.
+fn apply_black_pixel_policy(pixels: &mut [u8], policy: BlackPixelPolicy) {
+    // Opaque images already carry the alpha bytes emitted by the asset
+    // converter. Leaving them untouched preserves black as active erase data.
+    if policy == BlackPixelPolicy::Opaque {
+        return;
+    }
+
+    // Transparent images use pure black as their colorkey. Colored pixels keep
+    // their original alpha so this transformation remains safe for a future
+    // asset containing deliberately translucent non-black artwork.
+    let (pixels, remainder) = pixels.as_chunks_mut::<4>();
     debug_assert!(
         remainder.is_empty(),
         "RGBA image must contain complete pixels"
@@ -808,15 +873,6 @@ fn load_texture<'textures>(
             pixel[3] = 0;
         }
     }
-
-    let mut texture = texture_creator
-        .create_texture_streaming(PixelFormatEnum::RGBA32, image.width, image.height)
-        .map_err(|error| RenderError::Sdl(error.to_string()))?;
-    texture
-        .update(None, &image.pixels, image.width as usize * 4)
-        .map_err(|error| RenderError::Sdl(error.to_string()))?;
-    texture.set_blend_mode(BlendMode::Blend);
-    Ok(texture)
 }
 
 /// Decodes one embedded PNG and requires a tightly packed RGBA8 output frame.
@@ -1185,9 +1241,10 @@ mod tests {
     //! Pure mapping and decoding tests that do not initialize SDL video.
 
     use super::{
-        ATLAS_COLUMNS, ATLAS_ROWS, CHARS8_PNG, MOVING_PNG, ROCKS_SP_PNG, bug_sprite, decode_png,
-        electron_sprite_part, gravity_sprite_part, infotron_moving_sprite, murphy_movement_offset,
-        ping_pong, snik_snak_sprite_part, static_sprite, zonk_moving_sprite,
+        ATLAS_COLUMNS, ATLAS_ROWS, BlackPixelPolicy, CHARS8_PNG, MOVING_PNG, ROCKS_SP_PNG,
+        apply_black_pixel_policy, bug_sprite, decode_png, electron_sprite_part,
+        gravity_sprite_part, infotron_moving_sprite, murphy_movement_offset, ping_pong,
+        snik_snak_sprite_part, static_sprite, zonk_moving_sprite,
     };
     use crate::actor::{
         Actor, AnimationKind, Direction, EnemyTurn, Infotron, MurphyAnimation, MurphyMoveTarget,
@@ -1204,6 +1261,73 @@ mod tests {
         assert_eq!((sprites.width, sprites.height), (512, 480));
         assert_eq!((moving.width, moving.height), (320, 462));
         assert_eq!((font.width, font.height), (512, 8));
+    }
+
+    /// Confirms opaque DOS copies and transparent overlays treat black differently.
+    #[test]
+    fn black_pixel_policy_preserves_moving_erase_pixels() {
+        let source = [0, 0, 0, 255, 12, 34, 56, 192];
+        let mut opaque = source;
+        let mut transparent = source;
+
+        // Opaque moving frames use black to erase the previously drawn target,
+        // while overlay atlases discard only pure black and retain colored alpha.
+        apply_black_pixel_policy(&mut opaque, BlackPixelPolicy::Opaque);
+        apply_black_pixel_policy(&mut transparent, BlackPixelPolicy::Transparent);
+
+        assert_eq!(opaque, source);
+        assert_eq!(transparent, [0, 0, 0, 0, 12, 34, 56, 192]);
+    }
+
+    /// Confirms every completed Base-eating rectangle carries opaque black background pixels.
+    #[test]
+    fn final_base_movement_frames_contain_opaque_erase_data() {
+        let mut moving = decode_png(MOVING_PNG).expect("MOVING.DAT conversion should decode");
+        apply_black_pixel_policy(&mut moving.pixels, BlackPixelPolicy::Opaque);
+        let variants = [
+            (Direction::Up, true),
+            (Direction::Up, false),
+            (Direction::Right, false),
+            (Direction::Down, true),
+            (Direction::Down, false),
+            (Direction::Left, true),
+        ];
+
+        for (direction, looking_left) in variants {
+            let action = MurphyAnimation::Move {
+                direction,
+                target: MurphyMoveTarget::Base,
+                looking_left,
+            };
+            let part = crate::murphy_animation::sprite_parts(action, 7).primary;
+
+            // The renderer may reconstruct Base pixels outside the descriptor
+            // during earlier frames, but the final opaque rectangle must span
+            // the entire logical target so none can survive underneath it.
+            assert!(part.offset_x <= 0);
+            assert!(part.offset_y <= 0);
+            assert!(part.offset_x + part.width as i32 >= 16);
+            assert!(part.offset_y + part.height as i32 >= 16);
+
+            // Search only the final descriptor rectangle. At least one opaque
+            // black pixel must survive so copying this frame can cover the
+            // consumed Base rather than reveal a synthetic tile underneath.
+            let mut opaque_black_pixels = 0;
+            for y in part.source.y..part.source.y + part.height as i32 {
+                for x in part.source.x..part.source.x + part.width as i32 {
+                    let pixel_index = (y as usize * moving.width as usize + x as usize) * 4;
+                    let pixel = &moving.pixels[pixel_index..pixel_index + 4];
+                    if pixel == [0, 0, 0, 255] {
+                        opaque_black_pixels += 1;
+                    }
+                }
+            }
+
+            assert!(
+                opaque_black_pixels > 0,
+                "final {direction:?} Base frame must retain black erase pixels"
+            );
+        }
     }
 
     /// Confirms every serialized tile maps inside the 16×15 atlas grid.
