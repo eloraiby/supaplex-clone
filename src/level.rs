@@ -64,7 +64,7 @@ impl<'bytes> LevelSet<'bytes> {
     pub fn level_count(self) -> Result<usize, LevelError> {
         // Partial records are rejected instead of ignored because their
         // presence normally means the source data was truncated.
-        if self.bytes.len() % LEVEL_RECORD_SIZE != 0 {
+        if !self.bytes.len().is_multiple_of(LEVEL_RECORD_SIZE) {
             return Err(LevelError::InvalidFileSize(self.bytes.len()));
         }
 
@@ -145,7 +145,7 @@ impl Level {
             // The original coordinate is twice the row-major cell index and is
             // stored in big-endian byte order. Odd values cannot name a cell.
             let encoded_position = u16::from_be_bytes([port_bytes[0], port_bytes[1]]);
-            if encoded_position % 2 != 0 {
+            if !encoded_position.is_multiple_of(2) {
                 return Err(LevelError::InvalidSpecialPortPosition(encoded_position));
             }
 
