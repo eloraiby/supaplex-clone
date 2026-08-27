@@ -5,6 +5,7 @@ use std::{process::ExitCode, time::Duration};
 use sdl2::{event::Event, keyboard::Scancode};
 use supaplex_clone::{
     actor::Direction,
+    audio::AudioPlayer,
     cli::Options,
     game::{Game, GameStatus, Input},
     level::{Level, LevelSet},
@@ -80,6 +81,19 @@ fn run(level: &Level, level_number: usize) -> Result<(), String> {
         .event_pump()
         .map_err(|error| format!("create SDL2 event pump: {error}"))?;
     let mut game = Game::new(level).map_err(|error| error.to_string())?;
+    let mut audio = match sdl
+        .audio()
+        .map_err(|error| format!("initialize SDL2 audio: {error}"))
+        .and_then(|subsystem| AudioPlayer::new(&subsystem))
+    {
+        Ok(audio) => Some(audio),
+        Err(error) => {
+            // Missing devices are common over remote sessions. Gameplay stays
+            // available, while stderr still explains why audio was disabled.
+            eprintln!("audio disabled: {error}");
+            None
+        }
+    };
 
     // The DOS game and the SpeedFix reference timing both advance gameplay at
     // thirty-five iterations per second.  Keep this as an integer nanosecond
@@ -124,6 +138,21 @@ fn run(level: &Level, level_number: usize) -> Result<(), String> {
                     game.restart(level).map_err(|error| error.to_string())?;
                     accumulator = Duration::ZERO;
                 }
+                Event::KeyDown {
+                    scancode: Some(Scancode::S),
+                    repeat: false,
+                    ..
+                } => {
+                    // Toggling affects only effects; music receives its own M
+                    // control once the independent looping voice is installed.
+                    if let Some(audio) = audio.as_mut() {
+                        let enabled = audio.toggle_effects();
+                        eprintln!(
+                            "sound effects {}",
+                            if enabled { "enabled" } else { "muted" }
+                        );
+                    }
+                }
                 _ => {}
             }
         }
@@ -136,6 +165,17 @@ fn run(level: &Level, level_number: usize) -> Result<(), String> {
                 action: keyboard.is_scancode_pressed(Scancode::Space),
             };
             game.tick(input);
+            if let Some(audio) = audio.as_mut() {
+                // Drain after every simulation step so catch-up frames retain
+                // actor event order before the original priority gate runs.
+                for effect in game.take_sound_effects() {
+                    audio.play(effect);
+                }
+            } else {
+                // A headless session must still discard requests instead of
+                // letting an unused queue grow for the lifetime of the level.
+                game.take_sound_effects();
+            }
             accumulator -= STEP;
             processed_steps += 1;
         }

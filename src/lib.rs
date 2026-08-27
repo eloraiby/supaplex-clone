@@ -4,6 +4,7 @@
 //! be tested without opening a window. The binary is a thin SDL2 adapter.
 
 pub mod actor;
+pub mod audio;
 pub mod cli;
 pub mod dat_graphics;
 pub mod game;
