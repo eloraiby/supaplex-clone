@@ -93,6 +93,110 @@ impl Direction {
     }
 }
 
+/// Material Murphy crosses or consumes during one cell-to-cell animation.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum MurphyMoveTarget {
+    /// Ordinary empty space, including a cell reached by gravity.
+    Empty,
+    /// Diggable Base or a safe Bug that has already reverted to Base.
+    Base,
+    /// A required Infotron collected when the movement finishes.
+    Infotron,
+    /// A loose Red Disk collected when the movement finishes.
+    RedDisk,
+    /// The already planted fuse crossed without adding it to inventory.
+    PlantedRedDisk,
+}
+
+/// Material Murphy removes without leaving his current cell.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum MurphySnapTarget {
+    /// Diggable Base or a safe Bug represented by the Base-eating sequence.
+    Base,
+    /// A required Infotron represented by the seven-frame collection sequence.
+    Infotron,
+    /// A loose Red Disk represented by the original Red Disk sequence.
+    RedDisk,
+}
+
+/// Pushable actor represented by one of Murphy's dedicated push sequences.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum MurphyPushTarget {
+    /// A Zonk, which can only be pushed horizontally.
+    Zonk,
+    /// A Yellow Disk, which can be pushed in all four directions.
+    YellowDisk,
+    /// An Orange Disk, which can only be pushed horizontally.
+    OrangeDisk,
+}
+
+/// One original Murphy animation descriptor selected by action context.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum MurphyAnimation {
+    /// Movement into an adjacent cell, retaining both material and side-facing.
+    Move {
+        /// Direction in which Murphy enters the destination cell.
+        direction: Direction,
+        /// Material that determines the appropriate eating/collection artwork.
+        target: MurphyMoveTarget,
+        /// Horizontal pose retained while moving vertically.
+        looking_left: bool,
+    },
+    /// Stationary removal or collection of one adjacent cell.
+    Snap {
+        /// Direction from Murphy to the affected cell.
+        direction: Direction,
+        /// Material that determines the dedicated snapping strip.
+        target: MurphySnapTarget,
+    },
+    /// Movement that transfers one pushable actor into the following cell.
+    Push {
+        /// Direction in which Murphy and the pushed actor travel.
+        direction: Direction,
+        /// Actor that determines the Zonk, Yellow, or Orange artwork.
+        target: MurphyPushTarget,
+    },
+    /// Two-cell traversal through an intervening port.
+    Port {
+        /// Direction accepted by the port and used for the traversal pair.
+        direction: Direction,
+    },
+    /// Forty-frame disappearance played after entering an unlocked Exit.
+    Exit,
+    /// Sixty-four-tick hold-to-place Red Disk sequence.
+    PlantRedDisk,
+}
+
+impl MurphyAnimation {
+    /// Returns the exact number of original updates used by this action.
+    const fn frame_count(self) -> u8 {
+        match self {
+            // The original rightward Red Disk table deliberately contains a
+            // duplicated ninth coordinate. Retaining it is demo-compatible.
+            Self::Move {
+                direction: Direction::Right,
+                target: MurphyMoveTarget::RedDisk | MurphyMoveTarget::PlantedRedDisk,
+                ..
+            } => 9,
+            Self::Move { .. } | Self::Push { .. } | Self::Port { .. } => 8,
+            Self::Snap {
+                target: MurphySnapTarget::Infotron,
+                ..
+            } => 7,
+            Self::Snap { .. } => 8,
+            Self::Exit => 40,
+            // Planting is advanced by Murphy's hold-sensitive state machine,
+            // not by the generic finite-animation path.
+            Self::PlantRedDisk => 65,
+        }
+    }
+
+    /// Reports whether Murphy changes board cells when the action completes.
+    const fn changes_cell(self) -> bool {
+        matches!(self, Self::Move { .. } | Self::Port { .. })
+    }
+}
+
 /// Visual family used to select a frame from the sprite atlas.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum AnimationKind {
@@ -106,10 +210,12 @@ pub enum AnimationKind {
     Moving(Direction),
     /// A rounded actor entering its current cell diagonally from the row above.
     Rolling(Direction),
-    /// Murphy entering a cell from two cells away through an intervening port.
-    PortTraversal(Direction),
-    /// Murphy acting on an adjacent cell without changing cells.
-    Snapping(Direction),
+    /// A direction-, target-, and facing-specific original Murphy sequence.
+    Murphy(MurphyAnimation),
+    /// Pushable actor temporarily locked while Murphy prepares or pushes it.
+    MurphyPushTarget,
+    /// Empty destination reserved for a Murphy push or port traversal.
+    MurphyDestination,
     /// A Bug's fourteen-frame lethal spark cycle.
     Bug,
     /// A safe Bug waiting an independently randomized number of quarter ticks.
@@ -141,6 +247,27 @@ enum AnimationNext {
     BeginZonkFall,
     /// Give completed movement back to Murphy, settling if there is no input.
     ResumeMurphy,
+    /// Remove an adjacent target and apply collection effects after snapping.
+    FinishMurphySnap {
+        /// Direction from Murphy to the reserved target cell.
+        direction: Direction,
+        /// Target identity used to choose the completion side effect.
+        target: MurphySnapTarget,
+    },
+    /// Transfer Murphy and one reserved pushable actor after its last frame.
+    FinishMurphyPush {
+        /// Direction of both cell transfers.
+        direction: Direction,
+        /// Persistent actor identity written into the reserved destination.
+        target: MurphyPushTarget,
+    },
+    /// Transfer Murphy two cells and apply special-port settings at completion.
+    FinishMurphyPort {
+        /// Direction from the current cell through the intervening port.
+        direction: Direction,
+    },
+    /// Enter the post-completion sequence after the Exit animation finishes.
+    FinishMurphyExit,
     /// Ask the game session to choose this Bug's next dormant duration.
     RandomizeBug,
     /// Return a dormant Bug to lethal active frame zero.
@@ -194,10 +321,15 @@ impl Animation {
 
     /// Creates a synchronized, invisible reservation for a movement source.
     fn vacating(direction: Direction) -> Self {
+        Self::vacating_for(direction, MOVEMENT_FRAMES)
+    }
+
+    /// Creates a source reservation synchronized to a caller-owned duration.
+    fn vacating_for(direction: Direction, frame_count: u8) -> Self {
         Self {
             kind: AnimationKind::Vacating(direction),
             frame: 0,
-            frame_count: MOVEMENT_FRAMES,
+            frame_count: frame_count.max(1),
             next: AnimationNext::Release,
         }
     }
@@ -222,40 +354,112 @@ impl Animation {
         }
     }
 
-    /// Creates interpolation frames for Murphy's two-cell port traversal.
-    fn port_traversal(direction: Direction) -> Self {
-        Self {
-            kind: AnimationKind::PortTraversal(direction),
-            frame: 0,
-            frame_count: MOVEMENT_FRAMES,
-            next: AnimationNext::Settle,
-        }
-    }
-
     /// Holds a completed movement's final pose until Murphy's next update.
     fn murphy_ready(kind: AnimationKind) -> Self {
         debug_assert!(
-            matches!(
-                kind,
-                AnimationKind::Moving(_) | AnimationKind::PortTraversal(_)
-            ),
+            matches!(kind, AnimationKind::Murphy(animation) if animation.changes_cell()),
             "only Murphy movement phases can become input-ready"
         );
+        let AnimationKind::Murphy(animation) = kind else {
+            unreachable!("the debug assertion validates the Murphy animation kind")
+        };
         Self {
             kind,
-            frame: MOVEMENT_FRAMES - 1,
-            frame_count: MOVEMENT_FRAMES,
+            frame: animation.frame_count() - 1,
+            frame_count: animation.frame_count(),
             next: AnimationNext::ResumeMurphy,
         }
     }
 
-    /// Creates a short non-moving Murphy action animation.
-    fn snapping(direction: Direction) -> Self {
+    /// Creates a target-specific Murphy movement using its original duration.
+    fn murphy_move(direction: Direction, target: MurphyMoveTarget, looking_left: bool) -> Self {
+        let action = MurphyAnimation::Move {
+            direction,
+            target,
+            looking_left,
+        };
         Self {
-            kind: AnimationKind::Snapping(direction),
+            kind: AnimationKind::Murphy(action),
             frame: 0,
-            frame_count: MOVEMENT_FRAMES,
+            frame_count: action.frame_count(),
             next: AnimationNext::Settle,
+        }
+    }
+
+    /// Creates a target-specific stationary Murphy action and completion rule.
+    fn murphy_snap(direction: Direction, target: MurphySnapTarget) -> Self {
+        let action = MurphyAnimation::Snap { direction, target };
+        Self {
+            kind: AnimationKind::Murphy(action),
+            frame: 0,
+            frame_count: action.frame_count(),
+            next: AnimationNext::FinishMurphySnap { direction, target },
+        }
+    }
+
+    /// Creates a push animation after the eight-tick hold requirement succeeds.
+    fn murphy_push(direction: Direction, target: MurphyPushTarget) -> Self {
+        let action = MurphyAnimation::Push { direction, target };
+        Self {
+            kind: AnimationKind::Murphy(action),
+            frame: 0,
+            frame_count: action.frame_count(),
+            next: AnimationNext::FinishMurphyPush { direction, target },
+        }
+    }
+
+    /// Creates the paired eight-frame passage through one port cell.
+    fn murphy_port(direction: Direction) -> Self {
+        let action = MurphyAnimation::Port { direction };
+        Self {
+            kind: AnimationKind::Murphy(action),
+            frame: 0,
+            frame_count: action.frame_count(),
+            next: AnimationNext::FinishMurphyPort { direction },
+        }
+    }
+
+    /// Creates the original forty-frame Exit disappearance at Murphy's source.
+    fn murphy_exit() -> Self {
+        let action = MurphyAnimation::Exit;
+        Self {
+            kind: AnimationKind::Murphy(action),
+            frame: 0,
+            frame_count: action.frame_count(),
+            next: AnimationNext::FinishMurphyExit,
+        }
+    }
+
+    /// Creates one hold-sensitive Red Disk placement pose at `elapsed` ticks.
+    fn murphy_plant(elapsed: u8) -> Self {
+        let action = MurphyAnimation::PlantRedDisk;
+        Self {
+            kind: AnimationKind::Murphy(action),
+            frame: elapsed.min(action.frame_count() - 1),
+            frame_count: action.frame_count(),
+            // Murphy intercepts this phase before generic advancement. Settle
+            // is a safe recovery promise for malformed internal states.
+            next: AnimationNext::Settle,
+        }
+    }
+
+    /// Creates a stable reservation that prevents a push target from updating.
+    fn murphy_push_target() -> Self {
+        Self {
+            kind: AnimationKind::MurphyPushTarget,
+            frame: 0,
+            frame_count: 1,
+            next: AnimationNext::Act,
+        }
+    }
+
+    /// Creates stable collision occupancy for an otherwise empty destination.
+    fn murphy_destination() -> Self {
+        Self {
+            kind: AnimationKind::MurphyDestination,
+            frame: 0,
+            frame_count: 1,
+            next: AnimationNext::Act,
         }
     }
 
@@ -329,7 +533,10 @@ impl Animation {
     const fn is_movement(&self) -> bool {
         matches!(
             self.kind,
-            AnimationKind::Moving(_) | AnimationKind::Rolling(_) | AnimationKind::PortTraversal(_)
+            AnimationKind::Moving(_) | AnimationKind::Rolling(_)
+        ) || matches!(
+            self.kind,
+            AnimationKind::Murphy(animation) if animation.changes_cell()
         )
     }
 
@@ -381,7 +588,13 @@ impl Animation {
     fn advance(&self) -> AnimationAdvance {
         // Idle is a stable state rather than a finite animation; actors in this
         // state are allowed to inspect their neighbors and choose new behavior.
-        if matches!(self.kind, AnimationKind::Idle | AnimationKind::Terminal) {
+        if matches!(
+            self.kind,
+            AnimationKind::Idle
+                | AnimationKind::Terminal
+                | AnimationKind::MurphyPushTarget
+                | AnimationKind::MurphyDestination
+        ) {
             return AnimationAdvance::Ready;
         }
 
@@ -432,6 +645,28 @@ impl State {
         Self::animated(Actor::Empty(Empty), Animation::vacating(direction))
     }
 
+    /// Creates a movement source whose release matches a Murphy action length.
+    fn vacating_for(direction: Direction, frame_count: u8) -> Self {
+        Self::animated(
+            Actor::Empty(Empty),
+            Animation::vacating_for(direction, frame_count),
+        )
+    }
+
+    /// Creates a stable non-empty reservation for a future Murphy destination.
+    fn murphy_destination() -> Self {
+        Self::animated(Actor::Empty(Empty), Animation::murphy_destination())
+    }
+
+    /// Retains a pushable actor while suppressing its own fall/update behavior.
+    fn murphy_push_target(actor: Actor) -> Self {
+        debug_assert!(matches!(
+            actor,
+            Actor::Zonk(_) | Actor::YellowDisk(_) | Actor::OrangeDisk(_)
+        ));
+        Self::animated(actor, Animation::murphy_push_target())
+    }
+
     /// Returns this cell's actor identity and actor-specific fields.
     pub fn actor(&self) -> &Actor {
         &self.actor
@@ -460,7 +695,10 @@ impl State {
     /// Reports whether this state is unoccupied for collision purposes.
     pub fn is_empty(&self) -> bool {
         matches!(self.actor, Actor::Empty(_))
-            && !matches!(self.animation.kind, AnimationKind::Vacating(_))
+            && !matches!(
+                self.animation.kind,
+                AnimationKind::Vacating(_) | AnimationKind::MurphyDestination
+            )
     }
 
     /// Reports whether the actor is in its stable, non-moving phase.
@@ -581,36 +819,89 @@ impl Base {
     }
 }
 
-/// The player-controlled actor and its persistent facing direction.
+/// Hold-sensitive substate that cannot be represented by a free-running strip.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum MurphyPhase {
+    /// Murphy is available for ordinary movement and interaction input.
+    Ready,
+    /// A push target and its destination are reserved while direction is held.
+    PreparingPush {
+        /// Direction that must remain held until the preparation delay expires.
+        direction: Direction,
+        /// Reserved actor that determines both validation and final animation.
+        target: MurphyPushTarget,
+        /// Original counter after the initial update, counting from seven to zero.
+        remaining: u8,
+    },
+    /// Space-only Red Disk placement that can still be cancelled by releasing.
+    PlantingRedDisk {
+        /// Original counter after the initial update, counting from 63 to zero.
+        remaining: u8,
+    },
+}
+
+/// The player-controlled actor and all state retained between input updates.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct Murphy {
-    /// Direction used for the stationary sprite and Red Disk placement.
-    facing: Direction,
+    /// Original left/right look flag retained across vertical movement.
+    looking_left: bool,
+    /// Whether the last idle Murphy update observed no direction or Space key.
+    previous_input_was_none: bool,
+    /// Current hold-sensitive push or Red Disk preparation, if any.
+    phase: MurphyPhase,
 }
 
 impl Murphy {
     /// Creates Murphy facing right, matching the original starting pose.
     pub const fn new() -> Self {
         Self {
-            facing: Direction::Right,
+            looking_left: false,
+            previous_input_was_none: false,
+            phase: MurphyPhase::Ready,
         }
     }
 
-    /// Returns the direction Murphy most recently attempted to move.
+    /// Returns Murphy's retained horizontal pose as a conventional direction.
     pub const fn facing(self) -> Direction {
-        self.facing
+        if self.looking_left {
+            Direction::Left
+        } else {
+            Direction::Right
+        }
     }
 
     /// Interprets player intent against complete neighboring cell states.
     fn transition(&self, position: Position, world: &WorldView<'_>) -> Option<Transition> {
         let input = world.input();
 
+        // Push and planting delays are input-sensitive. They must be handled
+        // before generic animation advancement so releasing the required key
+        // cancels the reserved action on the exact original update.
+        match self.phase {
+            MurphyPhase::PreparingPush {
+                direction,
+                target,
+                remaining,
+            } => {
+                return Some(
+                    self.continue_push(position, direction, target, remaining, input, world),
+                );
+            }
+            MurphyPhase::PlantingRedDisk { remaining } => {
+                return Some(self.continue_plant(position, remaining, input));
+            }
+            MurphyPhase::Ready => {}
+        }
+
+        let input_is_none = input.direction.is_none() && !input.action;
+        let mut next_murphy = *self;
+        next_murphy.previous_input_was_none = input_is_none;
+
         // Original Murphy gravity rewrites unsupported input to Down. The only
         // exceptions are plain Up/Left/Right commands that eat Base, plus an
         // upward-capable port directly above Murphy that acts as a handhold.
         if self.is_pulled_by_gravity(position, world) {
             let base_exception = !input.action
-                && !input.drop_disk
                 && input.direction.is_some_and(|direction| {
                     direction != Direction::Down
                         && world
@@ -621,30 +912,165 @@ impl Murphy {
                             })
                 });
             if !base_exception {
-                return self.move_or_interact(position, Direction::Down, world);
+                return next_murphy.move_or_interact(position, Direction::Down, world);
             }
         }
 
-        // Space without a direction is the classic plant command; D is kept as
-        // an ergonomic one-shot alias. The game event records this exact cell,
-        // so the disk appears underneath Murphy only after he moves away.
-        let plant_disk = input.drop_disk || (input.action && input.direction.is_none());
-        if plant_disk && world.red_disks() > 0 && !world.has_active_red_disk() {
-            let murphy = State::animated(Actor::Murphy(*self), Animation::snapping(self.facing));
+        // The original accepts planting only after a completely input-free
+        // idle update. The first Space-only update installs countdown state one
+        // and immediately consumes the first of the 64 hold ticks.
+        if input.action
+            && input.direction.is_none()
+            && self.previous_input_was_none
+            && world.red_disks() > 0
+            && !world.has_active_red_disk()
+        {
+            next_murphy.previous_input_was_none = false;
+            next_murphy.phase = MurphyPhase::PlantingRedDisk { remaining: 0x3f };
+            let murphy = State::animated(Actor::Murphy(next_murphy), Animation::murphy_plant(1));
             return Some(Transition::new(
                 vec![CellWrite::new(position, murphy)],
-                vec![GameEvent::PlantRedDisk(position)],
+                vec![GameEvent::BeginPlantRedDisk(position)],
             ));
         }
 
         if let Some(direction) = input.direction {
+            next_murphy.previous_input_was_none = false;
             if input.action {
-                return self.snap(position, direction, world);
+                return next_murphy.snap(position, direction, world);
             }
-            return self.move_or_interact(position, direction, world);
+            return next_murphy.move_or_interact(position, direction, world);
         }
 
-        None
+        // Remember the release even though no visible actor action occurred;
+        // this latch is what permits a later Space-only placement command.
+        (next_murphy != *self)
+            .then(|| Transition::replace(position, State::new(Actor::Murphy(next_murphy))))
+    }
+
+    /// Advances or cancels the eight-update delay before a push animation.
+    fn continue_push(
+        &self,
+        position: Position,
+        direction: Direction,
+        target: MurphyPushTarget,
+        remaining: u8,
+        input: crate::game::Input,
+        world: &WorldView<'_>,
+    ) -> Transition {
+        let target_position = world.offset(position, direction);
+        let destination = target_position.and_then(|cell| world.offset(cell, direction));
+        let reservations_intact = target_position
+            .and_then(|cell| world.state(cell))
+            .is_some_and(|state| {
+                state.animation.kind == AnimationKind::MurphyPushTarget
+                    && pushed_actor_matches(state.actor(), target)
+            })
+            && destination
+                .and_then(|cell| world.state(cell))
+                .is_some_and(|state| {
+                    matches!(state.actor(), Actor::Empty(_))
+                        && state.animation.kind == AnimationKind::MurphyDestination
+                });
+        let still_holding = input.direction == Some(direction) && !input.action;
+
+        if reservations_intact && still_holding {
+            if remaining == 0 {
+                let mut moving = *self;
+                moving.phase = MurphyPhase::Ready;
+                return Transition::replace(
+                    position,
+                    State::animated(
+                        Actor::Murphy(moving),
+                        Animation::murphy_push(direction, target),
+                    ),
+                );
+            }
+
+            let mut waiting = *self;
+            waiting.phase = MurphyPhase::PreparingPush {
+                direction,
+                target,
+                remaining: remaining - 1,
+            };
+            return Transition::replace(position, State::new(Actor::Murphy(waiting)));
+        }
+
+        // Releasing or changing direction restores both reservations, unless a
+        // blast has already replaced either cell during the preparation delay.
+        let mut writes = Vec::with_capacity(3);
+        let mut cancelled = *self;
+        cancelled.phase = MurphyPhase::Ready;
+        cancelled.previous_input_was_none = input.direction.is_none() && !input.action;
+        writes.push(CellWrite::new(
+            position,
+            State::new(Actor::Murphy(cancelled)),
+        ));
+        if let Some(target_position) = target_position.filter(|cell| {
+            world.state(*cell).is_some_and(|state| {
+                state.animation.kind == AnimationKind::MurphyPushTarget
+                    && pushed_actor_matches(state.actor(), target)
+            })
+        }) {
+            writes.push(CellWrite::new(
+                target_position,
+                State::new(actor_for_push_target(target)),
+            ));
+        }
+        if let Some(destination) = destination.filter(|cell| {
+            world.state(*cell).is_some_and(|state| {
+                matches!(state.actor(), Actor::Empty(_))
+                    && state.animation.kind == AnimationKind::MurphyDestination
+            })
+        }) {
+            writes.push(CellWrite::new(destination, State::empty()));
+        }
+        Transition::new(writes, Vec::new())
+    }
+
+    /// Advances, completes, or cancels the 64-update Space-only plant action.
+    fn continue_plant(
+        &self,
+        position: Position,
+        remaining: u8,
+        input: crate::game::Input,
+    ) -> Transition {
+        let still_holding = input.action && input.direction.is_none();
+        if !still_holding {
+            let mut cancelled = *self;
+            cancelled.phase = MurphyPhase::Ready;
+            cancelled.previous_input_was_none = input.direction.is_none() && !input.action;
+            return Transition::new(
+                vec![CellWrite::new(
+                    position,
+                    State::new(Actor::Murphy(cancelled)),
+                )],
+                vec![GameEvent::CancelPlantRedDisk],
+            );
+        }
+
+        if remaining == 0 {
+            let mut completed = *self;
+            completed.phase = MurphyPhase::Ready;
+            completed.previous_input_was_none = false;
+            return Transition::new(
+                vec![CellWrite::new(
+                    position,
+                    State::new(Actor::Murphy(completed)),
+                )],
+                vec![GameEvent::FinishPlantRedDisk],
+            );
+        }
+
+        let mut planting = *self;
+        planting.phase = MurphyPhase::PlantingRedDisk {
+            remaining: remaining - 1,
+        };
+        let elapsed = 0x40 - (remaining - 1);
+        Transition::replace(
+            position,
+            State::animated(Actor::Murphy(planting), Animation::murphy_plant(elapsed)),
+        )
     }
 
     /// Reports whether gravity must override Murphy's current player command.
@@ -680,27 +1106,32 @@ impl Murphy {
     ) -> Option<Transition> {
         let target = world.offset(position, direction)?;
         let target_state = world.state(target)?;
-        let mut events = Vec::new();
-
-        match target_state.actor() {
-            Actor::Base(_) => {}
-            Actor::Bug(_) if !world.is_bug_active(target) => {}
+        let target_kind = match target_state.actor() {
+            Actor::Base(_) => MurphySnapTarget::Base,
+            Actor::Bug(_) if !world.is_bug_active(target) => MurphySnapTarget::Base,
             Actor::Bug(_) => return Some(explode_at(world, position, false)),
-            Actor::Infotron(_) => events.push(GameEvent::CollectInfotron),
-            Actor::RedDisk(_) if target_state.is_idle() => events.push(GameEvent::CollectRedDisk),
+            Actor::Infotron(_) => MurphySnapTarget::Infotron,
+            Actor::RedDisk(_) if target_state.is_idle() => MurphySnapTarget::RedDisk,
             _ => return None,
-        }
+        };
 
-        // The source animation and target removal share one transition so no
-        // later actor observes only half of the completed snap action.
-        let actor = Actor::Murphy(Self { facing: direction });
-        let state = State::animated(actor, Animation::snapping(direction));
+        // Preserve the target throughout the strip. Its reserved animation
+        // prevents row-major actor scheduling, and collection/removal happens
+        // only when Murphy reaches the last original coordinate.
+        let actor = Actor::Murphy(self.looking(direction));
+        let state = State::animated(actor, Animation::murphy_snap(direction, target_kind));
         Some(Transition::new(
             vec![
                 CellWrite::new(position, state),
-                CellWrite::new(target, State::empty()),
+                CellWrite::new(
+                    target,
+                    State::animated(
+                        target_state.actor().clone(),
+                        Animation::murphy_push_target(),
+                    ),
+                ),
             ],
-            events,
+            Vec::new(),
         ))
     }
 
@@ -713,101 +1144,101 @@ impl Murphy {
     ) -> Option<Transition> {
         let target = world.offset(position, direction)?;
         let target_state = world.state(target)?;
-        let murphy_actor = Actor::Murphy(Self { facing: direction });
+        let moving_murphy = self.looking(direction);
+        let murphy_actor = Actor::Murphy(moving_murphy);
+        let looking_left = moving_murphy.looking_left;
 
         match target_state.actor() {
             // An Empty actor can still be a synchronized `Vacating` collision
             // reservation. Consult the complete State before entering it;
             // matching only the actor identity would let Murphy cut through a
             // rock's or Infotron's still-active source animation.
-            Actor::Empty(_) if target_state.is_empty() => Some(Transition::move_actor(
+            Actor::Empty(_) if target_state.is_empty() => Some(Transition::move_murphy(
                 position,
                 target,
                 murphy_actor,
                 direction,
+                MurphyMoveTarget::Empty,
+                looking_left,
             )),
-            Actor::Base(_) => Some(Transition::move_actor(
+            Actor::Base(_) => Some(Transition::move_murphy(
                 position,
                 target,
                 murphy_actor,
                 direction,
+                MurphyMoveTarget::Base,
+                looking_left,
             )),
             Actor::Bug(_) if world.is_bug_active(target) => {
                 Some(explode_at(world, position, false))
             }
-            Actor::Bug(_) => Some(Transition::move_actor(
+            Actor::Bug(_) => Some(Transition::move_murphy(
                 position,
                 target,
                 murphy_actor,
                 direction,
+                MurphyMoveTarget::Base,
+                looking_left,
             )),
-            Actor::Infotron(_) => Some(Transition::move_actor_with_events(
+            Actor::Infotron(_) => Some(Transition::move_murphy(
                 position,
                 target,
                 murphy_actor,
                 direction,
-                vec![GameEvent::CollectInfotron],
+                MurphyMoveTarget::Infotron,
+                looking_left,
             )),
             Actor::RedDisk(_) if world.is_active_red_disk(target) => {
                 // A planted disk is position-owned rather than collectible.
                 // Murphy may cover it, and the game-level fuse keeps ticking.
-                Some(Transition::move_actor(
+                Some(Transition::move_murphy(
                     position,
                     target,
                     murphy_actor,
                     direction,
+                    MurphyMoveTarget::PlantedRedDisk,
+                    looking_left,
                 ))
             }
-            Actor::RedDisk(_) if target_state.is_idle() => {
-                Some(Transition::move_actor_with_events(
-                    position,
-                    target,
-                    murphy_actor,
-                    direction,
-                    vec![GameEvent::CollectRedDisk],
-                ))
-            }
+            Actor::RedDisk(_) if target_state.is_idle() => Some(Transition::move_murphy(
+                position,
+                target,
+                murphy_actor,
+                direction,
+                MurphyMoveTarget::RedDisk,
+                looking_left,
+            )),
             Actor::Exit(_) if world.remaining_infotrons() == 0 => Some(Transition::new(
                 vec![CellWrite::new(
                     position,
-                    State::animated(murphy_actor, Animation::snapping(direction)),
+                    State::animated(murphy_actor, Animation::murphy_exit()),
                 )],
-                vec![GameEvent::Completed],
+                Vec::new(),
             )),
-            Actor::Zonk(_) if direction.is_horizontal() && target_state.is_idle() => self.push(
+            Actor::Zonk(_) if direction.is_horizontal() && target_state.is_idle() => {
+                self.prepare_push(position, target, direction, world, MurphyPushTarget::Zonk)
+            }
+            Actor::YellowDisk(_) if target_state.is_idle() => self.prepare_push(
                 position,
                 target,
                 direction,
-                murphy_actor,
                 world,
-                Actor::Zonk(Zonk::resting()),
-            ),
-            Actor::YellowDisk(_) if target_state.is_idle() => self.push(
-                position,
-                target,
-                direction,
-                murphy_actor,
-                world,
-                Actor::YellowDisk(YellowDisk),
+                MurphyPushTarget::YellowDisk,
             ),
             Actor::OrangeDisk(_) if direction.is_horizontal() && target_state.is_idle() => self
-                .push(
+                .prepare_push(
                     position,
                     target,
                     direction,
-                    murphy_actor,
                     world,
-                    Actor::OrangeDisk(OrangeDisk::resting()),
+                    MurphyPushTarget::OrangeDisk,
                 ),
             Actor::Port(port) if port.allows(direction) => {
                 self.cross_port(position, target, direction, murphy_actor, *port, world)
             }
             Actor::Terminal(terminal) if !terminal.is_activated() => Some(Transition::new(
                 vec![
-                    CellWrite::new(
-                        position,
-                        State::animated(murphy_actor, Animation::snapping(direction)),
-                    ),
+                    CellWrite::new(position, State::new(murphy_actor)),
                     // Preserve this panel's independently randomized wait and
                     // visible scroll phase when the level-wide latch is set.
                     CellWrite::new(target, State::new(Actor::Terminal(terminal.activate()))),
@@ -825,31 +1256,34 @@ impl Murphy {
         }
     }
 
-    /// Atomically pushes one eligible actor and moves Murphy into its old cell.
-    fn push(
+    /// Reserves a push target and destination before the original hold delay.
+    fn prepare_push(
         &self,
         position: Position,
         target: Position,
         direction: Direction,
-        murphy_actor: Actor,
         world: &WorldView<'_>,
-        pushed_actor: Actor,
+        pushed_target: MurphyPushTarget,
     ) -> Option<Transition> {
         let destination = world.offset(target, direction)?;
         if !world.is_empty(destination) {
             return None;
         }
 
+        let mut preparing = self.looking(direction);
+        preparing.phase = MurphyPhase::PreparingPush {
+            direction,
+            target: pushed_target,
+            // The initiating call decrements the original value eight to seven.
+            remaining: 7,
+        };
         let writes = vec![
-            CellWrite::new(position, State::vacating(direction)),
+            CellWrite::new(position, State::new(Actor::Murphy(preparing))),
             CellWrite::new(
                 target,
-                State::animated(murphy_actor, Animation::moving(direction)),
+                State::murphy_push_target(actor_for_push_target(pushed_target)),
             ),
-            CellWrite::new(
-                destination,
-                State::animated(pushed_actor, Animation::moving(direction)),
-            ),
+            CellWrite::new(destination, State::murphy_destination()),
         ];
 
         Some(Transition::new(writes, Vec::new()))
@@ -862,7 +1296,7 @@ impl Murphy {
         port_position: Position,
         direction: Direction,
         murphy_actor: Actor,
-        port: Port,
+        _port: Port,
         world: &WorldView<'_>,
     ) -> Option<Transition> {
         let destination = world.offset(port_position, direction)?;
@@ -870,25 +1304,51 @@ impl Murphy {
             return None;
         }
 
-        let mut events = Vec::new();
-        if port.special
-            && let Some(settings) = world.special_port(port_position)
-        {
-            events.push(GameEvent::ApplySpecialPort(*settings));
-        }
-
-        // The port remains unchanged between the source and destination writes.
+        // Murphy remains logically at the source until frame eight. The empty
+        // cell beyond the port is reserved so no falling actor can enter it;
+        // special-port metadata is deliberately deferred to completion.
         Some(Transition::new(
             vec![
-                CellWrite::new(position, State::vacating(direction)),
                 CellWrite::new(
-                    destination,
-                    State::animated(murphy_actor, Animation::port_traversal(direction)),
+                    position,
+                    State::animated(murphy_actor, Animation::murphy_port(direction)),
                 ),
+                CellWrite::new(destination, State::murphy_destination()),
             ],
-            events,
+            Vec::new(),
         ))
     }
+
+    /// Updates only the horizontal look flag when input points left or right.
+    const fn looking(mut self, direction: Direction) -> Self {
+        if matches!(direction, Direction::Left) {
+            self.looking_left = true;
+        } else if matches!(direction, Direction::Right) {
+            self.looking_left = false;
+        }
+        self.previous_input_was_none = false;
+        self.phase = MurphyPhase::Ready;
+        self
+    }
+}
+
+/// Reconstructs the stable actor stored behind one push-target discriminator.
+fn actor_for_push_target(target: MurphyPushTarget) -> Actor {
+    match target {
+        MurphyPushTarget::Zonk => Actor::Zonk(Zonk::resting()),
+        MurphyPushTarget::YellowDisk => Actor::YellowDisk(YellowDisk),
+        MurphyPushTarget::OrangeDisk => Actor::OrangeDisk(OrangeDisk::resting()),
+    }
+}
+
+/// Validates that a reserved cell still contains the expected pushed actor.
+fn pushed_actor_matches(actor: &Actor, target: MurphyPushTarget) -> bool {
+    matches!(
+        (actor, target),
+        (Actor::Zonk(_), MurphyPushTarget::Zonk)
+            | (Actor::YellowDisk(_), MurphyPushTarget::YellowDisk)
+            | (Actor::OrangeDisk(_), MurphyPushTarget::OrangeDisk)
+    )
 }
 
 impl Default for Murphy {
@@ -1449,6 +1909,21 @@ impl Actor {
         position: Position,
         world: &WorldView<'_>,
     ) -> Option<Transition> {
+        // A planting Murphy owns a hold-sensitive counter. Generic animation
+        // advancement would make Space release unable to cancel the operation,
+        // so this phase delegates directly to the actor state machine.
+        if let Self::Murphy(murphy) = self
+            && matches!(murphy.phase, MurphyPhase::PlantingRedDisk { .. })
+        {
+            return murphy.transition(position, world);
+        }
+
+        // Reserved push/snap targets retain their actor identity for rendering
+        // and blast interactions but must not fall, roll, or otherwise update.
+        if state.animation.kind == AnimationKind::MurphyPushTarget {
+            return None;
+        }
+
         // Freeze pauses both stable and pre-fall Zonks. A transfer already
         // represented by synchronized destination/source animations must
         // finish, or its Vacating source would release out of phase with a
@@ -1568,6 +2043,105 @@ impl Actor {
                     ))
                 });
             }
+            AnimationAdvance::Finished(AnimationNext::FinishMurphySnap { direction, target }) => {
+                let Self::Murphy(murphy) = self else {
+                    debug_assert!(false, "only Murphy may finish a snap action");
+                    return Some(Transition::replace(position, State::new(self.clone())));
+                };
+                let mut writes = vec![CellWrite::new(position, State::new(Self::Murphy(*murphy)))];
+                if let Some(target_position) = world.offset(position, direction)
+                    && world.state(target_position).is_some_and(|target_state| {
+                        target_state.animation.kind == AnimationKind::MurphyPushTarget
+                    })
+                {
+                    writes.push(CellWrite::new(target_position, State::empty()));
+                }
+                let events = match target {
+                    MurphySnapTarget::Base => Vec::new(),
+                    MurphySnapTarget::Infotron => vec![GameEvent::CollectInfotron],
+                    MurphySnapTarget::RedDisk => vec![GameEvent::CollectRedDisk],
+                };
+                return Some(Transition::new(writes, events));
+            }
+            AnimationAdvance::Finished(AnimationNext::FinishMurphyPush { direction, target }) => {
+                let Self::Murphy(murphy) = self else {
+                    debug_assert!(false, "only Murphy may finish a push action");
+                    return Some(Transition::replace(position, State::new(self.clone())));
+                };
+                let Some(target_position) = world.offset(position, direction) else {
+                    return Some(Transition::replace(position, State::new(self.clone())));
+                };
+                let Some(destination) = world.offset(target_position, direction) else {
+                    return Some(Transition::replace(position, State::new(self.clone())));
+                };
+                let reservations_intact = world.state(target_position).is_some_and(|state| {
+                    state.animation.kind == AnimationKind::MurphyPushTarget
+                        && pushed_actor_matches(state.actor(), target)
+                }) && world.state(destination).is_some_and(|state| {
+                    matches!(state.actor(), Actor::Empty(_))
+                        && state.animation.kind == AnimationKind::MurphyDestination
+                });
+                if !reservations_intact {
+                    return Some(Transition::replace(
+                        position,
+                        State::new(Self::Murphy(*murphy)),
+                    ));
+                }
+                return Some(Transition::new(
+                    vec![
+                        CellWrite::new(position, State::empty()),
+                        CellWrite::new(target_position, State::new(Self::Murphy(*murphy))),
+                        CellWrite::new(destination, State::new(actor_for_push_target(target))),
+                    ],
+                    Vec::new(),
+                ));
+            }
+            AnimationAdvance::Finished(AnimationNext::FinishMurphyPort { direction }) => {
+                let Self::Murphy(murphy) = self else {
+                    debug_assert!(false, "only Murphy may finish a port traversal");
+                    return Some(Transition::replace(position, State::new(self.clone())));
+                };
+                let Some(port_position) = world.offset(position, direction) else {
+                    return Some(Transition::replace(position, State::new(self.clone())));
+                };
+                let Some(destination) = world.offset(port_position, direction) else {
+                    return Some(Transition::replace(position, State::new(self.clone())));
+                };
+                if !world.state(destination).is_some_and(|state| {
+                    matches!(state.actor(), Actor::Empty(_))
+                        && state.animation.kind == AnimationKind::MurphyDestination
+                }) {
+                    return Some(Transition::replace(
+                        position,
+                        State::new(Self::Murphy(*murphy)),
+                    ));
+                }
+                let events = world
+                    .state(port_position)
+                    .and_then(|state| match state.actor() {
+                        Actor::Port(port) if port.special => world
+                            .special_port(port_position)
+                            .copied()
+                            .map(GameEvent::ApplySpecialPort),
+                        _ => None,
+                    })
+                    .into_iter()
+                    .collect();
+                return Some(Transition::new(
+                    vec![
+                        CellWrite::new(position, State::empty()),
+                        CellWrite::new(destination, State::new(Self::Murphy(*murphy))),
+                    ],
+                    events,
+                ));
+            }
+            AnimationAdvance::Finished(AnimationNext::FinishMurphyExit) => {
+                debug_assert!(matches!(self, Self::Murphy(_)));
+                return Some(Transition::new(
+                    vec![CellWrite::new(position, State::empty())],
+                    vec![GameEvent::Completed],
+                ));
+            }
             AnimationAdvance::Finished(AnimationNext::Act) | AnimationAdvance::Ready => {}
         }
 
@@ -1614,9 +2188,10 @@ impl Actor {
                 // reservation releases in this same tick. Murphy is processed
                 // before the later row-major actor pass, so trailing hazards
                 // observe the updated reservation rather than stale occupancy.
-                let (direction, source_distance) = match state.animation.kind {
-                    AnimationKind::Moving(direction) => (direction, 1),
-                    AnimationKind::PortTraversal(direction) => (direction, 2),
+                let (direction, source_distance, target) = match state.animation.kind {
+                    AnimationKind::Murphy(MurphyAnimation::Move {
+                        direction, target, ..
+                    }) => (direction, 1, target),
                     // Murphy never owns Rolling, but retaining a total fallback
                     // makes malformed internal states settle without erasing a
                     // potentially unrelated neighboring cell.
@@ -1649,7 +2224,13 @@ impl Actor {
                     // reservation while Murphy was in flight.
                     writes.push(CellWrite::new(source, State::empty()));
                 }
-                return Transition::new(writes, Vec::new());
+                let events = match target {
+                    MurphyMoveTarget::Empty | MurphyMoveTarget::Base => Vec::new(),
+                    MurphyMoveTarget::Infotron => vec![GameEvent::CollectInfotron],
+                    MurphyMoveTarget::RedDisk => vec![GameEvent::CollectRedDisk],
+                    MurphyMoveTarget::PlantedRedDisk => Vec::new(),
+                };
+                return Transition::new(writes, events);
             }
             Self::Zonk(_) if world.freeze_zonks() && state.animation.is_movement() => {
                 // The in-flight transfer reaches its destination, then loses
@@ -1831,8 +2412,12 @@ pub(crate) enum GameEvent {
     CollectInfotron,
     /// Add one Red Disk to Murphy's inventory.
     CollectRedDisk,
-    /// Spend one disk and begin its one-at-a-time fuse under Murphy's cell.
-    PlantRedDisk(Position),
+    /// Reserve the one planted-disk slot at countdown one while Space is held.
+    BeginPlantRedDisk(Position),
+    /// Cancel an incomplete placement without spending a Red Disk.
+    CancelPlantRedDisk,
+    /// Spend one disk and arm the completed placement at countdown two.
+    FinishPlantRedDisk,
     /// Mark the current level as successfully completed.
     Completed,
     /// Mark Murphy as destroyed.
@@ -1908,6 +2493,26 @@ impl Transition {
                 CellWrite::new(destination, destination_state),
             ],
             events,
+        )
+    }
+
+    /// Moves Murphy with a target-specific eight- or nine-frame descriptor.
+    fn move_murphy(
+        source: Position,
+        destination: Position,
+        actor: Actor,
+        direction: Direction,
+        target: MurphyMoveTarget,
+        looking_left: bool,
+    ) -> Self {
+        let animation = Animation::murphy_move(direction, target, looking_left);
+        let frame_count = animation.frame_count;
+        Self::new(
+            vec![
+                CellWrite::new(source, State::vacating_for(direction, frame_count)),
+                CellWrite::new(destination, State::animated(actor, animation)),
+            ],
+            Vec::new(),
         )
     }
 

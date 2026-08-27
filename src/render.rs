@@ -10,8 +10,9 @@ use sdl2::{
 };
 
 use crate::{
-    actor::{Actor, AnimationKind, Direction, Position, State},
+    actor::{Actor, AnimationKind, Direction, MurphyAnimation, MurphyMoveTarget, Position, State},
     game::{Game, GameStatus},
+    murphy_animation::{SpritePart, sprite_parts},
 };
 
 /// Logical width used by the resizable SDL window.
@@ -52,6 +53,12 @@ const ROCKS_SP_PNG: &[u8] = include_bytes!("../RocksSP.png");
 
 /// Font converted from the original headerless `CHARS8.DAT` file.
 const CHARS8_PNG: &[u8] = include_bytes!("../assets/chars8.png");
+
+/// Pixel-perfect conversion of the original `MOVING.DAT` sprite sheet.
+const MOVING_PNG: &[u8] = include_bytes!("../assets/moving.png");
+
+/// Integer enlargement from original 16-pixel tiles to the 32-pixel board.
+const MOVING_SCALE: u32 = 2;
 
 /// Grid location of one 32×32 source frame in `RocksSP.png`.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -108,6 +115,8 @@ struct DecodedPng {
 pub struct Renderer<'textures> {
     /// Repacked actor sprite atlas loaded from `RocksSP.png`.
     sprites: Texture<'textures>,
+    /// Original variably sized movement frames used for Murphy composites.
+    moving: Texture<'textures>,
     /// Original eight-pixel DOS font converted to an RGBA PNG.
     font: Texture<'textures>,
     /// Most recent camera centered on a live Murphy.
@@ -123,10 +132,12 @@ impl<'textures> Renderer<'textures> {
         texture_creator: &'textures TextureCreator<WindowContext>,
     ) -> Result<Self, RenderError> {
         let sprites = load_texture(texture_creator, ROCKS_SP_PNG, 512, 480, "RocksSP.png")?;
+        let moving = load_texture(texture_creator, MOVING_PNG, 320, 462, "assets/moving.png")?;
         let font = load_texture(texture_creator, CHARS8_PNG, 512, 8, "assets/chars8.png")?;
 
         Ok(Self {
             sprites,
+            moving,
             font,
             camera: Camera::default(),
         })
@@ -159,9 +170,7 @@ impl<'textures> Renderer<'textures> {
             for (index, state) in game.board().cells().iter().enumerate() {
                 let is_interpolated = matches!(
                     state.animation().kind(),
-                    AnimationKind::Moving(_)
-                        | AnimationKind::Rolling(_)
-                        | AnimationKind::PortTraversal(_)
+                    AnimationKind::Moving(_) | AnimationKind::Rolling(_) | AnimationKind::Murphy(_)
                 );
                 if is_interpolated != moving_pass {
                     continue;
@@ -195,6 +204,16 @@ impl<'textures> Renderer<'textures> {
             return Ok(());
         }
 
+        if let AnimationKind::Murphy(action) = state.animation().kind() {
+            return self.draw_murphy_animation(
+                canvas,
+                position,
+                action,
+                state.animation().frame(),
+                camera,
+            );
+        }
+
         let sprite = sprite_for_state(state);
         debug_assert!(sprite.is_valid(), "sprite mapping must remain inside atlas");
         let (offset_x, offset_y) = movement_offset(state);
@@ -214,6 +233,70 @@ impl<'textures> Renderer<'textures> {
 
         canvas
             .copy(&self.sprites, sprite.source(), destination)
+            .map_err(RenderError::Sdl)
+    }
+
+    /// Draws one original variably sized Murphy descriptor at two-times scale.
+    fn draw_murphy_animation(
+        &mut self,
+        canvas: &mut Canvas<Window>,
+        position: Position,
+        action: MurphyAnimation,
+        frame: u8,
+        camera: Camera,
+    ) -> Result<(), RenderError> {
+        // Movement descriptors depend on the original target that was visible
+        // before its tile identity became Murphy. Restore that fixed backdrop;
+        // horizontal collection composites then draw transparently over it.
+        if let MurphyAnimation::Move { target, .. } = action {
+            let background_tile = match target {
+                MurphyMoveTarget::Empty => None,
+                MurphyMoveTarget::Base => Some(2),
+                MurphyMoveTarget::Infotron => Some(4),
+                MurphyMoveTarget::RedDisk | MurphyMoveTarget::PlantedRedDisk => Some(20),
+            };
+            if let Some(tile) = background_tile {
+                let destination = Rect::new(
+                    position.x as i32 * TILE_SIZE as i32 - camera.x,
+                    position.y as i32 * TILE_SIZE as i32 - camera.y,
+                    TILE_SIZE,
+                    TILE_SIZE,
+                );
+                canvas
+                    .copy(&self.sprites, static_sprite(tile).source(), destination)
+                    .map_err(RenderError::Sdl)?;
+            }
+        }
+
+        let parts = sprite_parts(action, frame);
+        self.draw_murphy_part(canvas, position, parts.primary, camera)?;
+        if let Some(secondary) = parts.secondary {
+            self.draw_murphy_part(canvas, position, secondary, camera)?;
+        }
+        Ok(())
+    }
+
+    /// Copies one original-resolution Murphy layer into board pixel space.
+    fn draw_murphy_part(
+        &mut self,
+        canvas: &mut Canvas<Window>,
+        position: Position,
+        part: SpritePart,
+        camera: Camera,
+    ) -> Result<(), RenderError> {
+        let source = Rect::new(part.source.x, part.source.y, part.width, part.height);
+        let destination = Rect::new(
+            position.x as i32 * TILE_SIZE as i32 - camera.x + part.offset_x * MOVING_SCALE as i32,
+            position.y as i32 * TILE_SIZE as i32 - camera.y + part.offset_y * MOVING_SCALE as i32,
+            part.width * MOVING_SCALE,
+            part.height * MOVING_SCALE,
+        );
+
+        // SDL clips wide push and vertical 18/34-pixel composites against the
+        // viewport, preserving partial frames at camera edges without slicing
+        // the descriptor tables themselves.
+        canvas
+            .copy(&self.moving, source, destination)
             .map_err(RenderError::Sdl)
     }
 
@@ -410,13 +493,15 @@ fn sprite_for_state(state: &State) -> SpriteCell {
         AnimationKind::Electron => SpriteCell::new(8 + frame.min(7), 10),
         AnimationKind::Terminal => SpriteCell::new(frame.min(6), 10),
         AnimationKind::SnikSnak => snik_sprite(state, frame),
-        AnimationKind::Snapping(direction) => murphy_action_sprite(direction),
-        AnimationKind::Moving(direction)
-        | AnimationKind::Rolling(direction)
-        | AnimationKind::PortTraversal(direction) => moving_sprite(state, direction, frame),
+        AnimationKind::Murphy(action) => murphy_animation_sprite(action, frame),
+        AnimationKind::Moving(direction) | AnimationKind::Rolling(direction) => {
+            moving_sprite(state, direction, frame)
+        }
         AnimationKind::Idle
         | AnimationKind::ZonkPreFall
         | AnimationKind::Vacating(_)
+        | AnimationKind::MurphyPushTarget
+        | AnimationKind::MurphyDestination
         | AnimationKind::RedDiskFuse
         | AnimationKind::OrangeDiskFuse => static_sprite(state.actor().tile_code()),
     }
@@ -425,11 +510,6 @@ fn sprite_for_state(state: &State) -> SpriteCell {
 /// Selects presentation frames for an actor logically entering its destination.
 fn moving_sprite(state: &State, direction: Direction, frame: u8) -> SpriteCell {
     match state.actor() {
-        Actor::Murphy(_) => match direction {
-            Direction::Left => SpriteCell::new(8 + ping_pong(frame, 3), 0),
-            Direction::Right => SpriteCell::new(11 + ping_pong(frame, 3), 0),
-            Direction::Up | Direction::Down => static_sprite(3),
-        },
         Actor::Zonk(_) if direction.is_horizontal() => zonk_moving_sprite(direction, frame),
         Actor::Infotron(_) if direction.is_horizontal() => infotron_moving_sprite(direction, frame),
         Actor::SnikSnak(_) => snik_direction_sprite(direction, frame),
@@ -509,8 +589,24 @@ fn snik_direction_sprite(direction: Direction, frame: u8) -> SpriteCell {
     SpriteCell::new(column + frame.min(3), row)
 }
 
-/// Selects one of the four single-frame Murphy snapping poses.
-fn murphy_action_sprite(direction: Direction) -> SpriteCell {
+/// Supplies an atlas fallback for one semantic original Murphy descriptor.
+fn murphy_animation_sprite(action: MurphyAnimation, frame: u8) -> SpriteCell {
+    let direction = match action {
+        MurphyAnimation::Move { direction, .. }
+        | MurphyAnimation::Snap { direction, .. }
+        | MurphyAnimation::Push { direction, .. }
+        | MurphyAnimation::Port { direction } => direction,
+        MurphyAnimation::Exit | MurphyAnimation::PlantRedDisk => return static_sprite(3),
+    };
+
+    if matches!(action, MurphyAnimation::Move { .. }) {
+        return match direction {
+            Direction::Left => SpriteCell::new(8 + ping_pong(frame, 3), 0),
+            Direction::Right => SpriteCell::new(11 + ping_pong(frame, 3), 0),
+            Direction::Up | Direction::Down => static_sprite(3),
+        };
+    }
+
     match direction {
         Direction::Right => SpriteCell::new(8, 1),
         Direction::Left => SpriteCell::new(9, 1),
@@ -577,12 +673,30 @@ fn movement_offset(state: &State) -> (i32, i32) {
             Direction::Right => (-distance, -distance),
             Direction::Up | Direction::Down => (0, 0),
         },
-        AnimationKind::PortTraversal(direction) => match direction {
-            Direction::Up => (0, distance * 2),
-            Direction::Right => (-distance * 2, 0),
-            Direction::Down => (0, -distance * 2),
-            Direction::Left => (distance * 2, 0),
+        AnimationKind::Murphy(MurphyAnimation::Move { direction, .. }) => match direction {
+            Direction::Up => (0, distance),
+            Direction::Right => (-distance, 0),
+            Direction::Down => (0, -distance),
+            Direction::Left => (distance, 0),
         },
+        AnimationKind::Murphy(MurphyAnimation::Push { direction, .. }) => {
+            let travelled = TILE_SIZE as i32 - distance;
+            match direction {
+                Direction::Up => (0, -travelled),
+                Direction::Right => (travelled, 0),
+                Direction::Down => (0, travelled),
+                Direction::Left => (-travelled, 0),
+            }
+        }
+        AnimationKind::Murphy(MurphyAnimation::Port { direction }) => {
+            let travelled = (TILE_SIZE as i32 - distance) * 2;
+            match direction {
+                Direction::Up => (0, -travelled),
+                Direction::Right => (travelled, 0),
+                Direction::Down => (0, travelled),
+                Direction::Left => (-travelled, 0),
+            }
+        }
         _ => (0, 0),
     }
 }

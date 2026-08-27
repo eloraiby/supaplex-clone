@@ -23,8 +23,6 @@ pub struct Input {
     pub direction: Option<Direction>,
     /// Whether Space is held to snap an adjacent collectible without moving.
     pub action: bool,
-    /// Whether the Red Disk drop key was pressed during this step.
-    pub drop_disk: bool,
 }
 
 /// Contiguous two-dimensional storage using only `width * y + x` indexing.
@@ -471,18 +469,40 @@ impl Game {
             GameEvent::CollectRedDisk => {
                 self.red_disks = self.red_disks.saturating_add(1);
             }
-            GameEvent::PlantRedDisk(position) => {
-                // The transition checks both conditions against the live board;
-                // repeat the guards to keep event application total and robust.
+            GameEvent::BeginPlantRedDisk(position) => {
+                // Countdown one is the cancellable, unspent placement state.
+                // The actor retains it only while Space remains held.
                 if self.red_disks > 0 && self.planted_red_disk.is_none() {
-                    self.red_disks -= 1;
                     self.planted_red_disk = Some(PlantedRedDisk {
                         position,
-                        countdown: 2,
+                        countdown: 1,
                     });
                 }
             }
-            GameEvent::Completed => self.status = GameStatus::Completed,
+            GameEvent::CancelPlantRedDisk => {
+                // A completed fuse can no longer be cancelled by player input.
+                if self
+                    .planted_red_disk
+                    .is_some_and(|disk| disk.countdown <= 1)
+                {
+                    self.planted_red_disk = None;
+                }
+            }
+            GameEvent::FinishPlantRedDisk => {
+                if let Some(disk) = self.planted_red_disk.as_mut()
+                    && disk.countdown <= 1
+                    && self.red_disks > 0
+                {
+                    self.red_disks -= 1;
+                    disk.countdown = 2;
+                }
+            }
+            GameEvent::Completed => {
+                self.status = GameStatus::Completed;
+                if self.quit_countdown == 0 {
+                    self.quit_countdown = 0x40;
+                }
+            }
             GameEvent::Died => {
                 self.status = GameStatus::Dead;
                 if self.quit_countdown == 0 {
@@ -939,8 +959,8 @@ mod tests {
     use super::{Board, Game, GameStatus, Input, PlantedRedDisk};
     use crate::actor::{
         Actor, AnimationKind, Base, Bug, CHAIN_REACTION_FRAMES, Direction, Electron, Empty, Exit,
-        ExplosionResidue, Hardware, Infotron, Murphy, OrangeDisk, Port, PortDirections, Position,
-        RedDisk, SnikSnak, State, Terminal, YellowDisk, Zonk,
+        ExplosionResidue, Hardware, Infotron, Murphy, MurphyAnimation, OrangeDisk, Port,
+        PortDirections, Position, RedDisk, SnikSnak, State, Terminal, YellowDisk, Zonk,
     };
     use crate::level::{LevelSet, SpecialPort};
 
@@ -1043,12 +1063,16 @@ mod tests {
         assert!(matches!(destination.actor(), Actor::Murphy(_)));
         assert_eq!(
             destination.animation().kind(),
-            AnimationKind::Moving(Direction::Right)
+            AnimationKind::Murphy(MurphyAnimation::Move {
+                direction: Direction::Right,
+                target: crate::actor::MurphyMoveTarget::Empty,
+                looking_left: false,
+            })
         );
 
-        // Four animation ticks release the synchronized source and retain the
+        // Eight animation ticks release the synchronized source and retain the
         // final moving pose until Murphy's next input-processing update.
-        for _ in 0..4 {
+        for _ in 0..8 {
             game.tick(Input::default());
         }
         let completed = game
@@ -1056,8 +1080,15 @@ mod tests {
             .state(Position::new(3, 2))
             .expect("destination should exist")
             .animation();
-        assert_eq!(completed.kind(), AnimationKind::Moving(Direction::Right));
-        assert_eq!(completed.frame(), 3);
+        assert_eq!(
+            completed.kind(),
+            AnimationKind::Murphy(MurphyAnimation::Move {
+                direction: Direction::Right,
+                target: crate::actor::MurphyMoveTarget::Empty,
+                looking_left: false,
+            })
+        );
+        assert_eq!(completed.frame(), 7);
         assert!(
             game.board()
                 .state(Position::new(2, 2))
@@ -1077,7 +1108,7 @@ mod tests {
         );
     }
 
-    /// Confirms collection is part of Murphy's immediate atomic movement.
+    /// Confirms collection occurs when Murphy's dedicated strip completes.
     #[test]
     fn murphy_collects_infotron_and_decrements_requirement() {
         let mut game = game_with(
@@ -1099,8 +1130,12 @@ mod tests {
             ..Input::default()
         });
 
-        assert_eq!(game.remaining_infotrons(), 0);
         assert!(matches!(actor_at(&game, 3, 2), Actor::Murphy(_)));
+        assert_eq!(game.remaining_infotrons(), 1);
+        for _ in 0..8 {
+            game.tick(Input::default());
+        }
+        assert_eq!(game.remaining_infotrons(), 0);
     }
 
     /// Confirms a stable Zonk can be pushed only with free space behind it.
@@ -1125,19 +1160,102 @@ mod tests {
             ..Input::default()
         });
 
+        for _ in 0..16 {
+            game.tick(Input {
+                direction: Some(Direction::Right),
+                ..Input::default()
+            });
+        }
+
         assert!(matches!(actor_at(&game, 3, 2), Actor::Murphy(_)));
         let pushed = game
             .board()
             .state(Position::new(4, 2))
             .expect("pushed Zonk destination should exist");
         assert!(matches!(pushed.actor(), Actor::Zonk(_)));
-        assert_eq!(
-            pushed.animation().kind(),
-            AnimationKind::Moving(Direction::Right)
+        assert_eq!(pushed.animation().kind(), AnimationKind::ZonkPreFall);
+    }
+
+    /// Confirms releasing a prepared push restores both reserved board cells.
+    #[test]
+    fn murphy_cancels_push_when_direction_is_released() {
+        let murphy_position = Position::new(2, 2);
+        let zonk_position = Position::new(3, 2);
+        let destination = Position::new(4, 2);
+        let mut game = game_with(
+            &[
+                (murphy_position, State::new(Actor::Murphy(Murphy::new()))),
+                (zonk_position, State::new(Actor::Zonk(Zonk::resting()))),
+            ],
+            0,
         );
-        // Murphy performs the push before schedule capture, so the pushed
-        // Zonk receives its normal row-major callback on that same tick.
-        assert_eq!(pushed.animation().frame(), 1);
+
+        game.tick(Input {
+            direction: Some(Direction::Right),
+            ..Input::default()
+        });
+        assert!(
+            !game
+                .board()
+                .state(destination)
+                .expect("push destination should be reserved")
+                .is_empty()
+        );
+
+        game.tick(Input::default());
+        assert!(matches!(actor_at(&game, 2, 2), Actor::Murphy(_)));
+        assert!(matches!(actor_at(&game, 3, 2), Actor::Zonk(_)));
+        assert!(
+            game.board()
+                .state(destination)
+                .expect("cancelled destination should exist")
+                .is_empty()
+        );
+    }
+
+    /// Confirms snapping retains its target and defers collection to frame seven.
+    #[test]
+    fn murphy_snap_collection_finishes_after_its_target_specific_strip() {
+        let target = Position::new(3, 2);
+        let mut game = game_with(
+            &[
+                (
+                    Position::new(2, 2),
+                    State::new(Actor::Murphy(Murphy::new())),
+                ),
+                (target, State::new(Actor::Infotron(Infotron::resting()))),
+            ],
+            1,
+        );
+
+        game.tick(Input {
+            direction: Some(Direction::Right),
+            action: true,
+        });
+        assert_eq!(game.remaining_infotrons(), 1);
+        assert!(matches!(actor_at(&game, 3, 2), Actor::Infotron(_)));
+        assert_eq!(
+            game.board()
+                .state(Position::new(2, 2))
+                .expect("Murphy should remain in place")
+                .animation()
+                .kind(),
+            AnimationKind::Murphy(MurphyAnimation::Snap {
+                direction: Direction::Right,
+                target: crate::actor::MurphySnapTarget::Infotron,
+            })
+        );
+
+        for _ in 0..7 {
+            game.tick(Input::default());
+        }
+        assert_eq!(game.remaining_infotrons(), 0);
+        assert!(
+            game.board()
+                .state(target)
+                .expect("snapped target cell should exist")
+                .is_empty()
+        );
     }
 
     /// Confirms a Zonk arms for one update before one captured fall begins.
@@ -1427,7 +1545,11 @@ mod tests {
         assert!(matches!(murphy.actor(), Actor::Murphy(_)));
         assert_eq!(
             murphy.animation().kind(),
-            AnimationKind::Moving(Direction::Right)
+            AnimationKind::Murphy(MurphyAnimation::Move {
+                direction: Direction::Right,
+                target: crate::actor::MurphyMoveTarget::Empty,
+                looking_left: false,
+            })
         );
         assert_eq!(murphy.animation().frame(), 0);
         let source = game
@@ -1469,7 +1591,7 @@ mod tests {
         // Movement completion releases the old collision reservation during
         // Murphy's player-first update but keeps his final Down pose. The later
         // Zonk arms in its original cell without entering the released source.
-        for _ in 0..5 {
+        for _ in 0..9 {
             game.tick(down);
         }
         let ready = game
@@ -1479,9 +1601,13 @@ mod tests {
         assert!(matches!(ready.actor(), Actor::Murphy(_)));
         assert_eq!(
             ready.animation().kind(),
-            AnimationKind::Moving(Direction::Down)
+            AnimationKind::Murphy(MurphyAnimation::Move {
+                direction: Direction::Down,
+                target: crate::actor::MurphyMoveTarget::Empty,
+                looking_left: false,
+            })
         );
-        assert_eq!(ready.animation().frame(), 3);
+        assert_eq!(ready.animation().frame(), 7);
         assert!(
             game.board()
                 .state(Position::new(3, 2))
@@ -1507,7 +1633,14 @@ mod tests {
             .state(Position::new(3, 4))
             .expect("Murphy destination should exist")
             .animation();
-        assert_eq!(moving.kind(), AnimationKind::Moving(Direction::Down));
+        assert_eq!(
+            moving.kind(),
+            AnimationKind::Murphy(MurphyAnimation::Move {
+                direction: Direction::Down,
+                target: crate::actor::MurphyMoveTarget::Empty,
+                looking_left: false,
+            })
+        );
         assert_eq!(moving.frame(), 0);
         let trailing = game
             .board()
@@ -1546,9 +1679,9 @@ mod tests {
             direction: Some(Direction::Right),
             ..Input::default()
         };
-        // Four more steps finish the original Down animation without applying
+        // Eight more steps finish the original Down animation without applying
         // the newly held Right direction during the completion update.
-        for _ in 0..4 {
+        for _ in 0..8 {
             game.tick(turn);
         }
         let ready = game
@@ -1558,9 +1691,13 @@ mod tests {
         assert!(matches!(ready.actor(), Actor::Murphy(_)));
         assert_eq!(
             ready.animation().kind(),
-            AnimationKind::Moving(Direction::Down)
+            AnimationKind::Murphy(MurphyAnimation::Move {
+                direction: Direction::Down,
+                target: crate::actor::MurphyMoveTarget::Empty,
+                looking_left: false,
+            })
         );
-        assert_eq!(ready.animation().frame(), 3);
+        assert_eq!(ready.animation().frame(), 7);
         assert!(
             game.board()
                 .state(Position::new(3, 2))
@@ -1603,7 +1740,14 @@ mod tests {
             .state(Position::new(4, 3))
             .expect("turned Murphy destination should exist")
             .animation();
-        assert_eq!(moving.kind(), AnimationKind::Moving(Direction::Right));
+        assert_eq!(
+            moving.kind(),
+            AnimationKind::Murphy(MurphyAnimation::Move {
+                direction: Direction::Right,
+                target: crate::actor::MurphyMoveTarget::Empty,
+                looking_left: false,
+            })
+        );
         assert_eq!(moving.frame(), 0);
     }
 
@@ -1677,8 +1821,15 @@ mod tests {
             ..Input::default()
         });
 
+        for _ in 0..16 {
+            game.tick(Input {
+                direction: Some(Direction::Right),
+                ..Input::default()
+            });
+        }
+
         assert!(matches!(actor_at(&game, 3, 2), Actor::Murphy(_)));
-        assert!(matches!(actor_at(&game, 4, 2), Actor::OrangeDisk(_)));
+        assert!(matches!(actor_at(&game, 4, 3), Actor::OrangeDisk(_)));
     }
 
     /// Confirms diagonal rolls expose their two-axis animation displacement.
@@ -1836,12 +1987,21 @@ mod tests {
         assert_eq!(game.status(), GameStatus::Playing);
         let murphy = game
             .board()
-            .state(Position::new(3, 2))
-            .expect("port exit should exist");
+            .state(Position::new(1, 2))
+            .expect("port entrance should retain Murphy during traversal");
         assert!(matches!(murphy.actor(), Actor::Murphy(_)));
         assert_eq!(
             murphy.animation().kind(),
-            AnimationKind::PortTraversal(Direction::Right)
+            AnimationKind::Murphy(MurphyAnimation::Port {
+                direction: Direction::Right,
+            })
+        );
+        assert!(
+            !game
+                .board()
+                .state(Position::new(3, 2))
+                .expect("port exit reservation should exist")
+                .is_empty()
         );
         assert!(matches!(actor_at(&game, 3, 1), Actor::Zonk(_)));
     }
@@ -1877,8 +2037,15 @@ mod tests {
         });
 
         assert_eq!(game.status(), GameStatus::Playing);
-        assert!(matches!(actor_at(&game, 2, 2), Actor::Murphy(_)));
-        assert!(matches!(actor_at(&game, 3, 2), Actor::Zonk(_)));
+        assert!(matches!(actor_at(&game, 1, 2), Actor::Murphy(_)));
+        assert!(matches!(actor_at(&game, 2, 2), Actor::Zonk(_)));
+        assert!(
+            !game
+                .board()
+                .state(Position::new(3, 2))
+                .expect("push destination reservation should exist")
+                .is_empty()
+        );
         assert!(matches!(actor_at(&game, 3, 1), Actor::Zonk(_)));
     }
 
@@ -1889,10 +2056,14 @@ mod tests {
         let mut game = game_with(&[(origin, State::new(Actor::Murphy(Murphy::new())))], 0);
         game.red_disks = 2;
 
-        game.tick(Input {
-            drop_disk: true,
-            ..Input::default()
-        });
+        // A completely input-free update arms the original placement latch.
+        game.tick(Input::default());
+        for _ in 0..65 {
+            game.tick(Input {
+                action: true,
+                ..Input::default()
+            });
+        }
         assert_eq!(game.red_disks(), 1);
         assert_eq!(
             game.planted_red_disk.map(|disk| disk.position),
@@ -1900,10 +2071,7 @@ mod tests {
         );
         assert!(matches!(actor_at(&game, 3, 2), Actor::Empty(_)));
 
-        // Finish Murphy's planting pose, then vacate the stored source cell.
-        for _ in 0..4 {
-            game.tick(Input::default());
-        }
+        // Vacate the stored source cell after the completed hold-to-place pose.
         game.tick(Input {
             direction: Some(Direction::Right),
             ..Input::default()
@@ -1919,7 +2087,7 @@ mod tests {
 
         // The disk materializes only after Murphy's collision reservation has
         // released the source; its independent fuse has continued throughout.
-        for _ in 0..4 {
+        for _ in 0..8 {
             game.tick(Input::default());
         }
 
@@ -1935,8 +2103,9 @@ mod tests {
         );
 
         // A second plant command is ignored while the retained fuse is active.
+        game.tick(Input::default());
         game.tick(Input {
-            drop_disk: true,
+            action: true,
             ..Input::default()
         });
         assert_eq!(game.red_disks(), 1);
@@ -1949,8 +2118,48 @@ mod tests {
             ..Input::default()
         });
         assert!(matches!(actor_at(&game, 2, 2), Actor::Murphy(_)));
+        assert_eq!(
+            game.board()
+                .state(origin)
+                .expect("Murphy should animate over the planted disk")
+                .animation()
+                .kind(),
+            AnimationKind::Murphy(MurphyAnimation::Move {
+                direction: Direction::Left,
+                target: crate::actor::MurphyMoveTarget::PlantedRedDisk,
+                looking_left: true,
+            })
+        );
         assert_eq!(game.red_disks(), 1);
         assert!(game.planted_red_disk.is_some());
+    }
+
+    /// Confirms releasing Space cancels planting without spending inventory.
+    #[test]
+    fn incomplete_red_disk_plant_is_cancellable() {
+        let origin = Position::new(2, 2);
+        let mut game = game_with(&[(origin, State::new(Actor::Murphy(Murphy::new())))], 0);
+        game.red_disks = 1;
+
+        game.tick(Input::default());
+        game.tick(Input {
+            action: true,
+            ..Input::default()
+        });
+        assert_eq!(game.red_disks(), 1);
+        assert_eq!(game.planted_red_disk.map(|disk| disk.countdown), Some(1));
+
+        game.tick(Input::default());
+        assert_eq!(game.red_disks(), 1);
+        assert!(game.planted_red_disk.is_none());
+        assert_eq!(
+            game.board()
+                .state(origin)
+                .expect("Murphy's cell should remain present")
+                .animation()
+                .kind(),
+            AnimationKind::Idle
+        );
     }
 
     /// Confirms a Zonk strike arms the Orange Disk's delayed animation promise.
@@ -2285,6 +2494,18 @@ mod tests {
         open.tick(input);
 
         assert_eq!(locked.status(), GameStatus::Playing);
+        assert_eq!(open.status(), GameStatus::Playing);
+        assert_eq!(
+            open.board()
+                .state(Position::new(2, 2))
+                .expect("Exit animation should remain at Murphy's source")
+                .animation()
+                .kind(),
+            AnimationKind::Murphy(MurphyAnimation::Exit)
+        );
+        for _ in 0..40 {
+            open.tick(Input::default());
+        }
         assert_eq!(open.status(), GameStatus::Completed);
     }
 
@@ -2374,15 +2595,25 @@ mod tests {
             ..Input::default()
         });
 
-        assert!(matches!(actor_at(&game, 4, 2), Actor::Murphy(_)));
+        assert!(matches!(actor_at(&game, 2, 2), Actor::Murphy(_)));
         assert_eq!(
             game.board()
-                .state(Position::new(4, 2))
-                .expect("port destination should exist")
+                .state(Position::new(2, 2))
+                .expect("port source should retain Murphy")
                 .animation()
                 .kind(),
-            AnimationKind::PortTraversal(Direction::Right)
+            AnimationKind::Murphy(MurphyAnimation::Port {
+                direction: Direction::Right,
+            })
         );
+        assert!(!game.gravity());
+        assert!(!game.freeze_zonks());
+        assert!(!game.freeze_enemies());
+
+        for _ in 0..8 {
+            game.tick(Input::default());
+        }
+        assert!(matches!(actor_at(&game, 4, 2), Actor::Murphy(_)));
         assert!(game.gravity());
         assert!(game.freeze_zonks());
         assert!(game.freeze_enemies());

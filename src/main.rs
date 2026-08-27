@@ -94,7 +94,6 @@ fn run(level: &Level, level_number: usize) -> Result<(), String> {
     const RENDER_INTERVAL: Duration = Duration::from_nanos(1_000_000_000 / 60);
     let mut previous = std::time::Instant::now();
     let mut accumulator = Duration::ZERO;
-    let mut drop_disk = false;
     let mut window_title = String::new();
 
     'running: loop {
@@ -125,11 +124,6 @@ fn run(level: &Level, level_number: usize) -> Result<(), String> {
                     game.restart(level).map_err(|error| error.to_string())?;
                     accumulator = Duration::ZERO;
                 }
-                Event::KeyDown {
-                    scancode: Some(Scancode::D),
-                    repeat: false,
-                    ..
-                } => drop_disk = true,
                 _ => {}
             }
         }
@@ -140,10 +134,8 @@ fn run(level: &Level, level_number: usize) -> Result<(), String> {
             let input = Input {
                 direction: keyboard_direction(&keyboard),
                 action: keyboard.is_scancode_pressed(Scancode::Space),
-                drop_disk,
             };
             game.tick(input);
-            drop_disk = false;
             accumulator -= STEP;
             processed_steps += 1;
         }
