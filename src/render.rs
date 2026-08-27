@@ -110,6 +110,11 @@ pub struct Renderer<'textures> {
     sprites: Texture<'textures>,
     /// Original eight-pixel DOS font converted to an RGBA PNG.
     font: Texture<'textures>,
+    /// Most recent camera centered on a live Murphy.
+    ///
+    /// A death transition replaces Murphy with an Explosion immediately. The
+    /// retained camera keeps that blast visible instead of jumping to `(0, 0)`.
+    camera: Camera,
 }
 
 impl<'textures> Renderer<'textures> {
@@ -120,7 +125,11 @@ impl<'textures> Renderer<'textures> {
         let sprites = load_texture(texture_creator, ROCKS_SP_PNG, 512, 480, "RocksSP.png")?;
         let font = load_texture(texture_creator, CHARS8_PNG, 512, 8, "assets/chars8.png")?;
 
-        Ok(Self { sprites, font })
+        Ok(Self {
+            sprites,
+            font,
+            camera: Camera::default(),
+        })
     }
 
     /// Draws the scrolling board, HUD, and completion/death overlay.
@@ -135,7 +144,12 @@ impl<'textures> Renderer<'textures> {
         canvas.set_draw_color(Color::RGB(0, 0, 0));
         canvas.clear();
 
-        let camera = camera_for(game);
+        // A live Murphy supplies a fresh target every frame. Terminal snapshots
+        // have no Murphy, so they deliberately retain the last playable view.
+        if let Some(camera) = camera_for(game) {
+            self.camera = camera;
+        }
+        let camera = self.camera;
         for (index, state) in game.board().cells().iter().enumerate() {
             let position = game
                 .board()
@@ -374,7 +388,7 @@ fn sprite_for_state(state: &State) -> SpriteCell {
     match state.animation().kind() {
         AnimationKind::Explosion => SpriteCell::new(8 + frame.min(7), 3),
         AnimationKind::ElectronExplosion => SpriteCell::new(8 + frame.min(7), 4),
-        AnimationKind::Bug => SpriteCell::new(8 + ping_pong(frame, 4), 6),
+        AnimationKind::Bug => bug_sprite(frame),
         AnimationKind::Electron => SpriteCell::new(8 + frame.min(7), 10),
         AnimationKind::Terminal => SpriteCell::new(frame.min(6), 10),
         AnimationKind::SnikSnak => snik_sprite(state, frame),
@@ -394,20 +408,51 @@ fn moving_sprite(state: &State, direction: Direction, frame: u8) -> SpriteCell {
             Direction::Right => SpriteCell::new(11 + ping_pong(frame, 3), 0),
             Direction::Up | Direction::Down => static_sprite(3),
         },
-        Actor::Zonk(_) if direction.is_horizontal() => SpriteCell::new(frame.min(3), 6),
-        Actor::Infotron(_) if direction.is_horizontal() => {
-            let strip_frame = (frame.saturating_mul(2)).min(7);
-            let strip_frame = if direction == Direction::Right {
-                7 - strip_frame
-            } else {
-                strip_frame
-            };
-            SpriteCell::new(8 + strip_frame, 13)
-        }
+        Actor::Zonk(_) if direction.is_horizontal() => zonk_moving_sprite(direction, frame),
+        Actor::Infotron(_) if direction.is_horizontal() => infotron_moving_sprite(direction, frame),
         Actor::SnikSnak(_) => snik_direction_sprite(direction, frame),
         Actor::Electron(_) => SpriteCell::new(8 + frame.saturating_mul(2).min(7), 10),
         _ => static_sprite(state.actor().tile_code()),
     }
+}
+
+/// Selects a Bug frame whose appearance agrees with its collision phase.
+fn bug_sprite(frame: u8) -> SpriteCell {
+    // Gameplay treats frames zero through three as dangerous. Later frames use
+    // the inactive Bug tile so identical pixels never mean both safe and lethal.
+    if frame < 4 {
+        SpriteCell::new(8 + frame, 6)
+    } else {
+        static_sprite(25)
+    }
+}
+
+/// Selects the atlas rotation order for a horizontally moving Zonk.
+fn zonk_moving_sprite(direction: Direction, frame: u8) -> SpriteCell {
+    // RocksSP stores four clockwise rotations from left to right. Its original
+    // metadata reverses that strip for left motion and begins right motion at
+    // frame one, wrapping after the final cell.
+    let phase = frame % 4;
+    let strip_frame = match direction {
+        Direction::Left => 3 - phase,
+        Direction::Right => (phase + 1) % 4,
+        Direction::Up | Direction::Down => return static_sprite(1),
+    };
+    SpriteCell::new(strip_frame, 6)
+}
+
+/// Selects four evenly sampled rotation frames for a moving Infotron.
+fn infotron_moving_sprite(direction: Direction, frame: u8) -> SpriteCell {
+    // The source strip contains eight frames while movement has four simulation
+    // phases. Left motion samples even frames forward; right motion follows the
+    // atlas's reverse-from-six metadata to produce the mirrored rotation.
+    let forward_frame = frame.min(3) * 2;
+    let strip_frame = match direction {
+        Direction::Left => forward_frame,
+        Direction::Right => 6 - forward_frame,
+        Direction::Up | Direction::Down => return static_sprite(4),
+    };
+    SpriteCell::new(8 + strip_frame, 13)
 }
 
 /// Selects a Snik Snak strip from its persistent heading.
@@ -498,16 +543,16 @@ fn movement_offset(state: &State) -> (i32, i32) {
     }
 }
 
-/// Centers and clamps the camera around Murphy's interpolated visual position.
-fn camera_for(game: &Game) -> Camera {
+/// Centers and clamps a camera around Murphy's interpolated visual position.
+fn camera_for(game: &Game) -> Option<Camera> {
     let board_width = game.board().width() as i32 * TILE_SIZE as i32;
     let board_height = game.board().height() as i32 * TILE_SIZE as i32;
     let maximum_x = (board_width - LOGICAL_WIDTH as i32).max(0);
     let maximum_y = (board_height - VIEW_HEIGHT as i32).max(0);
 
-    let Some(position) = game.murphy_position() else {
-        return Camera::default();
-    };
+    // Terminal snapshots intentionally return `None`, allowing `Renderer` to
+    // preserve the last camera from the instant before Murphy disappeared.
+    let position = game.murphy_position()?;
     let state = game
         .board()
         .state(position)
@@ -516,10 +561,10 @@ fn camera_for(game: &Game) -> Camera {
     let center_x = position.x as i32 * TILE_SIZE as i32 + offset_x + TILE_SIZE as i32 / 2;
     let center_y = position.y as i32 * TILE_SIZE as i32 + offset_y + TILE_SIZE as i32 / 2;
 
-    Camera {
+    Some(Camera {
         x: (center_x - LOGICAL_WIDTH as i32 / 2).clamp(0, maximum_x),
         y: (center_y - VIEW_HEIGHT as i32 / 2).clamp(0, maximum_y),
-    }
+    })
 }
 
 /// Errors produced while decoding assets, uploading textures, or drawing SDL.
@@ -598,8 +643,10 @@ mod tests {
     //! Pure mapping and decoding tests that do not initialize SDL video.
 
     use super::{
-        ATLAS_COLUMNS, ATLAS_ROWS, CHARS8_PNG, ROCKS_SP_PNG, decode_png, ping_pong, static_sprite,
+        ATLAS_COLUMNS, ATLAS_ROWS, CHARS8_PNG, ROCKS_SP_PNG, bug_sprite, decode_png,
+        infotron_moving_sprite, ping_pong, static_sprite, zonk_moving_sprite,
     };
+    use crate::actor::Direction;
 
     /// Confirms both embedded resources decode to their contracted RGBA sizes.
     #[test]
@@ -630,5 +677,47 @@ mod tests {
         let frames = (0..8).map(|frame| ping_pong(frame, 4)).collect::<Vec<_>>();
 
         assert_eq!(frames, vec![0, 1, 2, 3, 2, 1, 0, 1]);
+    }
+
+    /// Confirms safe Bug phases cannot reuse a visibly dangerous spark frame.
+    #[test]
+    fn bug_frames_visually_telegraph_the_collision_phase() {
+        let active = (0..4).map(bug_sprite).collect::<Vec<_>>();
+        let inactive = static_sprite(25);
+
+        assert_eq!(
+            active,
+            vec![
+                super::SpriteCell::new(8, 6),
+                super::SpriteCell::new(9, 6),
+                super::SpriteCell::new(10, 6),
+                super::SpriteCell::new(11, 6),
+            ]
+        );
+        for frame in 4..8 {
+            assert_eq!(bug_sprite(frame), inactive, "safe Bug frame {frame}");
+        }
+    }
+
+    /// Confirms horizontal rolling follows the direction metadata of each strip.
+    #[test]
+    fn rolling_frames_reverse_between_left_and_right_motion() {
+        let zonk_left = (0..4)
+            .map(|frame| zonk_moving_sprite(Direction::Left, frame).column)
+            .collect::<Vec<_>>();
+        let zonk_right = (0..4)
+            .map(|frame| zonk_moving_sprite(Direction::Right, frame).column)
+            .collect::<Vec<_>>();
+        let infotron_left = (0..4)
+            .map(|frame| infotron_moving_sprite(Direction::Left, frame).column)
+            .collect::<Vec<_>>();
+        let infotron_right = (0..4)
+            .map(|frame| infotron_moving_sprite(Direction::Right, frame).column)
+            .collect::<Vec<_>>();
+
+        assert_eq!(zonk_left, vec![3, 2, 1, 0]);
+        assert_eq!(zonk_right, vec![1, 2, 3, 0]);
+        assert_eq!(infotron_left, vec![8, 10, 12, 14]);
+        assert_eq!(infotron_right, vec![14, 12, 10, 8]);
     }
 }

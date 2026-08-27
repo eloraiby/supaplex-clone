@@ -85,16 +85,25 @@ fn run(level: &Level, level_number: usize) -> Result<(), String> {
     // refresh. Four animation frames therefore produce a 160 ms cell movement.
     const STEP: Duration = Duration::from_millis(40);
     const MAX_STEPS_PER_FRAME: usize = 6;
+    // Vsync is only a request and is ignored by some SDL render backends. An
+    // independent deadline prevents those backends from rendering hundreds of
+    // redundant frames per second and consuming an entire CPU core.
+    const RENDER_INTERVAL: Duration = Duration::from_nanos(1_000_000_000 / 60);
     let mut previous = std::time::Instant::now();
     let mut accumulator = Duration::ZERO;
     let mut drop_disk = false;
+    let mut window_title = String::new();
 
     'running: loop {
-        let now = std::time::Instant::now();
+        // The frame start serves both the fixed-step accumulator and the
+        // renderer's fallback deadline, keeping their clocks consistent.
+        let frame_started = std::time::Instant::now();
         // Capping a long pause prevents a debugger stop or window drag from
         // causing an unbounded burst of catch-up simulation.
-        accumulator += now.duration_since(previous).min(Duration::from_millis(250));
-        previous = now;
+        accumulator += frame_started
+            .duration_since(previous)
+            .min(Duration::from_millis(250));
+        previous = frame_started;
 
         for event in event_pump.poll_iter() {
             match event {
@@ -151,17 +160,25 @@ fn run(level: &Level, level_number: usize) -> Result<(), String> {
             game.title(),
             game.remaining_infotrons()
         );
-        canvas
-            .window_mut()
-            .set_title(&title)
-            .map_err(|error| format!("update window title: {error}"))?;
+        // Updating native window chrome can be surprisingly expensive on some
+        // compositors, so only cross that platform boundary when data changes.
+        if title != window_title {
+            canvas
+                .window_mut()
+                .set_title(&title)
+                .map_err(|error| format!("update window title: {error}"))?;
+            window_title = title;
+        }
         renderer
             .draw(&mut canvas, &game, level_number)
             .map_err(|error| error.to_string())?;
 
-        // Vsync normally limits the loop; this tiny sleep also prevents a busy
-        // loop on renderers that ignore the requested presentation interval.
-        std::thread::sleep(Duration::from_millis(1));
+        // Hardware vsync normally consumes most or all of this interval. The
+        // explicit remainder is still required for software, dummy, remote,
+        // and misconfigured drivers that return from presentation immediately.
+        if let Some(remaining) = RENDER_INTERVAL.checked_sub(frame_started.elapsed()) {
+            std::thread::sleep(remaining);
+        }
     }
 
     Ok(())
