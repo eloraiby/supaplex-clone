@@ -1081,6 +1081,9 @@ mod tests {
     /// Original level-set bytes used for end-to-end initialization checks.
     const ORIGINAL_LEVELS: &[u8] = include_bytes!("../data/levels.dat");
 
+    /// First legacy attract-mode stream, verified as successful by OpenSupaplex.
+    const ORIGINAL_DEMO_ZERO: &[u8] = include_bytes!("../data/demo0.bin");
+
     /// Creates a compact bordered game with mutable private fields for tests.
     fn game_with(placements: &[(Position, State)], required_infotrons: u16) -> Game {
         let width = 7;
@@ -1143,6 +1146,27 @@ mod tests {
             .load(1)
             .expect("the synthetic original-size level record should parse");
         Board::from_level(&level).expect("all synthetic tile identifiers should be supported")
+    }
+
+    /// Decodes one legacy demo command's low nibble into sampled player input.
+    fn original_demo_input(command: u8) -> Input {
+        // Commands one through four follow Up, Left, Down, Right ordering.
+        // Adding four combines the same direction with Space, while nine is
+        // Space alone. Values ten through fifteen never occur in valid demos.
+        let (direction, action) = match command {
+            0 => (None, false),
+            1 => (Some(Direction::Up), false),
+            2 => (Some(Direction::Left), false),
+            3 => (Some(Direction::Down), false),
+            4 => (Some(Direction::Right), false),
+            5 => (Some(Direction::Up), true),
+            6 => (Some(Direction::Left), true),
+            7 => (Some(Direction::Down), true),
+            8 => (Some(Direction::Right), true),
+            9 => (None, true),
+            _ => panic!("invalid original demo command {command:#x}"),
+        };
+        Input { direction, action }
     }
 
     /// Confirms all indexing routes implement exactly `width * y + x`.
@@ -3782,5 +3806,35 @@ mod tests {
             AnimationKind::ElectronMove(Direction::Right)
         );
         assert_eq!(electron_destination_state.animation().frame(), 0);
+    }
+
+    /// Replays the original successful level-one attract demo to its Exit.
+    #[test]
+    fn original_demo_zero_remains_a_successful_solution() {
+        let level_number = usize::from(ORIGINAL_DEMO_ZERO[0]);
+        let level = LevelSet::new(ORIGINAL_LEVELS)
+            .load(level_number)
+            .expect("the original demo's level should remain available");
+        // Legacy demos predate the embedded SpeedFix seed and consequently use
+        // the zero-initialized entry in the original demo seed table.
+        let mut game =
+            Game::with_random_seed(&level, 0).expect("the original demo's level should initialize");
+
+        for encoded in ORIGINAL_DEMO_ZERO[1..]
+            .iter()
+            .copied()
+            .take_while(|byte| *byte != 0xff)
+        {
+            // The high nibble stores repeat count minus one. Feed every decoded
+            // sample through the public simulation boundary so this remains an
+            // end-to-end scheduler, actor, interaction, and animation check.
+            let input = original_demo_input(encoded & 0x0f);
+            for _ in 0..=encoded >> 4 {
+                game.tick(input);
+            }
+        }
+
+        assert_eq!(game.status(), GameStatus::Completed);
+        assert_eq!(game.remaining_infotrons(), 0);
     }
 }
