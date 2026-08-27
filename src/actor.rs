@@ -93,6 +93,63 @@ impl Direction {
     }
 }
 
+/// Rotation family used by the original eight-state enemy turn cycles.
+///
+/// Snik Snaks and Electrons do not choose a new direction in one update. Their
+/// state byte advances around one of these cycles on global quarter ticks, and
+/// only even-numbered frames test the direction represented by that picture.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum EnemyTurn {
+    /// Counter-clockwise cycle whose candidates are Up, Left, Down, and Right.
+    Left,
+    /// Clockwise cycle whose candidates are Up, Right, Down, and Left.
+    Right,
+}
+
+impl EnemyTurn {
+    /// Returns the direction tested by an even turn frame.
+    const fn direction_at_frame(self, frame: u8) -> Option<Direction> {
+        // Odd frames are visual intermediates and deliberately perform no
+        // collision test on the original frame-counter phase.
+        match (self, frame & 7) {
+            (Self::Left, 0) | (Self::Right, 0) => Some(Direction::Up),
+            (Self::Left, 2) | (Self::Right, 6) => Some(Direction::Left),
+            (Self::Left, 4) | (Self::Right, 4) => Some(Direction::Down),
+            (Self::Left, 6) | (Self::Right, 2) => Some(Direction::Right),
+            _ => None,
+        }
+    }
+
+    /// Finds the even frame at which this cycle tests `direction`.
+    const fn candidate_frame(self, direction: Direction) -> u8 {
+        match (self, direction) {
+            (Self::Left, Direction::Up) | (Self::Right, Direction::Up) => 0,
+            (Self::Left, Direction::Left) | (Self::Right, Direction::Right) => 2,
+            (Self::Left, Direction::Down) | (Self::Right, Direction::Down) => 4,
+            (Self::Left, Direction::Right) | (Self::Right, Direction::Left) => 6,
+        }
+    }
+
+    /// Selects the serialized starting frame for an enemy facing `heading`.
+    const fn initial_frame(self, heading: Direction) -> u8 {
+        // A new enemy begins on the candidate immediately to its preferred
+        // side. In particular, a right-facing state-zero enemy tests Up.
+        let first_candidate = match self {
+            Self::Left => heading.left(),
+            Self::Right => heading.right(),
+        };
+        self.candidate_frame(first_candidate)
+    }
+
+    /// Returns the intermediate frame just before `direction` is tested.
+    const fn preceding_frame(self, direction: Direction) -> u8 {
+        // Wrapping seven positions backwards converts candidate frame zero to
+        // frame seven while every other even candidate becomes its prior odd
+        // animation frame.
+        self.candidate_frame(direction).wrapping_add(7) & 7
+    }
+}
+
 /// Material Murphy crosses or consumes during one cell-to-cell animation.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum MurphyMoveTarget {
@@ -232,8 +289,12 @@ pub enum AnimationKind {
     Bug,
     /// A safe Bug waiting an independently randomized number of quarter ticks.
     BugDormant,
-    /// The cyclic movement frames of a Snik Snak.
-    SnikSnak,
+    /// One of the original eight-frame Snik Snak turn cycles.
+    SnikSnakTurn(EnemyTurn),
+    /// An eight-update Snik Snak transfer in one cardinal direction.
+    SnikSnakMove(Direction),
+    /// Stable source reservation retained until the moving Snik Snak releases it.
+    SnikSnakVacating(Direction),
     /// The cyclic spark frames of an Electron.
     Electron,
     /// The current retained scroll frame of a Terminal screen.
@@ -300,6 +361,11 @@ enum AnimationNext {
     RandomizeBug,
     /// Return a dormant Bug to lethal active frame zero.
     ActivateBug,
+    /// Resolve the original left/forward/right choices after a Snik Snak transfer.
+    FinishSnikSnakMove {
+        /// Direction of the transfer that has just reached its final frame.
+        direction: Direction,
+    },
     /// Release a movement source reservation as ordinary empty space.
     Release,
     /// Replace the animated cell with empty space.
@@ -571,6 +637,50 @@ impl Animation {
         }
     }
 
+    /// Creates an explicitly positioned Snik Snak turn-cycle frame.
+    fn snik_snak_turn(turn: EnemyTurn, frame: u8) -> Self {
+        // Turn cycles are advanced by the global modulo-four schedule in the
+        // Snik Snak state machine, so their generic terminal action is only a
+        // defensive fallback and should never be reached in valid play.
+        Self {
+            kind: AnimationKind::SnikSnakTurn(turn),
+            frame: frame & 7,
+            frame_count: 8,
+            next: AnimationNext::Act,
+        }
+    }
+
+    /// Creates the eight original transfer frames for a moving Snik Snak.
+    fn snik_snak_move(direction: Direction) -> Self {
+        Self::snik_snak_move_at(direction, 0)
+    }
+
+    /// Restores one validated frame within a Snik Snak transfer.
+    fn snik_snak_move_at(direction: Direction, frame: u8) -> Self {
+        // Callers use this constructor when the penultimate update must also
+        // release the source reservation atomically. Clamp malformed input so
+        // no public State can index beyond the eight original coordinates.
+        Self {
+            kind: AnimationKind::SnikSnakMove(direction),
+            frame: frame.min(MOVEMENT_FRAMES - 1),
+            frame_count: MOVEMENT_FRAMES,
+            next: AnimationNext::FinishSnikSnakMove { direction },
+        }
+    }
+
+    /// Creates a non-advancing source reservation owned by a moving Snik Snak.
+    fn snik_snak_vacating(direction: Direction) -> Self {
+        // The destination updater releases this cell on its seventh transfer
+        // callback. Keeping the reservation stable also makes enemy freeze
+        // pause both halves of the movement exactly as in the original.
+        Self {
+            kind: AnimationKind::SnikSnakVacating(direction),
+            frame: 0,
+            frame_count: 1,
+            next: AnimationNext::Act,
+        }
+    }
+
     /// Creates the passive visual state for one Terminal screen offset.
     ///
     /// Terminal scrolling is scheduled by the actor's signed delay rather than
@@ -694,6 +804,7 @@ impl Animation {
                 | AnimationKind::MurphyDestination
                 | AnimationKind::RoundedSide
                 | AnimationKind::RoundedDestination
+                | AnimationKind::SnikSnakVacating(_)
         ) {
             return AnimationAdvance::Ready;
         }
@@ -808,6 +919,7 @@ impl State {
             && !matches!(
                 self.animation.kind,
                 AnimationKind::Vacating(_)
+                    | AnimationKind::SnikSnakVacating(_)
                     | AnimationKind::MurphyDestination
                     | AnimationKind::RoundedSide
                     | AnimationKind::RoundedDestination
@@ -1481,6 +1593,23 @@ fn murphy_is_protected_from_falling_actor(state: &State) -> bool {
     preparing_horizontal_push || animating_horizontal_push
 }
 
+/// Reports whether Murphy is in one of the four port-traversal states.
+fn murphy_is_crossing_port(state: &State) -> bool {
+    // Snik Snak turn-state collision uniquely exempts original Murphy states
+    // 0x18 through 0x1b. Those four bytes are precisely the directional port
+    // animations represented by this semantic variant.
+    matches!(
+        state,
+        State {
+            actor: Actor::Murphy(_),
+            animation: Animation {
+                kind: AnimationKind::Murphy(MurphyAnimation::Port { .. }),
+                ..
+            },
+        }
+    )
+}
+
 impl Default for Murphy {
     /// Uses the canonical right-facing starting pose.
     fn default() -> Self {
@@ -1758,7 +1887,7 @@ pub struct SnikSnak {
 }
 
 impl SnikSnak {
-    /// Creates a Snik Snak with a deterministic initial heading.
+    /// Creates a Snik Snak whose first left-turn candidate follows `heading`.
     pub const fn new(heading: Direction) -> Self {
         Self { heading }
     }
@@ -1768,45 +1897,165 @@ impl SnikSnak {
         self.heading
     }
 
-    /// Attacks adjacent Murphy or chooses the next wall-following step.
-    fn transition(&self, position: Position, world: &WorldView<'_>) -> Option<Transition> {
+    /// Advances or evaluates the current globally phased turn animation.
+    fn transition(
+        &self,
+        state: &State,
+        position: Position,
+        world: &WorldView<'_>,
+    ) -> Option<Transition> {
         if world.freeze_enemies() {
+            // Original enemy freeze returns before changing either the state
+            // byte or framebuffer, so retaining the complete State is required.
+            return None;
+        }
+
+        let AnimationKind::SnikSnakTurn(turn) = state.animation.kind else {
+            // Transfers are handled by the generic finite-animation path. This
+            // fallback makes an internally malformed idle Snik Snak recover to
+            // the correct left-turn cycle without inventing an instant step.
+            debug_assert!(
+                matches!(state.animation.kind, AnimationKind::Idle),
+                "Snik Snak decisions require a turn animation"
+            );
             return Some(Transition::replace(
                 position,
-                State::new(Actor::SnikSnak(*self)),
+                State::animated(
+                    Actor::SnikSnak(*self),
+                    Animation::snik_snak_turn(
+                        EnemyTurn::Left,
+                        EnemyTurn::Left.initial_frame(self.heading),
+                    ),
+                ),
+            ));
+        };
+
+        if world.tick_count().is_multiple_of(4) {
+            // The original draws the current turn picture and then increments
+            // its low three state bits, wrapping within the selected cycle.
+            let next_frame = (state.animation.frame + 1) & 7;
+            return Some(Transition::replace(
+                position,
+                State::animated(
+                    Actor::SnikSnak(*self),
+                    Animation::snik_snak_turn(turn, next_frame),
+                ),
             ));
         }
 
-        if adjacent_murphy(position, world).is_some() {
-            // The blast belongs to the enemy's cell; Murphy is merely one of
-            // the adjacent affected cells and therefore receives the death event.
-            return Some(explode_at(world, position, false));
+        if world.tick_count() % 4 != 3 {
+            return None;
         }
 
-        // Snik Snaks keep their left side near a wall. Each candidate is read
-        // from the board left by every earlier cell in the linear update pass.
-        for direction in [
-            self.heading.left(),
-            self.heading,
-            self.heading.right(),
-            self.heading.opposite(),
-        ] {
-            if let Some(destination) = world.offset(position, direction)
-                && world.is_empty(destination)
-            {
-                return Some(Transition::move_actor(
+        let direction = turn.direction_at_frame(state.animation.frame)?;
+        let destination = world.offset(position, direction)?;
+        if world.is_empty(destination) {
+            return Some(Transition::move_snik_snak(
+                position,
+                destination,
+                Actor::SnikSnak(Self { heading: direction }),
+                direction,
+            ));
+        }
+
+        let target_is_vulnerable_murphy = world.state(destination).is_some_and(|target| {
+            matches!(target.actor(), Actor::Murphy(_)) && !murphy_is_crossing_port(target)
+        });
+        target_is_vulnerable_murphy.then(|| explode_at(world, position, false))
+    }
+
+    /// Releases the old source on the original seventh movement callback.
+    fn advance_penultimate_movement(
+        &self,
+        position: Position,
+        direction: Direction,
+        state: &State,
+        world: &WorldView<'_>,
+    ) -> Transition {
+        debug_assert_eq!(state.animation.frame, 6);
+        let mut writes = vec![CellWrite::new(
+            position,
+            State::animated(
+                Actor::SnikSnak(*self),
+                Animation::snik_snak_move_at(direction, 7),
+            ),
+        )];
+
+        if let Some(source) = world.offset(position, direction.opposite())
+            && world.state(source).is_some_and(|source_state| {
+                matches!(source_state.actor(), Actor::Empty(_))
+                    && source_state.animation.kind == AnimationKind::SnikSnakVacating(direction)
+            })
+        {
+            // A blast may already have replaced the reservation. As in the DOS
+            // routine, never erase an Explosion encountered at the old source.
+            writes.push(CellWrite::new(source, State::empty()));
+        }
+
+        Transition::new(writes, Vec::new())
+    }
+
+    /// Resolves left, forward, right, then turn-around after a completed move.
+    fn finish_movement(
+        &self,
+        position: Position,
+        direction: Direction,
+        world: &WorldView<'_>,
+    ) -> Transition {
+        let left = direction.left();
+        if self.is_empty_or_murphy(position, left, world) {
+            return self.begin_turn(position, EnemyTurn::Left, left);
+        }
+
+        if let Some(forward) = world.offset(position, direction) {
+            if world.is_empty(forward) {
+                return Transition::move_snik_snak(
                     position,
-                    destination,
-                    Actor::SnikSnak(Self { heading: direction }),
+                    forward,
+                    Actor::SnikSnak(*self),
                     direction,
-                ));
+                );
+            }
+            if world
+                .state(forward)
+                .is_some_and(|state| matches!(state.actor(), Actor::Murphy(_)))
+            {
+                // Unlike side contact, forward contact detonates immediately
+                // and does not exempt Murphy while he crosses a port.
+                return explode_at(world, position, false);
             }
         }
 
-        Some(Transition::replace(
-            position,
-            State::new(Actor::SnikSnak(*self)),
-        ))
+        let right = direction.right();
+        if self.is_empty_or_murphy(position, right, world) {
+            return self.begin_turn(position, EnemyTurn::Right, right);
+        }
+
+        // A dead end begins a counter-clockwise scan from the left candidate;
+        // it does not teleport the enemy into the cell behind it.
+        self.begin_turn(position, EnemyTurn::Left, left)
+    }
+
+    /// Reports whether a side cell causes a turn without immediate attack.
+    fn is_empty_or_murphy(
+        &self,
+        position: Position,
+        direction: Direction,
+        world: &WorldView<'_>,
+    ) -> bool {
+        // The original movement-completion routines treat Murphy exactly like
+        // Space for side-choice purposes. Contact is reconsidered only after
+        // the turn cycle reaches that direction on a later quarter tick.
+        world
+            .offset(position, direction)
+            .and_then(|target| world.state(target))
+            .is_some_and(|state| state.is_empty() || matches!(state.actor(), Actor::Murphy(_)))
+    }
+
+    /// Builds the odd intermediate frame preceding one side candidate.
+    fn begin_turn(&self, position: Position, turn: EnemyTurn, candidate: Direction) -> Transition {
+        let animation = Animation::snik_snak_turn(turn, turn.preceding_frame(candidate));
+        Transition::replace(position, State::animated(Actor::SnikSnak(*self), animation))
     }
 }
 
@@ -2079,6 +2328,27 @@ impl Actor {
             return murphy.transition(position, world);
         }
 
+        // Snik Snak turn cycles use two different global modulo-four phases,
+        // while their penultimate transfer update also owns source cleanup.
+        // Intercept both before generic per-tick animation advancement.
+        if let Self::SnikSnak(snik_snak) = self {
+            if world.freeze_enemies() {
+                return None;
+            }
+            match state.animation.kind {
+                AnimationKind::SnikSnakTurn(_) => {
+                    return snik_snak.transition(state, position, world);
+                }
+                AnimationKind::SnikSnakMove(direction) if state.animation.frame == 6 => {
+                    return Some(
+                        snik_snak.advance_penultimate_movement(position, direction, state, world),
+                    );
+                }
+                AnimationKind::SnikSnakMove(_) => {}
+                _ => {}
+            }
+        }
+
         // Reserved push/snap targets retain their actor identity for rendering
         // and blast interactions but must not fall, roll, or otherwise update.
         if state.animation.kind == AnimationKind::MurphyPushTarget {
@@ -2305,6 +2575,15 @@ impl Actor {
                     State::animated(Self::Bug(Bug), Animation::bug_active()),
                 ));
             }
+            AnimationAdvance::Finished(AnimationNext::FinishSnikSnakMove { direction }) => {
+                let Self::SnikSnak(snik_snak) = self else {
+                    // Only `Animation::snik_snak_move` constructs this promise.
+                    // Recover malformed state without mutating neighboring cells.
+                    debug_assert!(false, "only a Snik Snak may finish this movement");
+                    return Some(Transition::replace(position, State::new(self.clone())));
+                };
+                return Some(snik_snak.finish_movement(position, direction, world));
+            }
             AnimationAdvance::Finished(AnimationNext::Release) => {
                 return Some(Transition::replace(position, State::empty()));
             }
@@ -2490,7 +2769,7 @@ impl Actor {
             Self::Exit(actor) => actor.transition(position, world),
             Self::OrangeDisk(actor) => actor.transition(position, world),
             Self::Port(actor) => actor.transition(position, world),
-            Self::SnikSnak(actor) => actor.transition(position, world),
+            Self::SnikSnak(actor) => actor.transition(state, position, world),
             Self::YellowDisk(actor) => actor.transition(position, world),
             Self::Terminal(actor) => actor.transition(position, world),
             Self::RedDisk(actor) => actor.transition(position, world),
@@ -2504,7 +2783,10 @@ impl Actor {
     /// Returns the validated starting/resting animation for this actor type.
     fn default_animation(&self) -> Animation {
         match self {
-            Self::SnikSnak(_) => Animation::cycle_then_act(AnimationKind::SnikSnak, 4),
+            Self::SnikSnak(actor) => Animation::snik_snak_turn(
+                EnemyTurn::Left,
+                EnemyTurn::Left.initial_frame(actor.heading),
+            ),
             Self::Electron(_) => Animation::cycle_then_act(AnimationKind::Electron, 8),
             Self::Bug(_) => Animation::bug_active(),
             Self::Terminal(terminal) => Animation::terminal(terminal.screen_frame),
@@ -2834,6 +3116,30 @@ impl Transition {
                 CellWrite::new(destination, destination_state),
             ],
             events,
+        )
+    }
+
+    /// Starts a Snik Snak transfer with a destination-owned release schedule.
+    fn move_snik_snak(
+        source: Position,
+        destination: Position,
+        actor: Actor,
+        direction: Direction,
+    ) -> Self {
+        // A generic Vacating animation releases itself after eight callbacks.
+        // The DOS enemy instead clears its source from movement frame seven,
+        // so this stable reservation is explicitly owned by the destination.
+        let destination_state = State::animated(actor, Animation::snik_snak_move(direction));
+        let source_state = State::animated(
+            Actor::Empty(Empty),
+            Animation::snik_snak_vacating(direction),
+        );
+        Self::new(
+            vec![
+                CellWrite::new(source, source_state),
+                CellWrite::new(destination, destination_state),
+            ],
+            Vec::new(),
         )
     }
 

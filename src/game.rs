@@ -2640,6 +2640,95 @@ mod tests {
         assert!(quarter_frame > second_frame);
     }
 
+    /// Confirms a Snik Snak rotates on quarter ticks before reserving a step.
+    #[test]
+    fn snik_snak_turns_before_moving_and_releases_its_source_on_frame_seven() {
+        let source = Position::new(3, 3);
+        let left_destination = Position::new(2, 3);
+        let mut game = game_with(
+            &[
+                (
+                    Position::new(5, 4),
+                    State::new(Actor::Murphy(Murphy::new())),
+                ),
+                (
+                    source,
+                    State::new(Actor::SnikSnak(SnikSnak::new(Direction::Right))),
+                ),
+            ],
+            0,
+        );
+
+        // State zero advances on tick zero; the first actionable even state is
+        // reached on tick seven. No instant wall-following choice is allowed.
+        for _ in 0..7 {
+            game.tick(Input::default());
+        }
+        assert!(matches!(
+            actor_at(&game, source.x, source.y),
+            Actor::SnikSnak(_)
+        ));
+        game.tick(Input::default());
+        assert!(matches!(
+            actor_at(&game, left_destination.x, left_destination.y),
+            Actor::SnikSnak(_)
+        ));
+        assert_eq!(
+            game.board()
+                .state(left_destination)
+                .expect("moving Snik Snak destination should exist")
+                .animation()
+                .kind(),
+            AnimationKind::SnikSnakMove(Direction::Left)
+        );
+
+        for _ in 0..6 {
+            game.tick(Input::default());
+        }
+        assert!(
+            !game
+                .board()
+                .state(source)
+                .expect("source reservation should exist through frame six")
+                .is_empty()
+        );
+        game.tick(Input::default());
+        assert!(
+            game.board()
+                .state(source)
+                .expect("source cell should remain addressable")
+                .is_empty()
+        );
+    }
+
+    /// Confirms side contact waits until the matching Snik Snak turn state.
+    #[test]
+    fn snik_snak_attacks_only_the_direction_of_its_current_turn_frame() {
+        let mut game = game_with(
+            &[
+                (
+                    Position::new(2, 3),
+                    State::new(Actor::Murphy(Murphy::new())),
+                ),
+                (
+                    Position::new(3, 3),
+                    State::new(Actor::SnikSnak(SnikSnak::new(Direction::Right))),
+                ),
+            ],
+            0,
+        );
+
+        // Murphy is adjacent from the beginning, but frame zero's intervening
+        // rotation must complete before frame two tests the left-hand cell.
+        for _ in 0..7 {
+            game.tick(Input::default());
+            assert_eq!(game.status(), GameStatus::Playing);
+        }
+        game.tick(Input::default());
+        assert_eq!(game.status(), GameStatus::Dead);
+        assert!(matches!(actor_at(&game, 3, 3), Actor::Explosion(_)));
+    }
+
     /// Confirms special-port metadata is applied by the completed traversal.
     #[test]
     fn crossing_a_special_port_updates_global_toggles() {

@@ -10,9 +10,12 @@ use sdl2::{
 };
 
 use crate::{
-    actor::{Actor, AnimationKind, Direction, MurphyAnimation, MurphyMoveTarget, Position, State},
+    actor::{
+        Actor, AnimationKind, Direction, EnemyTurn, MurphyAnimation, MurphyMoveTarget, Position,
+        State,
+    },
     game::{Game, GameStatus},
-    murphy_animation::{SpritePart, sprite_parts},
+    murphy_animation::{SourcePoint, SpritePart, sprite_parts},
 };
 
 /// Logical width used by the resizable SDL window.
@@ -173,6 +176,7 @@ impl<'textures> Renderer<'textures> {
                     AnimationKind::Moving(_)
                         | AnimationKind::Rolling(_)
                         | AnimationKind::OrangeFalling
+                        | AnimationKind::SnikSnakMove(_)
                         | AnimationKind::Murphy(_)
                 );
                 if is_interpolated != moving_pass {
@@ -227,6 +231,15 @@ impl<'textures> Renderer<'textures> {
                 state.animation().frame(),
                 camera,
             );
+        }
+
+        if matches!(state.actor(), Actor::SnikSnak(_))
+            && matches!(
+                state.animation().kind(),
+                AnimationKind::SnikSnakTurn(_) | AnimationKind::SnikSnakMove(_)
+            )
+        {
+            return self.draw_snik_snak_animation(canvas, position, state, camera);
         }
 
         let sprite = sprite_for_state(state);
@@ -334,6 +347,24 @@ impl<'textures> Renderer<'textures> {
             );
             return Ok(());
         };
+        self.draw_murphy_part(canvas, position, part, camera)
+    }
+
+    /// Draws one exact original Snik Snak turn or transfer rectangle.
+    fn draw_snik_snak_animation(
+        &mut self,
+        canvas: &mut Canvas<Window>,
+        position: Position,
+        state: &State,
+        camera: Camera,
+    ) -> Result<(), RenderError> {
+        let Some(part) = snik_snak_sprite_part(state.animation().kind(), state.animation().frame())
+        else {
+            debug_assert!(false, "Snik Snak renderer received an unsupported phase");
+            return Ok(());
+        };
+        // Enemy frames share the same colorkeyed MOVING.DAT conversion and
+        // unscaled offset convention as Murphy and gravity actors.
         self.draw_murphy_part(canvas, position, part, camera)
     }
 
@@ -516,6 +547,103 @@ fn gravity_sprite_part(actor: &Actor, kind: AnimationKind, frame: u8) -> Option<
     Some(part)
 }
 
+/// Original `MOVING.DAT` coordinates for all sixteen turn and thirty-two move frames.
+///
+/// The first two groups are counter-clockwise and clockwise turns. The final
+/// four groups are transfers Up, Left, Down, and Right in original state order.
+const SNIK_SNAK_SOURCE_POINTS: [SourcePoint; 48] = [
+    SourcePoint { x: 192, y: 388 },
+    SourcePoint { x: 64, y: 260 },
+    SourcePoint { x: 96, y: 244 },
+    SourcePoint { x: 80, y: 260 },
+    SourcePoint { x: 208, y: 388 },
+    SourcePoint { x: 96, y: 260 },
+    SourcePoint { x: 48, y: 260 },
+    SourcePoint { x: 112, y: 260 },
+    SourcePoint { x: 192, y: 388 },
+    SourcePoint { x: 112, y: 260 },
+    SourcePoint { x: 48, y: 260 },
+    SourcePoint { x: 96, y: 260 },
+    SourcePoint { x: 208, y: 388 },
+    SourcePoint { x: 80, y: 260 },
+    SourcePoint { x: 96, y: 244 },
+    SourcePoint { x: 64, y: 260 },
+    SourcePoint { x: 0, y: 424 },
+    SourcePoint { x: 16, y: 424 },
+    SourcePoint { x: 32, y: 424 },
+    SourcePoint { x: 48, y: 424 },
+    SourcePoint { x: 64, y: 424 },
+    SourcePoint { x: 80, y: 424 },
+    SourcePoint { x: 96, y: 424 },
+    SourcePoint { x: 112, y: 424 },
+    SourcePoint { x: 192, y: 228 },
+    SourcePoint { x: 224, y: 228 },
+    SourcePoint { x: 256, y: 228 },
+    SourcePoint { x: 288, y: 228 },
+    SourcePoint { x: 0, y: 244 },
+    SourcePoint { x: 32, y: 244 },
+    SourcePoint { x: 64, y: 244 },
+    SourcePoint { x: 96, y: 244 },
+    SourcePoint { x: 144, y: 422 },
+    SourcePoint { x: 160, y: 422 },
+    SourcePoint { x: 176, y: 422 },
+    SourcePoint { x: 192, y: 422 },
+    SourcePoint { x: 208, y: 422 },
+    SourcePoint { x: 224, y: 422 },
+    SourcePoint { x: 240, y: 422 },
+    SourcePoint { x: 256, y: 422 },
+    SourcePoint { x: 128, y: 244 },
+    SourcePoint { x: 160, y: 244 },
+    SourcePoint { x: 192, y: 244 },
+    SourcePoint { x: 224, y: 244 },
+    SourcePoint { x: 256, y: 244 },
+    SourcePoint { x: 288, y: 244 },
+    SourcePoint { x: 0, y: 260 },
+    SourcePoint { x: 32, y: 260 },
+];
+
+/// Selects one variably sized Snik Snak rectangle and its logical-cell offset.
+fn snik_snak_sprite_part(kind: AnimationKind, frame: u8) -> Option<SpritePart> {
+    let frame = frame.min(7);
+    let (source_index, width, height, offset_x, offset_y) = match kind {
+        AnimationKind::SnikSnakTurn(turn) => {
+            let cycle_start = match turn {
+                EnemyTurn::Left => 0,
+                EnemyTurn::Right => 8,
+            };
+            (cycle_start + usize::from(frame), 16, 16, 0, 0)
+        }
+        AnimationKind::SnikSnakMove(Direction::Up) => {
+            // Up states use gravity offsets one through eight, beginning two
+            // original pixels above the retained source cell.
+            (
+                16 + usize::from(frame),
+                16,
+                18,
+                0,
+                14 - i32::from(frame) * 2,
+            )
+        }
+        AnimationKind::SnikSnakMove(Direction::Left) => (24 + usize::from(frame), 32, 16, 0, 0),
+        AnimationKind::SnikSnakMove(Direction::Down) => (
+            32 + usize::from(frame),
+            16,
+            18,
+            0,
+            -16 + i32::from(frame) * 2,
+        ),
+        AnimationKind::SnikSnakMove(Direction::Right) => (40 + usize::from(frame), 32, 16, -16, 0),
+        _ => return None,
+    };
+    Some(SpritePart {
+        source: SNIK_SNAK_SOURCE_POINTS[source_index],
+        width,
+        height,
+        offset_x,
+        offset_y,
+    })
+}
+
 /// Returns the rendered width of one string in logical SDL pixels.
 fn text_width(text: &str) -> u32 {
     // Saturating conversion and multiplication keep layout total even for an
@@ -604,7 +732,6 @@ fn sprite_for_state(state: &State) -> SpriteCell {
         AnimationKind::BugDormant => static_sprite(2),
         AnimationKind::Electron => SpriteCell::new(8 + frame.min(7), 10),
         AnimationKind::Terminal => SpriteCell::new(frame.min(6), 10),
-        AnimationKind::SnikSnak => snik_sprite(state, frame),
         AnimationKind::Murphy(action) => murphy_animation_sprite(action, frame),
         AnimationKind::Moving(direction) | AnimationKind::Rolling(direction) => {
             moving_sprite(state, direction, frame)
@@ -620,6 +747,9 @@ fn sprite_for_state(state: &State) -> SpriteCell {
         | AnimationKind::RoundedDestination
         | AnimationKind::OrangePreFall
         | AnimationKind::OrangeFalling
+        | AnimationKind::SnikSnakTurn(_)
+        | AnimationKind::SnikSnakMove(_)
+        | AnimationKind::SnikSnakVacating(_)
         | AnimationKind::RedDiskFuse
         | AnimationKind::OrangeDiskFuse => static_sprite(state.actor().tile_code()),
     }
@@ -630,7 +760,6 @@ fn moving_sprite(state: &State, direction: Direction, frame: u8) -> SpriteCell {
     match state.actor() {
         Actor::Zonk(_) if direction.is_horizontal() => zonk_moving_sprite(direction, frame),
         Actor::Infotron(_) if direction.is_horizontal() => infotron_moving_sprite(direction, frame),
-        Actor::SnikSnak(_) => snik_direction_sprite(direction, frame),
         Actor::Electron(_) => SpriteCell::new(8 + frame.saturating_mul(2).min(7), 10),
         _ => static_sprite(state.actor().tile_code()),
     }
@@ -685,26 +814,6 @@ fn infotron_moving_sprite(direction: Direction, frame: u8) -> SpriteCell {
         Direction::Up | Direction::Down => return static_sprite(4),
     };
     SpriteCell::new(8 + strip_frame, 13)
-}
-
-/// Selects a Snik Snak strip from its persistent heading.
-fn snik_sprite(state: &State, frame: u8) -> SpriteCell {
-    let direction = match state.actor() {
-        Actor::SnikSnak(actor) => actor.heading(),
-        _ => Direction::Left,
-    };
-    snik_direction_sprite(direction, frame)
-}
-
-/// Selects the four-frame strip corresponding to one Snik Snak direction.
-fn snik_direction_sprite(direction: Direction, frame: u8) -> SpriteCell {
-    let (column, row) = match direction {
-        Direction::Left => (8, 8),
-        Direction::Right => (12, 8),
-        Direction::Up => (8, 9),
-        Direction::Down => (12, 9),
-    };
-    SpriteCell::new(column + frame.min(3), row)
 }
 
 /// Supplies an atlas fallback for one semantic original Murphy descriptor.
@@ -920,9 +1029,10 @@ mod tests {
 
     use super::{
         ATLAS_COLUMNS, ATLAS_ROWS, CHARS8_PNG, MOVING_PNG, ROCKS_SP_PNG, bug_sprite, decode_png,
-        gravity_sprite_part, infotron_moving_sprite, ping_pong, static_sprite, zonk_moving_sprite,
+        gravity_sprite_part, infotron_moving_sprite, ping_pong, snik_snak_sprite_part,
+        static_sprite, zonk_moving_sprite,
     };
-    use crate::actor::{Actor, AnimationKind, Direction, Infotron, OrangeDisk, Zonk};
+    use crate::actor::{Actor, AnimationKind, Direction, EnemyTurn, Infotron, OrangeDisk, Zonk};
 
     /// Confirms all embedded resources decode to their contracted RGBA sizes.
     #[test]
@@ -1038,5 +1148,24 @@ mod tests {
         assert_eq!((infotron.source.x, infotron.source.y), (240, 178));
         assert_eq!((orange.source.x, orange.source.y), (128, 64));
         assert_eq!(orange.offset_y, 0);
+    }
+
+    /// Confirms Snik Snak turns and moves use the literal MOVING.DAT rectangles.
+    #[test]
+    fn snik_snak_frames_preserve_turn_order_and_wide_horizontal_composites() {
+        let turn = snik_snak_sprite_part(AnimationKind::SnikSnakTurn(EnemyTurn::Left), 2)
+            .expect("left-turn frame should map");
+        let move_left = snik_snak_sprite_part(AnimationKind::SnikSnakMove(Direction::Left), 7)
+            .expect("left movement frame should map");
+        let move_up = snik_snak_sprite_part(AnimationKind::SnikSnakMove(Direction::Up), 0)
+            .expect("up movement frame should map");
+
+        assert_eq!((turn.source.x, turn.source.y), (96, 244));
+        assert_eq!((move_left.source.x, move_left.source.y), (96, 244));
+        assert_eq!((move_left.width, move_left.height), (32, 16));
+        assert_eq!(
+            (move_up.width, move_up.height, move_up.offset_y),
+            (16, 18, 14)
+        );
     }
 }
