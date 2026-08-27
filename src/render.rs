@@ -63,6 +63,9 @@ const MOVING_PNG: &[u8] = include_bytes!("../assets/moving.png");
 /// Integer enlargement from original 16-pixel tiles to the 32-pixel board.
 const MOVING_SCALE: u32 = 2;
 
+/// Display-space distance Murphy advances during one original movement update.
+const MURPHY_STEP: i32 = 2 * MOVING_SCALE as i32;
+
 /// Grid location of one 32×32 source frame in `RocksSP.png`.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 struct SpriteCell {
@@ -1005,8 +1008,11 @@ fn ping_pong(frame: u8, frame_count: u8) -> u8 {
 
 /// Returns the sub-cell pixel offset implied by a movement animation.
 fn movement_offset(state: &State) -> (i32, i32) {
-    // The actor already occupies its logical destination. At frame zero it is
-    // drawn at its prior logical location, then approaches zero displacement.
+    // Ordinary moving actors interpolate between inclusive endpoints because
+    // their frame zero represents the untouched source position. Murphy is
+    // handled separately below: his original routine advances its persistent
+    // pixel position before drawing frame zero, so reusing this progress value
+    // would insert a motionless update at the start of every Murphy action.
     let remaining = 1.0 - state.animation().progress();
     let distance = (remaining * TILE_SIZE as f32).round() as i32;
     match state.animation().kind() {
@@ -1021,31 +1027,61 @@ fn movement_offset(state: &State) -> (i32, i32) {
             Direction::Right => (-distance, -distance),
             Direction::Up | Direction::Down => (0, 0),
         },
-        AnimationKind::Murphy(MurphyAnimation::Move { direction, .. }) => match direction {
-            Direction::Up => (0, distance),
-            Direction::Right => (-distance, 0),
-            Direction::Down => (0, -distance),
-            Direction::Left => (distance, 0),
-        },
-        AnimationKind::Murphy(MurphyAnimation::Push { direction, .. }) => {
-            let travelled = TILE_SIZE as i32 - distance;
-            match direction {
-                Direction::Up => (0, -travelled),
-                Direction::Right => (travelled, 0),
-                Direction::Down => (0, travelled),
-                Direction::Left => (-travelled, 0),
-            }
-        }
-        AnimationKind::Murphy(MurphyAnimation::Port { direction }) => {
-            let travelled = (TILE_SIZE as i32 - distance) * 2;
-            match direction {
-                Direction::Up => (0, -travelled),
-                Direction::Right => (travelled, 0),
-                Direction::Down => (0, travelled),
-                Direction::Left => (-travelled, 0),
-            }
-        }
+        AnimationKind::Murphy(action) => murphy_movement_offset(action, state.animation().frame()),
         _ => (0, 0),
+    }
+}
+
+/// Reconstructs Murphy's original persistent pixel position for one action frame.
+fn murphy_movement_offset(action: MurphyAnimation, frame: u8) -> (i32, i32) {
+    // The DOS routine adds `speedX` and `speedY` before it draws the selected
+    // coordinate. Consequently frame zero has already travelled two original
+    // pixels, or four pixels after this renderer's integer enlargement. Limit
+    // ordinary travel to one tile so the historical ninth right-Red-Disk image
+    // remains duplicated artwork instead of moving the camera beyond Murphy's
+    // logical destination.
+    let updates = i32::from(frame) + 1;
+    let travelled = (updates * MURPHY_STEP).min(TILE_SIZE as i32);
+
+    match action {
+        MurphyAnimation::Move { direction, .. } => {
+            // A moving Murphy is stored at his destination from frame zero.
+            // Subtract the distance not yet travelled to recover the original
+            // pixel position between the reserved source and destination.
+            let remaining = TILE_SIZE as i32 - travelled;
+            match direction {
+                Direction::Up => (0, remaining),
+                Direction::Right => (-remaining, 0),
+                Direction::Down => (0, -remaining),
+                Direction::Left => (remaining, 0),
+            }
+        }
+        MurphyAnimation::Push { direction, .. } => {
+            // Push animations remain anchored at Murphy's source cell until
+            // their final collision update transfers him into the target cell.
+            match direction {
+                Direction::Up => (0, -travelled),
+                Direction::Right => (travelled, 0),
+                Direction::Down => (0, travelled),
+                Direction::Left => (-travelled, 0),
+            }
+        }
+        MurphyAnimation::Port { direction } => {
+            // Port descriptors cross two cells in the same eight updates, so
+            // their original velocity is twice ordinary Murphy movement.
+            let port_travelled = travelled * 2;
+            match direction {
+                Direction::Up => (0, -port_travelled),
+                Direction::Right => (port_travelled, 0),
+                Direction::Down => (0, port_travelled),
+                Direction::Left => (-port_travelled, 0),
+            }
+        }
+        // Snapping, planting, and exiting select changing artwork without
+        // changing Murphy's persistent world-space position.
+        MurphyAnimation::Snap { .. } | MurphyAnimation::Exit | MurphyAnimation::PlantRedDisk => {
+            (0, 0)
+        }
     }
 }
 
@@ -1150,10 +1186,13 @@ mod tests {
 
     use super::{
         ATLAS_COLUMNS, ATLAS_ROWS, CHARS8_PNG, MOVING_PNG, ROCKS_SP_PNG, bug_sprite, decode_png,
-        electron_sprite_part, gravity_sprite_part, infotron_moving_sprite, ping_pong,
-        snik_snak_sprite_part, static_sprite, zonk_moving_sprite,
+        electron_sprite_part, gravity_sprite_part, infotron_moving_sprite, murphy_movement_offset,
+        ping_pong, snik_snak_sprite_part, static_sprite, zonk_moving_sprite,
     };
-    use crate::actor::{Actor, AnimationKind, Direction, EnemyTurn, Infotron, OrangeDisk, Zonk};
+    use crate::actor::{
+        Actor, AnimationKind, Direction, EnemyTurn, Infotron, MurphyAnimation, MurphyMoveTarget,
+        MurphyPushTarget, OrangeDisk, Zonk,
+    };
 
     /// Confirms all embedded resources decode to their contracted RGBA sizes.
     #[test]
@@ -1186,6 +1225,79 @@ mod tests {
         let frames = (0..8).map(|frame| ping_pong(frame, 4)).collect::<Vec<_>>();
 
         assert_eq!(frames, vec![0, 1, 2, 3, 2, 1, 0, 1]);
+    }
+
+    /// Confirms chained movement advances on frame zero instead of pausing at a tile boundary.
+    #[test]
+    fn murphy_camera_motion_has_no_duplicate_boundary_sample() {
+        let movement = MurphyAnimation::Move {
+            direction: Direction::Right,
+            target: MurphyMoveTarget::Empty,
+            looking_left: false,
+        };
+        let tile = super::TILE_SIZE as i32;
+
+        // Each state is anchored at its logical destination. The completed
+        // first move reaches that anchor, while frame zero of the following
+        // move is already four display pixels beyond the shared boundary.
+        let completed_world_x = 5 * tile + murphy_movement_offset(movement, 7).0;
+        let next_started_world_x = 6 * tile + murphy_movement_offset(movement, 0).0;
+
+        assert_eq!(murphy_movement_offset(movement, 0), (-28, 0));
+        assert_eq!(murphy_movement_offset(movement, 7), (0, 0));
+        assert_eq!(next_started_world_x - completed_world_x, 4);
+    }
+
+    /// Confirms every cardinal move uses the original two-pixel unscaled velocity.
+    #[test]
+    fn murphy_move_camera_offsets_advance_four_display_pixels_per_update() {
+        let cases = [
+            (Direction::Up, (0, 28), (0, 0)),
+            (Direction::Right, (-28, 0), (0, 0)),
+            (Direction::Down, (0, -28), (0, 0)),
+            (Direction::Left, (28, 0), (0, 0)),
+        ];
+
+        for (direction, first, last) in cases {
+            let movement = MurphyAnimation::Move {
+                direction,
+                target: MurphyMoveTarget::Empty,
+                looking_left: false,
+            };
+
+            assert_eq!(murphy_movement_offset(movement, 0), first);
+            assert_eq!(murphy_movement_offset(movement, 7), last);
+        }
+    }
+
+    /// Confirms source-anchored pushes and ports retain their distinct original speeds.
+    #[test]
+    fn murphy_push_and_port_camera_offsets_start_on_their_first_frames() {
+        let push = MurphyAnimation::Push {
+            direction: Direction::Left,
+            target: MurphyPushTarget::Zonk,
+        };
+        let port = MurphyAnimation::Port {
+            direction: Direction::Down,
+        };
+
+        assert_eq!(murphy_movement_offset(push, 0), (-4, 0));
+        assert_eq!(murphy_movement_offset(push, 7), (-32, 0));
+        assert_eq!(murphy_movement_offset(port, 0), (0, 8));
+        assert_eq!(murphy_movement_offset(port, 7), (0, 64));
+    }
+
+    /// Confirms the ninth rightward Red Disk picture does not overshoot its destination.
+    #[test]
+    fn murphy_red_disk_ninth_picture_keeps_the_camera_on_the_tile() {
+        let movement = MurphyAnimation::Move {
+            direction: Direction::Right,
+            target: MurphyMoveTarget::RedDisk,
+            looking_left: false,
+        };
+
+        assert_eq!(murphy_movement_offset(movement, 7), (0, 0));
+        assert_eq!(murphy_movement_offset(movement, 8), (0, 0));
     }
 
     /// Confirms every non-negative Bug state follows the original coordinate table.
