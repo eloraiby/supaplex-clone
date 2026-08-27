@@ -44,7 +44,7 @@ const SPECIAL_PORT_SIZE: usize = 6;
 /// Maximum number of special ports reserved in an original level record.
 const MAX_SPECIAL_PORTS: usize = 10;
 
-/// Highest static tile identifier recognized by classic level editors.
+/// Accidental invisible-wall identifier retained by classic SpeedFix-era editors.
 const MAX_TILE_ID: u8 = 40;
 
 /// Read-only view over all fixed-size records in a `LEVELS.DAT` byte slice.

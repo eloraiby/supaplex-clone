@@ -1784,8 +1784,10 @@ pub struct Hardware {
 pub struct InvisibleWall;
 
 impl InvisibleWall {
-    /// Never changes and deliberately renders as empty until Murphy touches it.
+    /// Never changes and is deliberately rendered as empty for its whole lifetime.
     fn transition(&self, _position: Position, _world: &WorldView<'_>) -> Option<Transition> {
+        // Tile 40 is an accidental but historically adopted collision wall. It
+        // has no reveal state: Murphy merely fails to enter the invisible cell.
         None
     }
 }

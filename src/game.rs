@@ -3,6 +3,7 @@
 use std::{
     error::Error,
     fmt,
+    ops::Range,
     time::{SystemTime, UNIX_EPOCH},
 };
 
@@ -84,6 +85,21 @@ impl Board {
     /// Returns every cell in canonical row-major order.
     pub fn cells(&self) -> &[State] {
         &self.cells
+    }
+
+    /// Returns the exact linear interval scanned by the DOS moving-object pass.
+    fn moving_object_scan_range(&self) -> Range<usize> {
+        // The original loop does not skip each row's side cells separately. It
+        // starts at linear index `width + 1` and stops before
+        // `cell_count - width - 1`. On a conventional bordered level that is
+        // effectively the playfield, but malformed edge actors expose the two
+        // asymmetric endpoints and several original demos depend on them.
+        let start = self.width.saturating_add(1).min(self.cells.len());
+        let end = self
+            .cells
+            .len()
+            .saturating_sub(self.width.saturating_add(1));
+        start.min(end)..end
     }
 
     /// Converts a bounded coordinate using the required `width * y + x` rule.
@@ -386,13 +402,15 @@ impl Game {
         // deliberately includes actors Murphy pushed and explosions Murphy
         // created: the original linear scan sees those new tile kinds too. The
         // sole synthetic cell omitted is Murphy's newly Vacating source because
-        // original Space tiles do not receive moving-object callbacks.
-        let schedule = self
-            .board
-            .cells()
+        // original Space tiles do not receive moving-object callbacks. Preserve
+        // the DOS loop's asymmetric linear bounds rather than normalizing them
+        // to a geometric inner rectangle; edge-case demos rely on that detail.
+        let scan_range = self.board.moving_object_scan_range();
+        let schedule = self.board.cells()[scan_range.clone()]
             .iter()
             .enumerate()
             .filter_map(|(index, state)| {
+                let index = scan_range.start + index;
                 let position = self
                     .board
                     .position(index)
@@ -961,8 +979,8 @@ mod tests {
     use super::{Board, Game, GameStatus, Input, PlantedRedDisk};
     use crate::actor::{
         Actor, AnimationKind, Base, Bug, CHAIN_REACTION_FRAMES, Direction, Electron, Empty, Exit,
-        ExplosionResidue, Hardware, Infotron, Murphy, MurphyAnimation, OrangeDisk, Port,
-        PortDirections, Position, RedDisk, SnikSnak, State, Terminal, YellowDisk, Zonk,
+        ExplosionResidue, Hardware, Infotron, InvisibleWall, Murphy, MurphyAnimation, OrangeDisk,
+        Port, PortDirections, Position, RedDisk, SnikSnak, State, Terminal, YellowDisk, Zonk,
     };
     use crate::level::{LevelSet, SpecialPort};
 
@@ -1030,6 +1048,52 @@ mod tests {
         );
         assert_eq!(board.position(5), Some(Position::new(2, 1)));
         assert_eq!(board.index(Position::new(3, 0)), None);
+    }
+
+    /// Confirms the moving-object scan retains the DOS loop's linear endpoints.
+    #[test]
+    fn moving_object_scan_uses_asymmetric_linear_border_bounds() {
+        let mut game = game_with(
+            &[
+                (
+                    Position::new(1, 1),
+                    State::new(Actor::Murphy(Murphy::new())),
+                ),
+                (
+                    Position::new(3, 4),
+                    State::new(Actor::SnikSnak(SnikSnak::new(Direction::Left))),
+                ),
+                (Position::new(3, 5), State::empty()),
+            ],
+            0,
+        );
+
+        // A 7×6 board scans indices 8 through 33. The source at index 31 is
+        // eligible, but the destination on the bottom row at index 38 is not.
+        assert_eq!(game.board.moving_object_scan_range(), 8..34);
+        game.tick = 3;
+        game.tick(Input::default());
+        let bottom_enemy = game
+            .board()
+            .state(Position::new(3, 5))
+            .expect("bottom-edge destination should exist");
+        assert_eq!(
+            bottom_enemy.animation().kind(),
+            AnimationKind::SnikSnakMove(Direction::Down)
+        );
+        assert_eq!(bottom_enemy.animation().frame(), 0);
+
+        for _ in 0..4 {
+            game.tick(Input::default());
+        }
+        assert_eq!(
+            game.board()
+                .state(Position::new(3, 5))
+                .expect("excluded bottom-edge enemy should remain present")
+                .animation()
+                .frame(),
+            0
+        );
     }
 
     /// Confirms destination occupancy and source reservation move in lockstep.
@@ -2640,6 +2704,40 @@ mod tests {
             .animation()
             .frame();
         assert!(quarter_frame > second_frame);
+    }
+
+    /// Confirms accidental tile 40 blocks Murphy without gaining a reveal state.
+    #[test]
+    fn invisible_wall_remains_invisible_and_solid_after_contact() {
+        let wall = Position::new(3, 2);
+        let mut game = game_with(
+            &[
+                (
+                    Position::new(2, 2),
+                    State::new(Actor::Murphy(Murphy::new())),
+                ),
+                (wall, State::new(Actor::InvisibleWall(InvisibleWall))),
+            ],
+            0,
+        );
+        let press_wall = Input {
+            direction: Some(Direction::Right),
+            ..Input::default()
+        };
+
+        game.tick(press_wall);
+        game.tick(press_wall);
+
+        assert!(matches!(actor_at(&game, 2, 2), Actor::Murphy(_)));
+        assert!(matches!(actor_at(&game, 3, 2), Actor::InvisibleWall(_)));
+        assert_eq!(
+            game.board()
+                .state(wall)
+                .expect("invisible wall should remain addressable")
+                .animation()
+                .kind(),
+            AnimationKind::Idle
+        );
     }
 
     /// Confirms a Snik Snak rotates on quarter ticks before reserving a step.

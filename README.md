@@ -49,7 +49,8 @@ action—settle, act, repeat, explode, disappear, or become an Infotron.
 Every fixed tick follows the original deterministic linear order:
 
 1. Murphy inspects and immediately updates the live board first.
-2. The engine captures a row-major list directly from that post-Murphy board.
+2. The engine captures a row-major list directly from that post-Murphy board,
+   using the DOS loop's literal `width + 1 .. cell_count - width - 1` bounds.
 3. Each scheduled updater verifies that its actor still occupies the cell,
    reads the board left by earlier updates, and applies all of its writes and
    events before the next updater runs.
@@ -59,6 +60,10 @@ Every fixed tick follows the original deterministic linear order:
 
 There is no competing-move resolution phase: the update direction is linear,
 and every later callback observes mutations made by every earlier callback.
+The scan bounds are intentionally not rewritten as a geometric inner rectangle;
+the original asymmetric edge behavior is required by known demos. Tile 40 is
+the historical accidental invisible wall: it is always collision-solid, always
+drawn as empty space, and has no reveal-on-touch transition.
 
 Logical movement occupies the destination at animation start while its source
 becomes an invisible `Vacating` reservation. The destination sprite is offset
