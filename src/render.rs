@@ -170,7 +170,10 @@ impl<'textures> Renderer<'textures> {
             for (index, state) in game.board().cells().iter().enumerate() {
                 let is_interpolated = matches!(
                     state.animation().kind(),
-                    AnimationKind::Moving(_) | AnimationKind::Rolling(_) | AnimationKind::Murphy(_)
+                    AnimationKind::Moving(_)
+                        | AnimationKind::Rolling(_)
+                        | AnimationKind::OrangeFalling
+                        | AnimationKind::Murphy(_)
                 );
                 if is_interpolated != moving_pass {
                     continue;
@@ -202,6 +205,18 @@ impl<'textures> Renderer<'textures> {
         // black background untouched.
         if matches!(state.actor(), Actor::Empty(_) | Actor::InvisibleWall(_)) {
             return Ok(());
+        }
+
+        if matches!(
+            state.animation().kind(),
+            AnimationKind::Rolling(_)
+                | AnimationKind::OrangeFalling
+                | AnimationKind::Moving(Direction::Down)
+        ) && matches!(
+            state.actor(),
+            Actor::Zonk(_) | Actor::Infotron(_) | Actor::OrangeDisk(_)
+        ) {
+            return self.draw_gravity_actor(canvas, position, state, camera);
         }
 
         if let AnimationKind::Murphy(action) = state.animation().kind() {
@@ -298,6 +313,28 @@ impl<'textures> Renderer<'textures> {
         canvas
             .copy(&self.moving, source, destination)
             .map_err(RenderError::Sdl)
+    }
+
+    /// Draws original Zonk, Infotron, or Orange fall/slide rectangles.
+    fn draw_gravity_actor(
+        &mut self,
+        canvas: &mut Canvas<Window>,
+        position: Position,
+        state: &State,
+        camera: Camera,
+    ) -> Result<(), RenderError> {
+        let Some(part) = gravity_sprite_part(
+            state.actor(),
+            state.animation().kind(),
+            state.animation().frame(),
+        ) else {
+            debug_assert!(
+                false,
+                "gravity renderer received an unsupported actor phase"
+            );
+            return Ok(());
+        };
+        self.draw_murphy_part(canvas, position, part, camera)
     }
 
     /// Draws level metadata and live counters with the converted DOS font.
@@ -404,6 +441,81 @@ impl<'textures> Renderer<'textures> {
     }
 }
 
+/// Selects one unscaled original source rectangle for a gravity-driven actor.
+fn gravity_sprite_part(actor: &Actor, kind: AnimationKind, frame: u8) -> Option<SpritePart> {
+    let frame = frame.min(7);
+    let part = match (actor, kind) {
+        (Actor::Zonk(_), AnimationKind::Moving(Direction::Down)) => SpritePart {
+            source: crate::murphy_animation::SourcePoint { x: 224, y: 82 },
+            width: 16,
+            height: 18,
+            offset_x: 0,
+            offset_y: -16 + i32::from(frame) * 2,
+        },
+        (Actor::Infotron(_), AnimationKind::Moving(Direction::Down)) => SpritePart {
+            source: crate::murphy_animation::SourcePoint { x: 240, y: 178 },
+            width: 16,
+            height: 18,
+            offset_x: 0,
+            offset_y: -16 + i32::from(frame) * 2,
+        },
+        (Actor::OrangeDisk(_), AnimationKind::OrangeFalling) => SpritePart {
+            source: crate::murphy_animation::SourcePoint { x: 128, y: 64 },
+            width: 16,
+            height: 18,
+            offset_x: 0,
+            offset_y: i32::from(frame) * 2,
+        },
+        (Actor::Zonk(_), AnimationKind::Rolling(direction)) => {
+            let source_y = if direction == Direction::Left {
+                84
+            } else {
+                100
+            };
+            SpritePart {
+                source: crate::murphy_animation::SourcePoint {
+                    x: i32::from(frame) * 32,
+                    y: source_y,
+                },
+                width: 32,
+                height: 16,
+                offset_x: if direction == Direction::Right {
+                    -16
+                } else {
+                    0
+                },
+                offset_y: 0,
+            }
+        }
+        (Actor::Infotron(_), AnimationKind::Rolling(direction)) => {
+            // Frame four of the left strip really begins at x=8 in the
+            // original pointer table. Preserve that historical coordinate.
+            const LEFT_X: [i32; 8] = [0, 32, 64, 96, 8, 160, 192, 224];
+            let (source_x, source_y) = if direction == Direction::Left {
+                (LEFT_X[usize::from(frame)], 164)
+            } else {
+                (i32::from(frame) * 32, 180)
+            };
+            SpritePart {
+                source: crate::murphy_animation::SourcePoint {
+                    x: source_x,
+                    y: source_y,
+                },
+                width: 32,
+                height: 16,
+                offset_x: if direction == Direction::Right {
+                    -16
+                } else {
+                    0
+                },
+                offset_y: 0,
+            }
+        }
+        _ => return None,
+    };
+    Some(part)
+}
+
 /// Returns the rendered width of one string in logical SDL pixels.
 fn text_width(text: &str) -> u32 {
     // Saturating conversion and multiplication keep layout total even for an
@@ -499,9 +611,15 @@ fn sprite_for_state(state: &State) -> SpriteCell {
         }
         AnimationKind::Idle
         | AnimationKind::ZonkPreFall
+        | AnimationKind::InfotronPreFall
+        | AnimationKind::RoundedPreRoll(_)
         | AnimationKind::Vacating(_)
         | AnimationKind::MurphyPushTarget
         | AnimationKind::MurphyDestination
+        | AnimationKind::RoundedSide
+        | AnimationKind::RoundedDestination
+        | AnimationKind::OrangePreFall
+        | AnimationKind::OrangeFalling
         | AnimationKind::RedDiskFuse
         | AnimationKind::OrangeDiskFuse => static_sprite(state.actor().tile_code()),
     }
@@ -801,18 +919,20 @@ mod tests {
     //! Pure mapping and decoding tests that do not initialize SDL video.
 
     use super::{
-        ATLAS_COLUMNS, ATLAS_ROWS, CHARS8_PNG, ROCKS_SP_PNG, bug_sprite, decode_png,
-        infotron_moving_sprite, ping_pong, static_sprite, zonk_moving_sprite,
+        ATLAS_COLUMNS, ATLAS_ROWS, CHARS8_PNG, MOVING_PNG, ROCKS_SP_PNG, bug_sprite, decode_png,
+        gravity_sprite_part, infotron_moving_sprite, ping_pong, static_sprite, zonk_moving_sprite,
     };
-    use crate::actor::Direction;
+    use crate::actor::{Actor, AnimationKind, Direction, Infotron, OrangeDisk, Zonk};
 
-    /// Confirms both embedded resources decode to their contracted RGBA sizes.
+    /// Confirms all embedded resources decode to their contracted RGBA sizes.
     #[test]
     fn embedded_render_assets_are_valid_rgba_pngs() {
         let sprites = decode_png(ROCKS_SP_PNG).expect("sprite atlas should decode");
+        let moving = decode_png(MOVING_PNG).expect("original moving sheet should decode");
         let font = decode_png(CHARS8_PNG).expect("font should decode");
 
         assert_eq!((sprites.width, sprites.height), (512, 480));
+        assert_eq!((moving.width, moving.height), (320, 462));
         assert_eq!((font.width, font.height), (512, 8));
     }
 
@@ -883,5 +1003,40 @@ mod tests {
         assert_eq!(zonk_right, vec![1, 2, 3, 0]);
         assert_eq!(infotron_left, vec![8, 10, 12, 14]);
         assert_eq!(infotron_right, vec![14, 12, 10, 8]);
+    }
+
+    /// Confirms falling actors use the original two-pixel gravity increments.
+    #[test]
+    fn gravity_frames_stop_two_pixels_before_the_destination_tile() {
+        let zonk = Actor::Zonk(Zonk::resting());
+        let first = gravity_sprite_part(&zonk, AnimationKind::Moving(Direction::Down), 0)
+            .expect("Zonk fall frame should map");
+        let last = gravity_sprite_part(&zonk, AnimationKind::Moving(Direction::Down), 7)
+            .expect("Zonk fall frame should map");
+
+        assert_eq!(first.offset_y, -16);
+        assert_eq!(last.offset_y, -2);
+        assert_eq!((first.source.x, first.source.y), (224, 82));
+    }
+
+    /// Confirms each gravity actor selects its own unscaled source picture.
+    #[test]
+    fn falling_actor_sources_remain_distinct() {
+        let infotron = gravity_sprite_part(
+            &Actor::Infotron(Infotron::resting()),
+            AnimationKind::Moving(Direction::Down),
+            0,
+        )
+        .expect("Infotron fall frame should map");
+        let orange = gravity_sprite_part(
+            &Actor::OrangeDisk(OrangeDisk::resting()),
+            AnimationKind::OrangeFalling,
+            0,
+        )
+        .expect("Orange fall frame should map");
+
+        assert_eq!((infotron.source.x, infotron.source.y), (240, 178));
+        assert_eq!((orange.source.x, orange.source.y), (128, 64));
+        assert_eq!(orange.offset_y, 0);
     }
 }

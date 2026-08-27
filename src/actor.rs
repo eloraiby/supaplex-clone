@@ -6,8 +6,8 @@
 
 use crate::{game::WorldView, level::SpecialPort};
 
-/// Number of simulation frames used for one cell-to-cell movement.
-const MOVEMENT_FRAMES: u8 = 4;
+/// Number of original updates used by a falling or enemy cell transfer.
+const MOVEMENT_FRAMES: u8 = 8;
 
 /// Number of source frames in either explosion strip of `RocksSP.png`.
 const EXPLOSION_FRAMES: u8 = 8;
@@ -204,12 +204,24 @@ pub enum AnimationKind {
     Idle,
     /// A Zonk armed to begin falling once its destination is still free.
     ZonkPreFall,
+    /// An Infotron armed to begin falling once its destination remains free.
+    InfotronPreFall,
+    /// A rounded Zonk or Infotron spending its two-update side-roll delay.
+    RoundedPreRoll(Direction),
     /// A non-rendered source cell reserved while its actor leaves that cell.
     Vacating(Direction),
     /// An actor entering its current cell from the opposite direction.
     Moving(Direction),
-    /// A rounded actor entering its current cell diagonally from the row above.
+    /// A rounded actor sliding horizontally before its vertical drop begins.
     Rolling(Direction),
+    /// Empty side cell reserved during a rounded actor's pre-roll delay.
+    RoundedSide,
+    /// Empty diagonal cell reserved during a rounded actor's horizontal slide.
+    RoundedDestination,
+    /// An Orange Disk waiting two updates before its first falling frame.
+    OrangePreFall,
+    /// An Orange Disk visually falling while logically retained at its source.
+    OrangeFalling,
     /// A direction-, target-, and facing-specific original Murphy sequence.
     Murphy(MurphyAnimation),
     /// Pushable actor temporarily locked while Murphy prepares or pushes it.
@@ -245,6 +257,22 @@ enum AnimationNext {
     Act,
     /// Transfer a pre-fall Zonk only if the cell below remains unoccupied.
     BeginZonkFall,
+    /// Transfer a pre-fall Infotron only if the cell below remains unoccupied.
+    BeginInfotronFall,
+    /// Transfer a rounded actor sideways when its two-update delay completes.
+    BeginRoundedSlide {
+        /// Side selected by the original left-first roll preference.
+        direction: Direction,
+    },
+    /// Transfer a completed horizontal slide into its diagonal falling cell.
+    BeginRoundedFall {
+        /// Side used to identify the reserved cell directly below the actor.
+        direction: Direction,
+    },
+    /// Start Orange Disk falling after its two-update preparation delay.
+    BeginOrangeFall,
+    /// Move an Orange Disk into its destination and resolve the landing below it.
+    FinishOrangeFall,
     /// Give completed movement back to Murphy, settling if there is no input.
     ResumeMurphy,
     /// Remove an adjacent target and apply collection effects after snapping.
@@ -319,6 +347,36 @@ impl Animation {
         }
     }
 
+    /// Creates the matching one-callback arming phase for a resting Infotron.
+    fn infotron_pre_fall() -> Self {
+        Self {
+            kind: AnimationKind::InfotronPreFall,
+            frame: 0,
+            frame_count: 1,
+            next: AnimationNext::BeginInfotronFall,
+        }
+    }
+
+    /// Creates the two-update delay before a rounded actor leaves its support.
+    fn rounded_pre_roll(direction: Direction) -> Self {
+        Self {
+            kind: AnimationKind::RoundedPreRoll(direction),
+            frame: 0,
+            frame_count: 1,
+            next: AnimationNext::BeginRoundedSlide { direction },
+        }
+    }
+
+    /// Retains the final pre-roll state while a diagonal destination is blocked.
+    fn rounded_wait(direction: Direction) -> Self {
+        Self {
+            kind: AnimationKind::RoundedPreRoll(direction),
+            frame: 0,
+            frame_count: 1,
+            next: AnimationNext::BeginRoundedSlide { direction },
+        }
+    }
+
     /// Creates a synchronized, invisible reservation for a movement source.
     fn vacating(direction: Direction) -> Self {
         Self::vacating_for(direction, MOVEMENT_FRAMES)
@@ -350,7 +408,47 @@ impl Animation {
             kind: AnimationKind::Rolling(direction),
             frame: 0,
             frame_count: MOVEMENT_FRAMES,
-            next: AnimationNext::Settle,
+            next: AnimationNext::BeginRoundedFall { direction },
+        }
+    }
+
+    /// Creates stable occupancy for a side cell reserved by pre-roll.
+    fn rounded_side() -> Self {
+        Self {
+            kind: AnimationKind::RoundedSide,
+            frame: 0,
+            frame_count: 1,
+            next: AnimationNext::Act,
+        }
+    }
+
+    /// Creates stable occupancy for a diagonal rolling destination.
+    fn rounded_destination() -> Self {
+        Self {
+            kind: AnimationKind::RoundedDestination,
+            frame: 0,
+            frame_count: 1,
+            next: AnimationNext::Act,
+        }
+    }
+
+    /// Creates the original two-update arming delay for an Orange Disk fall.
+    fn orange_pre_fall() -> Self {
+        Self {
+            kind: AnimationKind::OrangePreFall,
+            frame: 0,
+            frame_count: 2,
+            next: AnimationNext::BeginOrangeFall,
+        }
+    }
+
+    /// Creates eight visible falling frames retained at the Orange source cell.
+    fn orange_falling() -> Self {
+        Self {
+            kind: AnimationKind::OrangeFalling,
+            frame: 0,
+            frame_count: MOVEMENT_FRAMES,
+            next: AnimationNext::FinishOrangeFall,
         }
     }
 
@@ -594,6 +692,8 @@ impl Animation {
                 | AnimationKind::Terminal
                 | AnimationKind::MurphyPushTarget
                 | AnimationKind::MurphyDestination
+                | AnimationKind::RoundedSide
+                | AnimationKind::RoundedDestination
         ) {
             return AnimationAdvance::Ready;
         }
@@ -667,6 +767,16 @@ impl State {
         Self::animated(actor, Animation::murphy_push_target())
     }
 
+    /// Creates the temporary side reservation used by rounded pre-roll.
+    fn rounded_side() -> Self {
+        Self::animated(Actor::Empty(Empty), Animation::rounded_side())
+    }
+
+    /// Creates the diagonal reservation used by a horizontal rounded slide.
+    fn rounded_destination() -> Self {
+        Self::animated(Actor::Empty(Empty), Animation::rounded_destination())
+    }
+
     /// Returns this cell's actor identity and actor-specific fields.
     pub fn actor(&self) -> &Actor {
         &self.actor
@@ -697,7 +807,10 @@ impl State {
         matches!(self.actor, Actor::Empty(_))
             && !matches!(
                 self.animation.kind,
-                AnimationKind::Vacating(_) | AnimationKind::MurphyDestination
+                AnimationKind::Vacating(_)
+                    | AnimationKind::MurphyDestination
+                    | AnimationKind::RoundedSide
+                    | AnimationKind::RoundedDestination
             )
     }
 
@@ -777,10 +890,10 @@ impl Zonk {
             let side = world.offset(position, direction)?;
             let diagonal = world.offset(side, Direction::Down)?;
             if world.is_empty(side) && world.is_empty(diagonal) {
-                return Some(Transition::roll_actor(
+                return Some(Transition::prepare_rounded_roll(
                     position,
-                    diagonal,
-                    Actor::Zonk(Self { falling: false }),
+                    side,
+                    Actor::Zonk(*self),
                     direction,
                 ));
             }
@@ -1351,6 +1464,23 @@ fn pushed_actor_matches(actor: &Actor, target: MurphyPushTarget) -> bool {
     )
 }
 
+/// Reports whether an original horizontal push state shields Murphy from a fall.
+fn murphy_is_protected_from_falling_actor(state: &State) -> bool {
+    let Actor::Murphy(murphy) = state.actor() else {
+        return false;
+    };
+    let preparing_horizontal_push = matches!(
+        murphy.phase,
+        MurphyPhase::PreparingPush { direction, .. } if direction.is_horizontal()
+    );
+    let animating_horizontal_push = matches!(
+        state.animation.kind,
+        AnimationKind::Murphy(MurphyAnimation::Push { direction, .. })
+            if direction.is_horizontal()
+    );
+    preparing_horizontal_push || animating_horizontal_push
+}
+
 impl Default for Murphy {
     /// Uses the canonical right-facing starting pose.
     fn default() -> Self {
@@ -1380,11 +1510,18 @@ impl Infotron {
     fn transition(&self, position: Position, world: &WorldView<'_>) -> Option<Transition> {
         let below = world.offset(position, Direction::Down)?;
         if world.is_empty(below) {
-            return Some(Transition::move_actor(
+            if self.falling {
+                return Some(Transition::move_actor(
+                    position,
+                    below,
+                    Actor::Infotron(*self),
+                    Direction::Down,
+                ));
+            }
+
+            return Some(Transition::replace(
                 position,
-                below,
-                Actor::Infotron(Self { falling: true }),
-                Direction::Down,
+                State::animated(Actor::Infotron(*self), Animation::infotron_pre_fall()),
             ));
         }
 
@@ -1396,16 +1533,31 @@ impl Infotron {
             let side = world.offset(position, direction)?;
             let diagonal = world.offset(side, Direction::Down)?;
             if world.is_empty(side) && world.is_empty(diagonal) {
-                return Some(Transition::roll_actor(
+                return Some(Transition::prepare_rounded_roll(
                     position,
-                    diagonal,
-                    Actor::Infotron(Self { falling: false }),
+                    side,
+                    Actor::Infotron(*self),
                     direction,
                 ));
             }
         }
 
         None
+    }
+
+    /// Starts a resting Infotron fall after its destination survives one update.
+    fn begin_fall(&self, position: Position, world: &WorldView<'_>) -> Option<Transition> {
+        let below = world.offset(position, Direction::Down)?;
+        if !world.is_empty(below) {
+            return None;
+        }
+
+        Some(Transition::move_actor(
+            position,
+            below,
+            Actor::Infotron(Self { falling: true }),
+            Direction::Down,
+        ))
     }
 }
 
@@ -1516,11 +1668,20 @@ impl OrangeDisk {
     fn transition(&self, position: Position, world: &WorldView<'_>) -> Option<Transition> {
         let below = world.offset(position, Direction::Down)?;
         if world.is_empty(below) {
-            return Some(Transition::move_actor(
-                position,
-                below,
-                Actor::OrangeDisk(Self { falling: true }),
-                Direction::Down,
+            // A resting Orange Disk installs the original state-0x20 delay and
+            // reserves the cell below before any falling artwork is shown.
+            return Some(Transition::new(
+                vec![
+                    CellWrite::new(
+                        position,
+                        State::animated(
+                            Actor::OrangeDisk(Self { falling: true }),
+                            Animation::orange_pre_fall(),
+                        ),
+                    ),
+                    CellWrite::new(below, State::rounded_destination()),
+                ],
+                Vec::new(),
             ));
         }
 
@@ -1976,6 +2137,158 @@ impl Actor {
                 };
                 return zonk.begin_fall(position, world);
             }
+            AnimationAdvance::Finished(AnimationNext::BeginInfotronFall) => {
+                let Self::Infotron(infotron) = self else {
+                    debug_assert!(false, "only an Infotron may finish Infotron pre-fall");
+                    return Some(Transition::replace(position, State::new(self.clone())));
+                };
+                return infotron.begin_fall(position, world);
+            }
+            AnimationAdvance::Finished(AnimationNext::BeginRoundedSlide { direction }) => {
+                let side = world.offset(position, direction);
+                let diagonal = side.and_then(|cell| world.offset(cell, Direction::Down));
+                let side_reserved = side
+                    .and_then(|cell| world.state(cell))
+                    .is_some_and(|state| {
+                        matches!(state.actor(), Actor::Empty(_))
+                            && state.animation.kind == AnimationKind::RoundedSide
+                    });
+
+                if side_reserved && diagonal.is_some_and(|cell| world.is_empty(cell)) {
+                    let side = side.expect("a validated side reservation has a position");
+                    let diagonal = diagonal.expect("a validated diagonal has a position");
+                    let falling_actor = match self {
+                        Self::Zonk(_) => Self::Zonk(Zonk { falling: true }),
+                        Self::Infotron(_) => Self::Infotron(Infotron { falling: true }),
+                        _ => {
+                            debug_assert!(false, "only rounded actors may begin a side slide");
+                            return Some(Transition::replace(position, State::new(self.clone())));
+                        }
+                    };
+                    return Some(Transition::new(
+                        vec![
+                            CellWrite::new(position, State::empty()),
+                            CellWrite::new(
+                                side,
+                                State::animated(falling_actor, Animation::rolling(direction)),
+                            ),
+                            CellWrite::new(diagonal, State::rounded_destination()),
+                        ],
+                        Vec::new(),
+                    ));
+                }
+
+                if side_reserved {
+                    // State 0x51 is deliberately sticky: another actor may
+                    // vacate the diagonal later while the side stays reserved.
+                    return Some(Transition::replace(
+                        position,
+                        State::animated(self.clone(), Animation::rounded_wait(direction)),
+                    ));
+                }
+
+                // A blast can consume the reservation. Recover the rounded
+                // actor as stable without overwriting the new side occupant.
+                return Some(Transition::replace(position, State::new(self.clone())));
+            }
+            AnimationAdvance::Finished(AnimationNext::BeginRoundedFall { direction: _ }) => {
+                debug_assert!(matches!(self, Self::Zonk(_) | Self::Infotron(_)));
+                let Some(destination) = world.offset(position, Direction::Down) else {
+                    return Some(Transition::replace(position, State::new(self.clone())));
+                };
+                if !world.state(destination).is_some_and(|state| {
+                    matches!(state.actor(), Actor::Empty(_))
+                        && state.animation.kind == AnimationKind::RoundedDestination
+                }) {
+                    return Some(Transition::replace(position, State::new(self.clone())));
+                }
+                return Some(Transition::new(
+                    vec![
+                        CellWrite::new(position, State::empty()),
+                        CellWrite::new(
+                            destination,
+                            State::animated(self.clone(), Animation::moving(Direction::Down)),
+                        ),
+                    ],
+                    Vec::new(),
+                ));
+            }
+            AnimationAdvance::Finished(AnimationNext::BeginOrangeFall) => {
+                debug_assert!(matches!(self, Self::OrangeDisk(_)));
+                let Some(destination) = world.offset(position, Direction::Down) else {
+                    return Some(Transition::replace(position, State::new(self.clone())));
+                };
+                if !world.state(destination).is_some_and(|state| {
+                    matches!(state.actor(), Actor::Empty(_))
+                        && state.animation.kind == AnimationKind::RoundedDestination
+                }) {
+                    return Some(Transition::replace(
+                        position,
+                        State::new(Self::OrangeDisk(OrangeDisk::resting())),
+                    ));
+                }
+                return Some(Transition::replace(
+                    position,
+                    State::animated(self.clone(), Animation::orange_falling()),
+                ));
+            }
+            AnimationAdvance::Finished(AnimationNext::FinishOrangeFall) => {
+                debug_assert!(matches!(self, Self::OrangeDisk(_)));
+                let Some(destination) = world.offset(position, Direction::Down) else {
+                    return Some(Transition::replace(
+                        position,
+                        State::new(Self::OrangeDisk(OrangeDisk::resting())),
+                    ));
+                };
+                let destination_reserved = world.state(destination).is_some_and(|state| {
+                    matches!(state.actor(), Actor::Empty(_))
+                        && state.animation.kind == AnimationKind::RoundedDestination
+                });
+                if !destination_reserved {
+                    return Some(explode_at(world, position, false));
+                }
+
+                let landing_cell = world.offset(destination, Direction::Down);
+                if landing_cell.is_some_and(|cell| world.is_empty(cell)) {
+                    let landing_cell = landing_cell.expect("validated landing cell exists");
+                    return Some(Transition::new(
+                        vec![
+                            CellWrite::new(position, State::empty()),
+                            CellWrite::new(
+                                destination,
+                                State::animated(
+                                    Self::OrangeDisk(OrangeDisk { falling: true }),
+                                    Animation::orange_falling(),
+                                ),
+                            ),
+                            CellWrite::new(landing_cell, State::rounded_destination()),
+                        ],
+                        Vec::new(),
+                    ));
+                }
+
+                if landing_cell
+                    .and_then(|cell| world.state(cell))
+                    .is_some_and(|state| matches!(state.actor(), Actor::Explosion(_)))
+                {
+                    return Some(Transition::new(
+                        vec![
+                            CellWrite::new(position, State::empty()),
+                            CellWrite::new(
+                                destination,
+                                State::new(Self::OrangeDisk(OrangeDisk::resting())),
+                            ),
+                        ],
+                        Vec::new(),
+                    ));
+                }
+
+                let mut explosion = explode_at(world, destination, false);
+                explosion
+                    .writes
+                    .insert(0, CellWrite::new(position, State::empty()));
+                return Some(explosion);
+            }
             AnimationAdvance::Finished(AnimationNext::RandomizeBug) => {
                 // The shared session RNG must be consumed at application time
                 // so Bugs ending together draw distinct values in row order.
@@ -2087,14 +2400,35 @@ impl Actor {
                         State::new(Self::Murphy(*murphy)),
                     ));
                 }
-                return Some(Transition::new(
-                    vec![
-                        CellWrite::new(position, State::empty()),
-                        CellWrite::new(target_position, State::new(Self::Murphy(*murphy))),
-                        CellWrite::new(destination, State::new(actor_for_push_target(target))),
-                    ],
-                    Vec::new(),
-                ));
+                let pushed_state = if target == MurphyPushTarget::OrangeDisk
+                    && direction == Direction::Right
+                    && world
+                        .offset(destination, Direction::Down)
+                        .is_some_and(|below| world.is_empty(below))
+                {
+                    State::animated(
+                        Self::OrangeDisk(OrangeDisk { falling: true }),
+                        Animation::orange_pre_fall(),
+                    )
+                } else {
+                    State::new(actor_for_push_target(target))
+                };
+                let mut writes = vec![
+                    CellWrite::new(position, State::empty()),
+                    CellWrite::new(target_position, State::new(Self::Murphy(*murphy))),
+                    CellWrite::new(destination, pushed_state),
+                ];
+                if target == MurphyPushTarget::OrangeDisk
+                    && direction == Direction::Right
+                    && let Some(below) = world.offset(destination, Direction::Down)
+                    && world.is_empty(below)
+                {
+                    // The original right-push completion immediately installs
+                    // Orange state 0x20 and its destination reservation. The
+                    // corresponding left-push path intentionally does not.
+                    writes.push(CellWrite::new(below, State::rounded_destination()));
+                }
+                return Some(Transition::new(writes, Vec::new()));
             }
             AnimationAdvance::Finished(AnimationNext::FinishMurphyPort { direction }) => {
                 let Self::Murphy(murphy) = self else {
@@ -2242,6 +2576,11 @@ impl Actor {
                 if let Some(below) = world.offset(position, Direction::Down) {
                     if let Some(target) = world.state(below) {
                         match target.actor() {
+                            Actor::Murphy(_) if murphy_is_protected_from_falling_actor(target) => {
+                                // Horizontal push states 0x0e/0x0f/0x25/
+                                // 0x26/0x28/0x29 are explicit original crush
+                                // exceptions; the rounded actor simply lands.
+                            }
                             Actor::Murphy(_) => {
                                 // Murphy has already taken his player-first
                                 // update this tick. Remaining here therefore
@@ -2290,7 +2629,9 @@ impl Actor {
             Self::Infotron(infotron) if infotron.falling => {
                 if let Some(below) = world.offset(position, Direction::Down) {
                     if let Some(target) = world.state(below) {
-                        if matches!(target.actor(), Actor::Murphy(_)) {
+                        if matches!(target.actor(), Actor::Murphy(_))
+                            && !murphy_is_protected_from_falling_actor(target)
+                        {
                             // As with a Zonk, sequential player-first mutation
                             // has already decided whether Murphy escaped.
                             return explode_at(world, below, false);
@@ -2516,18 +2857,20 @@ impl Transition {
         )
     }
 
-    /// Moves a rounded actor diagonally while reserving its final cell at once.
-    fn roll_actor(
+    /// Begins the two-update side delay while reserving only the adjacent cell.
+    fn prepare_rounded_roll(
         source: Position,
-        destination: Position,
+        side: Position,
         actor: Actor,
         direction: Direction,
     ) -> Self {
-        let destination_state = State::animated(actor, Animation::rolling(direction));
         Self::new(
             vec![
-                CellWrite::new(source, State::vacating(direction)),
-                CellWrite::new(destination, destination_state),
+                CellWrite::new(
+                    source,
+                    State::animated(actor, Animation::rounded_pre_roll(direction)),
+                ),
+                CellWrite::new(side, State::rounded_side()),
             ],
             Vec::new(),
         )

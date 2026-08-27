@@ -1304,6 +1304,42 @@ mod tests {
         assert!(matches!(actor_at(&game, 3, 3), Actor::Empty(_)));
     }
 
+    /// Confirms a resting Infotron uses the same pre-fall boundary as a Zonk.
+    #[test]
+    fn infotron_arms_before_its_first_fall() {
+        let mut game = game_with(
+            &[
+                (
+                    Position::new(1, 1),
+                    State::new(Actor::Murphy(Murphy::new())),
+                ),
+                (
+                    Position::new(3, 1),
+                    State::new(Actor::Infotron(Infotron::resting())),
+                ),
+            ],
+            0,
+        );
+
+        game.tick(Input::default());
+        let armed = game
+            .board()
+            .state(Position::new(3, 1))
+            .expect("armed Infotron should remain in its source cell");
+        assert_eq!(armed.animation().kind(), AnimationKind::InfotronPreFall);
+
+        game.tick(Input::default());
+        let falling = game
+            .board()
+            .state(Position::new(3, 2))
+            .expect("Infotron fall destination should exist");
+        assert!(matches!(falling.actor(), Actor::Infotron(infotron) if infotron.is_falling()));
+        assert_eq!(
+            falling.animation().kind(),
+            AnimationKind::Moving(Direction::Down)
+        );
+    }
+
     /// Confirms retained downward momentum does not repeat the resting delay.
     #[test]
     fn falling_zonk_continues_into_the_next_cell_without_rearming() {
@@ -1321,9 +1357,9 @@ mod tests {
             0,
         );
 
-        // The initial pre-fall update, transfer start, and four animation
+        // The initial pre-fall update, transfer start, and eight animation
         // updates complete the first cell while preserving falling momentum.
-        for _ in 0..6 {
+        for _ in 0..10 {
             game.tick(Input::default());
         }
         let continued = game
@@ -1372,7 +1408,7 @@ mod tests {
 
         // Destination and invisible source must advance as one transfer even
         // though freeze became active after the move began.
-        for expected_frame in 1..=3 {
+        for expected_frame in 1..=7 {
             game.tick(Input::default());
             let source = game
                 .board()
@@ -1518,9 +1554,9 @@ mod tests {
             0,
         );
 
-        // One pre-fall step plus four transfer steps leave the Zonk on its final
+        // One pre-fall step plus eight transfer steps leave the Zonk on its final
         // interpolated frame immediately above an otherwise idle Murphy.
-        for _ in 0..5 {
+        for _ in 0..9 {
             game.tick(Input::default());
         }
         let falling = game
@@ -1528,7 +1564,7 @@ mod tests {
             .state(Position::new(3, 2))
             .expect("falling Zonk destination should exist");
         assert!(matches!(falling.actor(), Actor::Zonk(zonk) if zonk.is_falling()));
-        assert_eq!(falling.animation().frame(), 3);
+        assert_eq!(falling.animation().frame(), 7);
 
         // Murphy's earlier Right move changes the would-be crush into
         // a stable landing above his collision-reserved source cell.
@@ -1829,10 +1865,22 @@ mod tests {
         }
 
         assert!(matches!(actor_at(&game, 3, 2), Actor::Murphy(_)));
-        assert!(matches!(actor_at(&game, 4, 3), Actor::OrangeDisk(_)));
+        let orange = game
+            .board()
+            .state(Position::new(4, 2))
+            .expect("pushed Orange Disk should remain at its source during pre-fall");
+        assert!(matches!(orange.actor(), Actor::OrangeDisk(_)));
+        assert_eq!(orange.animation().kind(), AnimationKind::OrangePreFall);
+        assert!(
+            !game
+                .board()
+                .state(Position::new(4, 3))
+                .expect("Orange fall destination should be reserved")
+                .is_empty()
+        );
     }
 
-    /// Confirms diagonal rolls expose their two-axis animation displacement.
+    /// Confirms a rounded roll uses pre-roll, horizontal, then vertical phases.
     #[test]
     fn rounded_rolls_use_a_diagonal_animation_kind() {
         let mut game = game_with(
@@ -1854,11 +1902,21 @@ mod tests {
         );
 
         game.tick(Input::default());
+        let preparing = game
+            .board()
+            .state(Position::new(3, 1))
+            .expect("rounded actor source should exist");
+        assert_eq!(
+            preparing.animation().kind(),
+            AnimationKind::RoundedPreRoll(Direction::Left)
+        );
+
+        game.tick(Input::default());
 
         let rolled = game
             .board()
-            .state(Position::new(2, 2))
-            .expect("diagonal destination should exist");
+            .state(Position::new(2, 1))
+            .expect("horizontal slide cell should exist");
         assert!(matches!(rolled.actor(), Actor::Zonk(_)));
         assert_eq!(
             rolled.animation().kind(),
@@ -1866,7 +1924,7 @@ mod tests {
         );
     }
 
-    /// Confirms freeze also completes a diagonal roll and its paired source.
+    /// Confirms freeze lets both in-flight rounded movement phases complete.
     #[test]
     fn freezing_an_in_flight_roll_keeps_both_animation_cells_synchronized() {
         let mut game = game_with(
@@ -1887,35 +1945,48 @@ mod tests {
             0,
         );
 
-        game.tick(Input::default());
-        game.freeze_zonks = true;
-        for expected_frame in 1..=3 {
+        for _ in 0..2 {
             game.tick(Input::default());
-            let source = game
+        }
+        game.freeze_zonks = true;
+        for expected_frame in 1..=7 {
+            game.tick(Input::default());
+            let sliding = game
                 .board()
-                .state(Position::new(3, 1))
-                .expect("roll source should exist")
+                .state(Position::new(2, 1))
+                .expect("horizontal slide cell should exist")
                 .animation();
-            let destination = game
-                .board()
-                .state(Position::new(2, 2))
-                .expect("roll destination should exist")
-                .animation();
-            assert_eq!(source.frame(), expected_frame);
-            assert_eq!(destination.frame(), expected_frame);
+            assert_eq!(sliding.frame(), expected_frame);
+            assert!(
+                !game
+                    .board()
+                    .state(Position::new(2, 2))
+                    .expect("diagonal destination reservation should exist")
+                    .is_empty()
+            );
         }
 
         game.tick(Input::default());
-        assert!(
+        assert!(matches!(
+            actor_at(&game, 2, 2),
+            Actor::Zonk(zonk) if zonk.is_falling()
+        ));
+        assert_eq!(
             game.board()
-                .state(Position::new(3, 1))
-                .expect("released roll source should exist")
-                .is_empty()
+                .state(Position::new(2, 2))
+                .expect("vertical roll destination should exist")
+                .animation()
+                .kind(),
+            AnimationKind::Moving(Direction::Down)
         );
-        assert!(matches!(actor_at(&game, 2, 2), Actor::Zonk(_)));
 
-        game.tick(Input::default());
-        assert!(matches!(actor_at(&game, 2, 2), Actor::Zonk(_)));
+        for _ in 0..8 {
+            game.tick(Input::default());
+        }
+        assert!(matches!(
+            actor_at(&game, 2, 2),
+            Actor::Zonk(zonk) if !zonk.is_falling()
+        ));
         assert!(matches!(actor_at(&game, 2, 3), Actor::Empty(_)));
     }
 
@@ -1947,14 +2018,21 @@ mod tests {
 
         assert_eq!(game.status(), GameStatus::Playing);
         assert!(matches!(actor_at(&game, 2, 2), Actor::Murphy(_)));
-        let rolled = game
+        let preparing = game
             .board()
-            .state(Position::new(4, 2))
-            .expect("right-hand roll destination should exist");
-        assert!(matches!(rolled.actor(), Actor::Zonk(_)));
+            .state(Position::new(3, 1))
+            .expect("right-hand pre-roll source should exist");
+        assert!(matches!(preparing.actor(), Actor::Zonk(_)));
         assert_eq!(
-            rolled.animation().kind(),
-            AnimationKind::Rolling(Direction::Right)
+            preparing.animation().kind(),
+            AnimationKind::RoundedPreRoll(Direction::Right)
+        );
+        assert!(
+            !game
+                .board()
+                .state(Position::new(4, 1))
+                .expect("right side should be reserved")
+                .is_empty()
         );
     }
 
@@ -2187,7 +2265,7 @@ mod tests {
             0,
         );
 
-        for _ in 0..6 {
+        for _ in 0..10 {
             game.tick(Input::default());
         }
 
@@ -2222,7 +2300,7 @@ mod tests {
             0,
         );
 
-        for _ in 0..5 {
+        for _ in 0..10 {
             game.tick(Input::default());
         }
 
@@ -2253,7 +2331,7 @@ mod tests {
             countdown: 5,
         });
 
-        for _ in 0..5 {
+        for _ in 0..10 {
             game.tick(Input::default());
         }
 
@@ -2283,7 +2361,7 @@ mod tests {
         );
         game.freeze_enemies = true;
 
-        for _ in 0..6 {
+        for _ in 0..10 {
             game.tick(Input::default());
         }
 
@@ -2465,7 +2543,7 @@ mod tests {
             0,
         );
 
-        for _ in 0..5 {
+        for _ in 0..11 {
             game.tick(Input::default());
         }
 
