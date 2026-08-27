@@ -1,9 +1,10 @@
-//! SDL audio-device ownership and original Sound Blaster effect playback.
+//! SDL audio-device ownership, original AdLib music, and Sound Blaster effects.
 //!
 //! The DOS `.snd` files bundled in `data/` contain executable driver code, so
 //! they cannot be queued as PCM. This module embeds WAV renders of their seven
-//! gameplay effects, converts them to the exact opened-device format once, and
-//! mixes the selected effect in SDL's real-time callback.
+//! gameplay effects, converts those short clips to the opened-device format,
+//! and mixes them with a compact mono render of the original tracker music in
+//! SDL's real-time callback.
 
 use sdl2::{
     AudioSubsystem,
@@ -28,6 +29,12 @@ const OUTPUT_BUFFER_SAMPLES: u16 = 512;
 /// Original effect-priority time is measured in 20-millisecond units.
 const PRIORITY_UNIT_MILLISECONDS: usize = 20;
 
+/// Background level used before effects are added to the callback buffer.
+const MUSIC_VOLUME: f32 = 0.38;
+
+/// Full AdLib soundtrack rendered from its original tracker arrangement.
+const EMBEDDED_MUSIC: &[u8] = include_bytes!("../assets/audio/music.wav");
+
 /// Sound Blaster renders of the seven effects in [`SoundEffect`] index order.
 const EMBEDDED_EFFECTS: [&[u8]; 7] = [
     include_bytes!("../assets/audio/explosion.wav"),
@@ -46,19 +53,20 @@ pub struct AudioPlayer {
 }
 
 impl AudioPlayer {
-    /// Opens the default 44.1-kHz stereo device and starts effect playback.
+    /// Opens the default 44.1-kHz stereo device and starts music playback.
     pub fn new(subsystem: &AudioSubsystem) -> Result<Self, String> {
         // Decode before opening the device so malformed embedded data produces
         // a normal initialization error rather than panicking inside SDL's
         // callback-construction closure.
         let effects = EffectBank::decode(OUTPUT_FREQUENCY, OUTPUT_CHANNELS)?;
+        let music = MusicTrack::decode()?;
         let desired = AudioSpecDesired {
             freq: Some(OUTPUT_FREQUENCY),
             channels: Some(OUTPUT_CHANNELS),
             samples: Some(OUTPUT_BUFFER_SAMPLES),
         };
         let device = subsystem
-            .open_playback(None, &desired, move |spec| Mixer::new(spec, effects))
+            .open_playback(None, &desired, move |spec| Mixer::new(spec, effects, music))
             .map_err(|error| format!("open playback device: {error}"))?;
 
         // SDL devices begin paused so construction cannot race the caller.
@@ -86,6 +94,70 @@ impl AudioPlayer {
             mixer.priority_frames_remaining = 0;
         }
         mixer.effects_enabled
+    }
+
+    /// Toggles soundtrack playback and returns its new enabled state.
+    pub fn toggle_music(&mut self) -> bool {
+        // User muting and Exit pausing are distinct: toggling back on is an
+        // explicit request to resume from the retained loop cursor.
+        let mut mixer = self.device.lock();
+        mixer.music_enabled = !mixer.music_enabled;
+        mixer.music_playing = mixer.music_enabled;
+        mixer.music_enabled
+    }
+
+    /// Clears transient effects and resumes enabled music for a restarted level.
+    pub fn restart_level(&mut self) {
+        // Exit protects its effect for five seconds and pauses music. A manual
+        // level restart is a new session, so neither terminal state may leak.
+        let mut mixer = self.device.lock();
+        mixer.effect_voice = None;
+        mixer.current_priority = 0;
+        mixer.priority_frames_remaining = 0;
+        mixer.music_playing = mixer.music_enabled;
+    }
+}
+
+/// Decoded mono samples and source rate for the looping AdLib soundtrack.
+struct MusicTrack {
+    /// Complete mono signed-PCM song produced by one tracker traversal.
+    samples: Box<[i16]>,
+    /// Source frames per second, resampled incrementally by the callback.
+    frequency: usize,
+}
+
+impl MusicTrack {
+    /// Expands the embedded IMA-ADPCM soundtrack to compact mono signed PCM.
+    fn decode() -> Result<Self, String> {
+        // Retaining the 22.05-kHz mono result uses roughly one eighth of the
+        // memory required by a five-minute 44.1-kHz stereo `f32` conversion.
+        // The callback performs the simple rate/channel expansion incrementally.
+        let mut source = RWops::from_bytes(EMBEDDED_MUSIC)
+            .map_err(|error| format!("open embedded music: {error}"))?;
+        let wav = AudioSpecWAV::load_wav_rw(&mut source)
+            .map_err(|error| format!("decode embedded music: {error}"))?;
+        if wav.channels != 1 || wav.format != AudioFormat::s16_sys() {
+            return Err(format!(
+                "embedded music decoded as {:?}/{} channels instead of native S16 mono",
+                wav.format, wav.channels
+            ));
+        }
+        if !wav.buffer().len().is_multiple_of(size_of::<i16>()) {
+            return Err("decoded music has a partial signed sample".to_owned());
+        }
+        let (sample_bytes, remainder) = wav.buffer().as_chunks::<{ size_of::<i16>() }>();
+        debug_assert!(remainder.is_empty(), "the length check rejects a remainder");
+        let samples = sample_bytes
+            .iter()
+            .map(|bytes| i16::from_ne_bytes(*bytes))
+            .collect::<Vec<_>>();
+        if samples.is_empty() {
+            return Err("decoded music contains no samples".to_owned());
+        }
+        Ok(Self {
+            samples: samples.into_boxed_slice(),
+            frequency: wav.freq.max(1).unsigned_abs() as usize,
+        })
     }
 }
 
@@ -149,6 +221,16 @@ struct Mixer {
     spec: AudioSpec,
     /// Decoded immutable effect samples shared by successive voices.
     effects: EffectBank,
+    /// Decoded immutable soundtrack samples traversed as a continuous loop.
+    music: MusicTrack,
+    /// Next mono soundtrack frame mixed by the callback.
+    music_frame_cursor: usize,
+    /// Fractional source-rate numerator retained between output frames.
+    music_rate_accumulator: usize,
+    /// Persistent user preference controlled by the M key.
+    music_enabled: bool,
+    /// Session playback state paused independently when Exit is accepted.
+    music_playing: bool,
     /// Current single-channel effect, replaced when a request is accepted.
     effect_voice: Option<EffectVoice>,
     /// Original global priority value, where zero means no protected sound.
@@ -161,12 +243,17 @@ struct Mixer {
 
 impl Mixer {
     /// Creates silent callback state around already converted effect samples.
-    fn new(spec: AudioSpec, effects: EffectBank) -> Self {
+    fn new(spec: AudioSpec, effects: EffectBank, music: MusicTrack) -> Self {
         // The audio device owns this value for its full lifetime; no callback
         // path allocates, decodes, locks a Rust mutex, or touches simulation.
         Self {
             spec,
             effects,
+            music,
+            music_frame_cursor: 0,
+            music_rate_accumulator: 0,
+            music_enabled: true,
+            music_playing: true,
             effect_voice: None,
             current_priority: 0,
             priority_frames_remaining: 0,
@@ -192,7 +279,41 @@ impl Mixer {
             * PRIORITY_UNIT_MILLISECONDS
             * policy.duration_units
             / 1_000;
+        if effect == SoundEffect::Exit {
+            // The Exit routine pauses music only after its effect request is
+            // accepted; muting effects therefore leaves music untouched.
+            self.music_playing = false;
+        }
         true
+    }
+
+    /// Adds looping music to the cleared output and advances its retained cursor.
+    fn mix_music(&mut self, output: &mut [f32]) {
+        // Exit and M both silence the track without rewinding it. The callback
+        // can therefore resume continuously after a restart or explicit toggle.
+        if !self.music_enabled || !self.music_playing || self.music.samples.is_empty() {
+            return;
+        }
+        let output_channels = usize::from(self.spec.channels.max(1));
+        let output_frequency = self.spec.freq.max(1).unsigned_abs() as usize;
+        for frame in output.chunks_exact_mut(output_channels) {
+            let sample =
+                f32::from(self.music.samples[self.music_frame_cursor]) / f32::from(i16::MAX);
+            for destination in frame {
+                *destination += sample * MUSIC_VOLUME;
+            }
+
+            // A rational accumulator avoids cumulative drift and handles any
+            // future exact device rate without pre-expanding the full song.
+            self.music_rate_accumulator += self.music.frequency;
+            while self.music_rate_accumulator >= output_frequency {
+                self.music_rate_accumulator -= output_frequency;
+                self.music_frame_cursor += 1;
+                if self.music_frame_cursor == self.music.samples.len() {
+                    self.music_frame_cursor = 0;
+                }
+            }
+        }
     }
 
     /// Copies the active effect over the already cleared output slice.
@@ -232,11 +353,12 @@ impl Mixer {
 impl AudioCallback for Mixer {
     type Channel = f32;
 
-    /// Produces one silent-or-effect buffer whenever SDL requests more audio.
+    /// Produces one mixed music-and-effect buffer whenever SDL requests audio.
     fn callback(&mut self, output: &mut [Self::Channel]) {
         // SDL may recycle buffers, so every callback must establish silence
         // before selectively adding active voices.
         output.fill(0.0);
+        self.mix_music(output);
         self.mix_effect(output);
         self.advance_priority(output.len());
     }
@@ -334,7 +456,9 @@ fn decode_wav(encoded: &[u8], frequency: i32, channels: u8) -> Result<Vec<f32>, 
 mod tests {
     //! Decoder and mixer checks that do not open a host audio device.
 
-    use super::{AudioCallback, AudioSpec, EffectBank, Mixer, OUTPUT_CHANNELS, OUTPUT_FREQUENCY};
+    use super::{
+        AudioCallback, AudioSpec, EffectBank, Mixer, MusicTrack, OUTPUT_CHANNELS, OUTPUT_FREQUENCY,
+    };
     use crate::game::SoundEffect;
 
     /// Builds a mixer with decoded production assets and a production layout.
@@ -351,7 +475,8 @@ mod tests {
         };
         let effects = EffectBank::decode(spec.freq, spec.channels)
             .expect("embedded Sound Blaster effects should decode");
-        Mixer::new(spec, effects)
+        let music = MusicTrack::decode().expect("embedded AdLib music should decode");
+        Mixer::new(spec, effects, music)
     }
 
     /// Confirms each production WAV becomes non-empty interleaved stereo data.
@@ -390,6 +515,9 @@ mod tests {
         assert!(mixer.play_effect(SoundEffect::Base));
         let mut output = [0.0; 128];
 
+        // Isolate the effect voice from the independently tested music layer.
+        mixer.music_enabled = false;
+        mixer.music_playing = false;
         mixer.callback(&mut output);
         assert!(output.iter().any(|sample| *sample != 0.0));
         mixer.effects_enabled = false;
@@ -397,5 +525,21 @@ mod tests {
         mixer.callback(&mut output);
         assert!(output.iter().all(|sample| *sample == 0.0));
         assert!(!mixer.play_effect(SoundEffect::Bug));
+    }
+
+    /// Confirms music wraps inside a callback and Exit pauses only its voice.
+    #[test]
+    fn music_loops_and_an_accepted_exit_pauses_it() {
+        let mut mixer = decoded_mixer();
+        let mut output = [0.0; 16];
+        mixer.music_frame_cursor = mixer.music.samples.len() - 2;
+
+        mixer.callback(&mut output);
+        // Sixteen stereo output samples are eight frames; at 2:1 resampling
+        // they consume four source frames and wrap from len - 2 to frame two.
+        assert_eq!(mixer.music_frame_cursor, 2);
+        assert!(output.iter().any(|sample| *sample != 0.0));
+        assert!(mixer.play_effect(SoundEffect::Exit));
+        assert!(!mixer.music_playing);
     }
 }

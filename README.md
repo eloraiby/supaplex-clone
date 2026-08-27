@@ -3,7 +3,8 @@
 This project plays the 111 original Supaplex levels in SDL2. It loads the
 bundled DOS `LEVELS.DAT`, simulates actor-owned animation and behavior, and
 renders pixel-perfect conversions of the original `FIXED.DAT`, `MOVING.DAT`,
-and `CHARS8.DAT` assets with nearest-neighbor scaling.
+and `CHARS8.DAT` assets with nearest-neighbor scaling. The original AdLib music
+and Sound Blaster gameplay effects play through a self-contained SDL mixer.
 
 ## Run a level
 
@@ -26,6 +27,8 @@ Controls:
 - Space without an arrow, or `D`: plant one collected Red Disk beneath Murphy;
   move away before its fuse expires. Only one planted fuse can be active.
 - `R`: restart the selected level from its original record.
+- `M`: mute or resume music.
+- `S`: mute or enable sound effects.
 - `Escape`: quit.
 
 The HUD shows the original level title, remaining Infotrons, Red Disk inventory,
@@ -84,7 +87,7 @@ Terminal/Yellow Disk detonation, single-fuse planted Red Disks, merged and
 chained 3×3 explosions, Electron-to-Infotron residue, synchronized initial Bug
 cycles with randomized per-Bug cooldowns, animated player death,
 completion, and restart. The current scope intentionally omits menus, profiles,
-demos, sound, and progression between levels.
+demos, and progression between levels.
 
 ## Original data and PNG conversion
 
@@ -106,6 +109,12 @@ cargo run --bin dat-to-png -- data/chars8.dat assets/chars8.png
 becomes 512×8. Gameplay addresses the original fixed tiles and variably sized
 moving descriptors directly; the HUD uses the converted original font.
 
+The WAV files in `assets/audio/` are playback-ready renders of the supplied DOS
+sound data: Sound Blaster is used for effects and the matching AdLib arrangement
+for music. Effects retain the original one-channel priority rules, while music
+loops independently and pauses when the Exit sound is accepted. Both are
+embedded in the executable and require only SDL2, not SDL2_mixer.
+
 ## Verification
 
 ```bash
@@ -118,7 +127,8 @@ Tests cover the CLI range, complete record layout and metadata, row-major board
 indexing, every supplied level, actor movement and collection, gravity
 overrides, falling-object collision matrices, Red Disk planting, ordered and
 chained explosions, Bug timing/RNG, exit gating, planar and binary graphics
-decoding, PNG assets, and fixed-strip bounds.
+decoding, PNG assets, audio event timing, effect priorities, WAV decoding, and
+fixed-strip bounds.
 
 Format and mapping references:
 

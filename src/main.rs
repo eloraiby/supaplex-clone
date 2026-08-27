@@ -136,15 +136,29 @@ fn run(level: &Level, level_number: usize) -> Result<(), String> {
                     // Restarting reconstructs actors and level toggles while
                     // retaining the process RNG stream, as original play does.
                     game.restart(level).map_err(|error| error.to_string())?;
+                    if let Some(audio) = audio.as_mut() {
+                        audio.restart_level();
+                    }
                     accumulator = Duration::ZERO;
+                }
+                Event::KeyDown {
+                    scancode: Some(Scancode::M),
+                    repeat: false,
+                    ..
+                } => {
+                    // Music is an independent voice, so muting it never drops a
+                    // currently protected gameplay effect.
+                    if let Some(audio) = audio.as_mut() {
+                        let enabled = audio.toggle_music();
+                        eprintln!("music {}", if enabled { "enabled" } else { "muted" });
+                    }
                 }
                 Event::KeyDown {
                     scancode: Some(Scancode::S),
                     repeat: false,
                     ..
                 } => {
-                    // Toggling affects only effects; music receives its own M
-                    // control once the independent looping voice is installed.
+                    // Toggling effects leaves the independent music voice live.
                     if let Some(audio) = audio.as_mut() {
                         let enabled = audio.toggle_effects();
                         eprintln!(
