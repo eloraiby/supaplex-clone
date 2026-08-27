@@ -2582,6 +2582,46 @@ mod tests {
         assert!(matches!(actor_at(&game, 3, 3), Actor::Explosion(_)));
     }
 
+    /// Confirms an Orange landing blast does not re-arm its vacated source.
+    #[test]
+    fn orange_landing_explosion_schedules_no_phantom_source_wave() {
+        let source = Position::new(3, 1);
+        let destination = Position::new(3, 2);
+        let mut game = game_with(
+            &[
+                (
+                    Position::new(1, 1),
+                    State::new(Actor::Murphy(Murphy::new())),
+                ),
+                (source, State::new(Actor::OrangeDisk(OrangeDisk::resting()))),
+                (
+                    Position::new(3, 3),
+                    State::new(Actor::Hardware(Hardware::new(0))),
+                ),
+            ],
+            0,
+        );
+
+        // One initiating update, two pre-fall states, and eight falling states
+        // place the armed disk at its blocked destination and emit its blast.
+        for _ in 0..11 {
+            game.tick(Input::default());
+        }
+
+        assert!(matches!(actor_at(&game, 3, 1), Actor::Explosion(_)));
+        assert!(matches!(actor_at(&game, 3, 2), Actor::Explosion(_)));
+        let source_index = game
+            .board()
+            .index(source)
+            .expect("the Orange source should remain in bounds");
+        assert_eq!(game.explosion_timers[source_index], 0);
+        let destination_index = game
+            .board()
+            .index(destination)
+            .expect("the Orange destination should remain in bounds");
+        assert_eq!(game.explosion_timers[destination_index], 0);
+    }
+
     /// Confirms an Infotron landing on any idle disk detonates immediately.
     #[test]
     fn falling_infotron_detonates_an_idle_red_disk() {

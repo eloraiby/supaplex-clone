@@ -2852,6 +2852,21 @@ impl Actor {
                 }
 
                 let mut explosion = explode_at(world, destination, false);
+                // The DOS routine clears the old falling source before it
+                // detonates the newly occupied destination. Our immutable
+                // WorldView still exposes the Orange Disk at that source, so
+                // discard only the spurious delayed timer it would otherwise
+                // receive as a reactive neighbor. The immediate blast write at
+                // the source remains: the new 3x3 wave legitimately covers it.
+                explosion.events.retain(|event| {
+                    !matches!(
+                        event,
+                        GameEvent::ScheduleExplosion {
+                            position: scheduled,
+                            ..
+                        } if *scheduled == position
+                    )
+                });
                 explosion
                     .writes
                     .insert(0, CellWrite::new(position, State::empty()));
