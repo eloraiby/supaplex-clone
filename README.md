@@ -67,8 +67,10 @@ drawn as empty space, and has no reveal-on-touch transition.
 
 Logical movement occupies the destination at animation start while its source
 becomes an invisible `Vacating` reservation. The destination sprite is offset
-toward that source until both synchronized animations finish. Murphy releases
-his old cell while retaining the final moving pose, and processes new direction
+toward that source and owns the reservation's release; temporary Space markers
+do not receive autonomous original callbacks. Falling Zonks and Infotrons clear
+their source on state `0x16`, before their last two pictures. Murphy releases his
+old cell while retaining the final moving pose, and processes new direction
 input on his next update. A trailing Zonk that sees the newly opened cell later
 in the same pass first enters `ZonkPreFall`; it transfers only on the following
 pass, after Murphy has received that next input.

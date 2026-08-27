@@ -1406,6 +1406,95 @@ mod tests {
         );
     }
 
+    /// Confirms falling destinations clear their sources at original state 0x16.
+    #[test]
+    fn zonk_and_infotron_release_sources_before_their_final_two_frames() {
+        let zonk_source = Position::new(2, 1);
+        let infotron_source = Position::new(4, 1);
+        let zonk_destination = Position::new(2, 2);
+        let infotron_destination = Position::new(4, 2);
+        let mut game = game_with(
+            &[
+                (
+                    Position::new(1, 4),
+                    State::new(Actor::Murphy(Murphy::new())),
+                ),
+                (zonk_source, State::new(Actor::Zonk(Zonk::resting()))),
+                (
+                    infotron_source,
+                    State::new(Actor::Infotron(Infotron::resting())),
+                ),
+            ],
+            0,
+        );
+
+        // Arm on the first callback, begin movement on the second, then reach
+        // original destination state 0x15 after five movement callbacks.
+        for _ in 0..7 {
+            game.tick(Input::default());
+        }
+        assert_eq!(
+            game.board()
+                .state(zonk_destination)
+                .expect("moving Zonk should occupy its destination")
+                .animation()
+                .frame(),
+            5
+        );
+        assert_eq!(
+            game.board()
+                .state(infotron_destination)
+                .expect("moving Infotron should occupy its destination")
+                .animation()
+                .frame(),
+            5
+        );
+        assert!(
+            !game
+                .board()
+                .state(zonk_source)
+                .expect("Zonk source reservation should still exist")
+                .is_empty()
+        );
+        assert!(
+            !game
+                .board()
+                .state(infotron_source)
+                .expect("Infotron source reservation should still exist")
+                .is_empty()
+        );
+
+        game.tick(Input::default());
+        assert_eq!(
+            game.board()
+                .state(zonk_destination)
+                .expect("Zonk should retain its destination")
+                .animation()
+                .frame(),
+            6
+        );
+        assert_eq!(
+            game.board()
+                .state(infotron_destination)
+                .expect("Infotron should retain its destination")
+                .animation()
+                .frame(),
+            6
+        );
+        assert!(
+            game.board()
+                .state(zonk_source)
+                .expect("released Zonk source should remain addressable")
+                .is_empty()
+        );
+        assert!(
+            game.board()
+                .state(infotron_source)
+                .expect("released Infotron source should remain addressable")
+                .is_empty()
+        );
+    }
+
     /// Confirms retained downward momentum does not repeat the resting delay.
     #[test]
     fn falling_zonk_continues_into_the_next_cell_without_rearming() {
@@ -1472,22 +1561,30 @@ mod tests {
         game.tick(Input::default());
         game.freeze_zonks = true;
 
-        // Destination and invisible source must advance as one transfer even
-        // though freeze became active after the move began.
+        // The destination keeps advancing even though freeze became active.
+        // Its source marker has no autonomous frame; destination state 0x16
+        // releases that marker before the last two pictures are shown.
         for expected_frame in 1..=7 {
             game.tick(Input::default());
-            let source = game
-                .board()
-                .state(Position::new(3, 1))
-                .expect("fall source should exist")
-                .animation();
             let destination = game
                 .board()
                 .state(Position::new(3, 2))
                 .expect("fall destination should exist")
                 .animation();
-            assert_eq!(source.frame(), expected_frame);
             assert_eq!(destination.frame(), expected_frame);
+            let source = game
+                .board()
+                .state(Position::new(3, 1))
+                .expect("fall source should remain addressable");
+            if expected_frame < 6 {
+                assert_eq!(
+                    source.animation().kind(),
+                    AnimationKind::Vacating(Direction::Down)
+                );
+                assert!(!source.is_empty());
+            } else {
+                assert!(source.is_empty());
+            }
         }
 
         game.tick(Input::default());

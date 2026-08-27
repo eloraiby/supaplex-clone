@@ -375,8 +375,6 @@ enum AnimationNext {
         /// Direction of the transfer that has just reached its final frame.
         direction: Direction,
     },
-    /// Release a movement source reservation as ordinary empty space.
-    Release,
     /// Replace the animated cell with empty space.
     BecomeEmpty,
     /// Replace the animated cell with a stationary Infotron.
@@ -459,19 +457,29 @@ impl Animation {
 
     /// Creates a source reservation synchronized to a caller-owned duration.
     fn vacating_for(direction: Direction, frame_count: u8) -> Self {
+        // Movement destinations own source cleanup. The retained count records
+        // the action contract for diagnostics but is not advanced independently;
+        // original temporary Space markers have no dispatcher callback.
         Self {
             kind: AnimationKind::Vacating(direction),
             frame: 0,
             frame_count: frame_count.max(1),
-            next: AnimationNext::Release,
+            next: AnimationNext::Act,
         }
     }
 
     /// Creates interpolation frames for an actor already in its destination.
     fn moving(direction: Direction) -> Self {
+        Self::moving_at(direction, 0)
+    }
+
+    /// Restores one validated frame within a generic actor transfer.
+    fn moving_at(direction: Direction, frame: u8) -> Self {
+        // Falling actors use this constructor when advancing to frame six must
+        // also clear their original source cell in one atomic transition.
         Self {
             kind: AnimationKind::Moving(direction),
-            frame: 0,
+            frame: frame.min(MOVEMENT_FRAMES - 1),
             frame_count: MOVEMENT_FRAMES,
             next: AnimationNext::Settle,
         }
@@ -840,6 +848,7 @@ impl Animation {
         if matches!(
             self.kind,
             AnimationKind::Idle
+                | AnimationKind::Vacating(_)
                 | AnimationKind::Terminal
                 | AnimationKind::MurphyPushTarget
                 | AnimationKind::MurphyDestination
@@ -2533,6 +2542,16 @@ impl Actor {
             }
         }
 
+        // Original falling state 0x15 increments to 0x16 and clears the prior
+        // cell before the final two pictures play. The temporary Space marker
+        // has no updater of its own, so the destination must own this write.
+        if matches!(self, Self::Zonk(_) | Self::Infotron(_))
+            && let AnimationKind::Moving(direction) = state.animation.kind
+            && state.animation.frame == 5
+        {
+            return Some(self.advance_falling_source(position, direction, world));
+        }
+
         // Reserved push/snap targets retain their actor identity for rendering
         // and blast interactions but must not fall, roll, or otherwise update.
         if state.animation.kind == AnimationKind::MurphyPushTarget {
@@ -2777,9 +2796,6 @@ impl Actor {
                 };
                 return Some(electron.finish_movement(position, direction, world));
             }
-            AnimationAdvance::Finished(AnimationNext::Release) => {
-                return Some(Transition::replace(position, State::empty()));
-            }
             AnimationAdvance::Finished(AnimationNext::BecomeEmpty) => {
                 return Some(Transition::new(
                     vec![CellWrite::new(position, State::empty())],
@@ -2989,6 +3005,34 @@ impl Actor {
             Self::Explosion(explosion) => Animation::explosion(explosion.residue),
             _ => Animation::idle(),
         }
+    }
+
+    /// Advances a fall to state `0x16` while releasing its temporary old cell.
+    fn advance_falling_source(
+        &self,
+        position: Position,
+        direction: Direction,
+        world: &WorldView<'_>,
+    ) -> Transition {
+        debug_assert!(matches!(self, Self::Zonk(_) | Self::Infotron(_)));
+        debug_assert_eq!(direction, Direction::Down);
+        let mut writes = vec![CellWrite::new(
+            position,
+            State::animated(self.clone(), Animation::moving_at(direction, 6)),
+        )];
+
+        if let Some(source) = world.offset(position, direction.opposite())
+            && world.state(source).is_some_and(|source_state| {
+                matches!(source_state.actor(), Actor::Empty(_))
+                    && source_state.animation.kind == AnimationKind::Vacating(direction)
+            })
+        {
+            // Preserve an actor or explosion that already consumed the source;
+            // only the still-matching temporary marker may become true Space.
+            writes.push(CellWrite::new(source, State::empty()));
+        }
+
+        Transition::new(writes, Vec::new())
     }
 
     /// Resolves movement completion using the latest neighboring cell states.
