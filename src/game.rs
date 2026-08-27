@@ -69,7 +69,88 @@ impl Board {
             .copied()
             .map(state_from_tile)
             .collect::<Result<Vec<_>, _>>()?;
-        Self::new(LEVEL_WIDTH, LEVEL_HEIGHT, cells)
+        let mut board = Self::new(LEVEL_WIDTH, LEVEL_HEIGHT, cells)?;
+        board.initialize_loaded_enemies(level.tiles());
+        Ok(board)
+    }
+
+    /// Applies the original pre-play conversion for serialized enemy tiles.
+    fn initialize_loaded_enemies(&mut self, serialized_tiles: &[u8]) {
+        // `convertToEasyTiles` scans original tile positions in row-major order
+        // and consults the board already changed by earlier enemies. A free cell
+        // on the left selects turn state one. Otherwise a free cell above, then
+        // a free cell on the right, starts a transfer immediately and replaces
+        // the serialized source with an unscheduled `0xffff` reservation.
+        for (index, tile) in serialized_tiles.iter().copied().enumerate() {
+            if !matches!(tile, 17 | 24) {
+                continue;
+            }
+
+            let position = self
+                .position(index)
+                .expect("serialized level tile indices fit the constructed board");
+            let left = position
+                .x
+                .checked_sub(1)
+                .map(|x| Position::new(x, position.y));
+            let above = position
+                .y
+                .checked_sub(1)
+                .map(|y| Position::new(position.x, y));
+            let right = position
+                .x
+                .checked_add(1)
+                .filter(|x| *x < self.width)
+                .map(|x| Position::new(x, position.y));
+
+            if left
+                .and_then(|neighbor| self.state(neighbor))
+                .is_some_and(State::is_empty)
+            {
+                let state = if tile == 17 {
+                    State::loaded_snik_snak_turn(1)
+                } else {
+                    State::loaded_electron_turn(1)
+                };
+                self.set(position, state)
+                    .expect("serialized enemy position remains in bounds");
+                continue;
+            }
+
+            let movement = [(above, Direction::Up), (right, Direction::Right)]
+                .into_iter()
+                .find_map(|(neighbor, direction)| {
+                    neighbor
+                        .filter(|candidate| self.state(*candidate).is_some_and(State::is_empty))
+                        .map(|destination| (destination, direction))
+                });
+
+            if let Some((destination, direction)) = movement {
+                let (source_state, destination_state) = if tile == 17 {
+                    (
+                        State::loaded_snik_snak_source(direction),
+                        State::loaded_snik_snak_move(direction),
+                    )
+                } else {
+                    (
+                        State::loaded_electron_source(direction),
+                        State::loaded_electron_move(direction),
+                    )
+                };
+                self.set(position, source_state)
+                    .expect("serialized enemy source remains in bounds");
+                self.set(destination, destination_state)
+                    .expect("validated enemy destination remains in bounds");
+            } else {
+                let state = if tile == 17 {
+                    State::loaded_snik_snak_turn(0)
+                } else {
+                    State::loaded_electron_turn(0)
+                };
+                self.set(position, state)
+                    .expect("blocked serialized enemy position remains in bounds");
+            }
+        }
     }
 
     /// Returns the number of columns in this board.
@@ -990,11 +1071,12 @@ mod tests {
 
     use super::{Board, Game, GameStatus, Input, PlantedRedDisk};
     use crate::actor::{
-        Actor, AnimationKind, Base, Bug, CHAIN_REACTION_FRAMES, Direction, Electron, Empty, Exit,
-        ExplosionResidue, Hardware, Infotron, InvisibleWall, Murphy, MurphyAnimation, OrangeDisk,
-        Port, PortDirections, Position, RedDisk, SnikSnak, State, Terminal, YellowDisk, Zonk,
+        Actor, AnimationKind, Base, Bug, CHAIN_REACTION_FRAMES, Direction, Electron, Empty,
+        EnemyTurn, Exit, ExplosionResidue, Hardware, Infotron, InvisibleWall, Murphy,
+        MurphyAnimation, OrangeDisk, Port, PortDirections, Position, RedDisk, SnikSnak, State,
+        Terminal, YellowDisk, Zonk,
     };
-    use crate::level::{LevelSet, SpecialPort};
+    use crate::level::{LEVEL_RECORD_SIZE, LEVEL_WIDTH, LevelSet, SpecialPort};
 
     /// Original level-set bytes used for end-to-end initialization checks.
     const ORIGINAL_LEVELS: &[u8] = include_bytes!("../data/levels.dat");
@@ -1043,6 +1125,24 @@ mod tests {
             .state(Position::new(x, y))
             .expect("fixture coordinate should be in bounds")
             .actor()
+    }
+
+    /// Builds one original-size board around explicitly supplied raw tile IDs.
+    fn loaded_board_with_tiles(placements: &[(Position, u8)]) -> Board {
+        let mut record = [0_u8; LEVEL_RECORD_SIZE];
+
+        // Hardware provides a non-empty default around each fixture. Metadata
+        // remains zeroed so no unrelated port or gravity rule affects loading.
+        record[..crate::level::TILE_COUNT].fill(6);
+        for (position, tile) in placements {
+            let index = LEVEL_WIDTH * position.y + position.x;
+            record[index] = *tile;
+        }
+
+        let level = LevelSet::new(&record)
+            .load(1)
+            .expect("the synthetic original-size level record should parse");
+        Board::from_level(&level).expect("all synthetic tile identifiers should be supported")
     }
 
     /// Confirms all indexing routes implement exactly `width * y + x`.
@@ -3592,5 +3692,95 @@ mod tests {
         assert_eq!(game.title(), "------- WARM UP -------");
         assert_eq!(game.remaining_infotrons(), 19);
         assert_eq!(game.murphy_position(), Some(Position::new(30, 20)));
+    }
+
+    /// Reproduces every branch of the original enemy conversion pass.
+    #[test]
+    fn loaded_enemies_derive_their_initial_state_from_live_neighbors() {
+        let snik_turn = Position::new(3, 3);
+        let electron_blocked = Position::new(8, 3);
+        let snik_source = Position::new(13, 4);
+        let snik_destination = Position::new(13, 3);
+        let electron_source = Position::new(18, 4);
+        let electron_destination = Position::new(19, 4);
+        let board = loaded_board_with_tiles(&[
+            // A stable Space on the left has priority over every other route
+            // and selects raw turn state one without moving the enemy.
+            (snik_turn, 17),
+            (Position::new(2, 3), 0),
+            // With no free neighbor, an Electron retains raw turn state zero.
+            (electron_blocked, 24),
+            // A free cell above has priority over a free cell on the right and
+            // starts the Up transfer before the first simulation callback.
+            (snik_source, 17),
+            (snik_destination, 0),
+            (Position::new(14, 4), 0),
+            // When left and above are blocked, a free right cell starts the
+            // corresponding pre-play Electron transfer.
+            (electron_source, 24),
+            (electron_destination, 0),
+        ]);
+
+        let snik_turn_state = board
+            .state(snik_turn)
+            .expect("the stationary Snik Snak should remain at its source");
+        assert!(matches!(snik_turn_state.actor(), Actor::SnikSnak(_)));
+        assert_eq!(
+            snik_turn_state.animation().kind(),
+            AnimationKind::SnikSnakTurn(EnemyTurn::Left)
+        );
+        assert_eq!(snik_turn_state.animation().frame(), 1);
+
+        let blocked_state = board
+            .state(electron_blocked)
+            .expect("the blocked Electron should remain at its source");
+        assert!(matches!(blocked_state.actor(), Actor::Electron(_)));
+        assert_eq!(
+            blocked_state.animation().kind(),
+            AnimationKind::ElectronTurn(EnemyTurn::Left)
+        );
+        assert_eq!(blocked_state.animation().frame(), 0);
+
+        let snik_source_state = board
+            .state(snik_source)
+            .expect("the Snik Snak source reservation should remain in bounds");
+        assert!(matches!(snik_source_state.actor(), Actor::Empty(_)));
+        assert_eq!(
+            snik_source_state.animation().kind(),
+            AnimationKind::SnikSnakVacating(Direction::Up)
+        );
+        let snik_destination_state = board
+            .state(snik_destination)
+            .expect("the Snik Snak destination should remain in bounds");
+        assert!(matches!(
+            snik_destination_state.actor(),
+            Actor::SnikSnak(enemy) if enemy.heading() == Direction::Up
+        ));
+        assert_eq!(
+            snik_destination_state.animation().kind(),
+            AnimationKind::SnikSnakMove(Direction::Up)
+        );
+        assert_eq!(snik_destination_state.animation().frame(), 0);
+
+        let electron_source_state = board
+            .state(electron_source)
+            .expect("the Electron source reservation should remain in bounds");
+        assert!(matches!(electron_source_state.actor(), Actor::Empty(_)));
+        assert_eq!(
+            electron_source_state.animation().kind(),
+            AnimationKind::ElectronVacating(Direction::Right)
+        );
+        let electron_destination_state = board
+            .state(electron_destination)
+            .expect("the Electron destination should remain in bounds");
+        assert!(matches!(
+            electron_destination_state.actor(),
+            Actor::Electron(enemy) if enemy.heading() == Direction::Right
+        ));
+        assert_eq!(
+            electron_destination_state.animation().kind(),
+            AnimationKind::ElectronMove(Direction::Right)
+        );
+        assert_eq!(electron_destination_state.animation().frame(), 0);
     }
 }

@@ -975,6 +975,68 @@ impl State {
         Self::animated(Actor::Bug(Bug), Animation::bug_dormant(delay))
     }
 
+    /// Creates a Snik Snak in an exact turn state selected during level loading.
+    pub(crate) fn loaded_snik_snak_turn(frame: u8) -> Self {
+        // The serialized tile has no direction byte. `convertToEasyTiles`
+        // derives raw state zero or one from neighboring Space before play;
+        // retaining that state explicitly avoids inventing a first-tick turn.
+        Self::animated(
+            Actor::SnikSnak(SnikSnak::new(Direction::Right)),
+            Animation::snik_snak_turn(EnemyTurn::Left, frame),
+        )
+    }
+
+    /// Creates the destination half of a load-time Snik Snak transfer.
+    pub(crate) fn loaded_snik_snak_move(direction: Direction) -> Self {
+        // Only Up and Right are selected by the original initialization pass.
+        // The complete constructor remains directional so that actor heading,
+        // movement artwork, and post-transfer wall following cannot diverge.
+        debug_assert!(matches!(direction, Direction::Up | Direction::Right));
+        Self::animated(
+            Actor::SnikSnak(SnikSnak::new(direction)),
+            Animation::snik_snak_move(direction),
+        )
+    }
+
+    /// Creates the collision reservation left by a load-time Snik Snak move.
+    pub(crate) fn loaded_snik_snak_source(direction: Direction) -> Self {
+        // The original writes tile/state `0xffff` here. Model that otherwise
+        // unscheduled, solid marker with the same destination-owned reservation
+        // used by later Snik Snak transfers.
+        Self::animated(
+            Actor::Empty(Empty),
+            Animation::snik_snak_vacating(direction),
+        )
+    }
+
+    /// Creates an Electron in an exact turn state selected during level loading.
+    pub(crate) fn loaded_electron_turn(frame: u8) -> Self {
+        // Electrons share Snik Snak's raw state-zero/state-one conversion while
+        // preserving a distinct actor and sprite family for later explosions.
+        Self::animated(
+            Actor::Electron(Electron::new(Direction::Right)),
+            Animation::electron_turn(EnemyTurn::Left, frame),
+        )
+    }
+
+    /// Creates the destination half of a load-time Electron transfer.
+    pub(crate) fn loaded_electron_move(direction: Direction) -> Self {
+        // Preserve the derived direction as the Electron's heading so movement
+        // completion begins its next left-hand decision from the correct side.
+        debug_assert!(matches!(direction, Direction::Up | Direction::Right));
+        Self::animated(
+            Actor::Electron(Electron::new(direction)),
+            Animation::electron_move(direction),
+        )
+    }
+
+    /// Creates the collision reservation left by a load-time Electron move.
+    pub(crate) fn loaded_electron_source(direction: Direction) -> Self {
+        // This stable marker stands in for original `0xffff` until movement
+        // frame seven clears it from the destination-side update.
+        Self::animated(Actor::Empty(Empty), Animation::electron_vacating(direction))
+    }
+
     /// Reports whether this state is unoccupied for collision purposes.
     pub fn is_empty(&self) -> bool {
         matches!(self.actor, Actor::Empty(_))
