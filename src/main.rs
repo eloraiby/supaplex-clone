@@ -81,9 +81,12 @@ fn run(level: &Level, level_number: usize) -> Result<(), String> {
         .map_err(|error| format!("create SDL2 event pump: {error}"))?;
     let mut game = Game::new(level).map_err(|error| error.to_string())?;
 
-    // Physics advances at a fixed rate independent of rendering or monitor
-    // refresh. Four animation frames therefore produce a 160 ms cell movement.
-    const STEP: Duration = Duration::from_millis(40);
+    // The DOS game and the SpeedFix reference timing both advance gameplay at
+    // thirty-five iterations per second.  Keep this as an integer nanosecond
+    // duration so the fixed-step accumulator loses less than one nanosecond per
+    // iteration instead of rounding every update to 28 or 29 milliseconds.
+    // Rendering remains independently capped at sixty frames per second below.
+    const STEP: Duration = Duration::from_nanos(1_000_000_000 / 35);
     const MAX_STEPS_PER_FRAME: usize = 6;
     // Vsync is only a request and is ignored by some SDL render backends. An
     // independent deadline prevents those backends from rendering hundreds of

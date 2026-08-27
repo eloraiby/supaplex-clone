@@ -438,18 +438,25 @@ fn moving_sprite(state: &State, direction: Direction, frame: u8) -> SpriteCell {
     }
 }
 
-/// Selects the original fourteen-frame active Bug presentation sequence.
+/// Selects the sprite drawn for one non-negative original Bug state.
+///
+/// Bug state zero is the ordinary fixed Bug tile.  On each eligible global
+/// quarter tick, the original updater increments the state and indexes its
+/// coordinate table with states one through thirteen.  States one through
+/// eleven oscillate across four electrical frames, state twelve returns to the
+/// fixed Bug tile, and state thirteen is visually indistinguishable from Base
+/// even though it remains lethal until the next eligible update.
 fn bug_sprite(frame: u8) -> SpriteCell {
-    // Frame thirteen deliberately looks exactly like safe Base even though its
-    // `AnimationKind::Bug` remains lethal until the following Bug update. This
-    // visual ambiguity is part of the original timing rather than a collision
-    // shortcut based on sprite identity.
+    // The repacked atlas stores the four electrical pictures in row six,
+    // columns eight through eleven.  Column twelve belongs to another actor;
+    // selecting it was the visible Bug-to-Snik-Snak corruption reported by the
+    // fidelity audit.
     match frame.min(13) {
-        0 | 12 => SpriteCell::new(8, 6),
-        1 | 11 => SpriteCell::new(9, 6),
-        2 | 6 | 10 => SpriteCell::new(10, 6),
-        3 | 5 | 7 | 9 => SpriteCell::new(11, 6),
-        4 | 8 => SpriteCell::new(12, 6),
+        0 | 12 => static_sprite(25),
+        1 | 11 => SpriteCell::new(8, 6),
+        2 | 6 | 10 => SpriteCell::new(9, 6),
+        3 | 5 | 7 | 9 => SpriteCell::new(10, 6),
+        4 | 8 => SpriteCell::new(11, 6),
         13.. => static_sprite(2),
     }
 }
@@ -716,7 +723,7 @@ mod tests {
         assert_eq!(frames, vec![0, 1, 2, 3, 2, 1, 0, 1]);
     }
 
-    /// Confirms the Bug atlas follows the original fourteen active frames.
+    /// Confirms every non-negative Bug state follows the original coordinate table.
     #[test]
     fn bug_frames_follow_the_original_spark_and_base_sequence() {
         let active = (0..14).map(bug_sprite).collect::<Vec<_>>();
@@ -724,19 +731,19 @@ mod tests {
         assert_eq!(
             active,
             vec![
+                static_sprite(25),
                 super::SpriteCell::new(8, 6),
                 super::SpriteCell::new(9, 6),
                 super::SpriteCell::new(10, 6),
                 super::SpriteCell::new(11, 6),
-                super::SpriteCell::new(12, 6),
-                super::SpriteCell::new(11, 6),
                 super::SpriteCell::new(10, 6),
-                super::SpriteCell::new(11, 6),
-                super::SpriteCell::new(12, 6),
+                super::SpriteCell::new(9, 6),
+                super::SpriteCell::new(10, 6),
                 super::SpriteCell::new(11, 6),
                 super::SpriteCell::new(10, 6),
                 super::SpriteCell::new(9, 6),
                 super::SpriteCell::new(8, 6),
+                static_sprite(25),
                 static_sprite(2),
             ]
         );
