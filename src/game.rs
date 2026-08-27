@@ -1072,7 +1072,7 @@ mod tests {
     use super::{Board, Game, GameStatus, Input, PlantedRedDisk};
     use crate::actor::{
         Actor, AnimationKind, Base, Bug, CHAIN_REACTION_FRAMES, Direction, Electron, Empty,
-        EnemyTurn, Exit, ExplosionResidue, Hardware, Infotron, InvisibleWall, Murphy,
+        EnemyTurn, Exit, Explosion, ExplosionResidue, Hardware, Infotron, InvisibleWall, Murphy,
         MurphyAnimation, OrangeDisk, Port, PortDirections, Position, RedDisk, SnikSnak, State,
         Terminal, YellowDisk, Zonk,
     };
@@ -2940,6 +2940,61 @@ mod tests {
             .animation()
             .frame();
         assert!(quarter_frame > second_frame);
+    }
+
+    /// Confirms only the late half of a regular explosion is traversable.
+    #[test]
+    fn murphy_enters_mature_regular_explosions_but_not_lethal_blasts() {
+        let murphy = Position::new(3, 3);
+        let target = Position::new(3, 2);
+        let movement = Input {
+            direction: Some(Direction::Up),
+            ..Input::default()
+        };
+        let fixture = |residue| {
+            game_with(
+                &[
+                    (murphy, State::new(Actor::Murphy(Murphy::new()))),
+                    (
+                        target,
+                        State::new(Actor::Explosion(Explosion::new(residue))),
+                    ),
+                ],
+                0,
+            )
+        };
+
+        let mut young_regular = fixture(ExplosionResidue::Empty);
+        young_regular.tick(movement);
+        assert_eq!(young_regular.status(), GameStatus::Dead);
+
+        let mut mature_regular = fixture(ExplosionResidue::Empty);
+        // Explosion state advances on ticks 0, 4, 8, and 12. Raw state four is
+        // the first value the original collision helper erases as harmless.
+        for _ in 0..13 {
+            mature_regular.tick(Input::default());
+        }
+        assert_eq!(
+            mature_regular
+                .board()
+                .state(target)
+                .expect("the mature explosion should remain present")
+                .animation()
+                .frame(),
+            4
+        );
+        mature_regular.tick(movement);
+        assert_eq!(mature_regular.status(), GameStatus::Playing);
+        assert_eq!(mature_regular.murphy_position(), Some(target));
+
+        let mut electron_blast = fixture(ExplosionResidue::Infotron);
+        // Electron explosions retain the high bit in every visible state and
+        // therefore remain lethal even after their fourth animation frame.
+        for _ in 0..13 {
+            electron_blast.tick(Input::default());
+        }
+        electron_blast.tick(movement);
+        assert_eq!(electron_blast.status(), GameStatus::Dead);
     }
 
     /// Confirms accidental tile 40 blocks Murphy without gaining a reveal state.

@@ -1600,11 +1600,30 @@ impl Murphy {
             )),
             Actor::SnikSnak(_) => Some(explode_at(world, target, false)),
             Actor::Electron(_) => Some(explode_at(world, target, true)),
-            Actor::Explosion(explosion) => Some(explode_at(
-                world,
-                position,
-                explosion.residue == ExplosionResidue::Infotron,
-            )),
+            Actor::Explosion(explosion)
+                if explosion.residue == ExplosionResidue::Empty
+                    && target_state.animation.frame >= 4 =>
+            {
+                // Regular explosion states four through seven are already
+                // harmless in the DOS collision helper. It erases that cell
+                // and then dispatches the ordinary direction handler, so the
+                // visible result is exactly an Empty-target Murphy movement.
+                Some(Transition::move_murphy(
+                    position,
+                    target,
+                    murphy_actor,
+                    direction,
+                    MurphyMoveTarget::Empty,
+                    looking_left,
+                ))
+            }
+            Actor::Explosion(_) => {
+                // Young regular explosions and every Electron explosion are
+                // lethal. The original re-detonates the destination cell, not
+                // Murphy's source; because that cell is currently Explosion,
+                // the new blast is always a normal, empty-residue explosion.
+                Some(explode_at(world, target, false))
+            }
             _ => None,
         }
     }
