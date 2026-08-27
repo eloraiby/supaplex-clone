@@ -4,7 +4,10 @@
 //! variants wrap actor-specific structs, while [`Animation`] records the visual
 //! phase and the semantic transition that follows its final frame.
 
-use crate::{game::WorldView, level::SpecialPort};
+use crate::{
+    game::{SoundEffect, WorldView},
+    level::SpecialPort,
+};
 
 /// Number of original updates used by a falling or enemy cell transfer.
 const MOVEMENT_FRAMES: u8 = 8;
@@ -1328,12 +1331,15 @@ impl Murphy {
             if remaining == 0 {
                 let mut moving = *self;
                 moving.phase = MurphyPhase::Ready;
-                return Transition::replace(
-                    position,
-                    State::animated(
-                        Actor::Murphy(moving),
-                        Animation::murphy_push(direction, target),
-                    ),
+                return Transition::new(
+                    vec![CellWrite::new(
+                        position,
+                        State::animated(
+                            Actor::Murphy(moving),
+                            Animation::murphy_push(direction, target),
+                        ),
+                    )],
+                    vec![GameEvent::PlaySound(SoundEffect::Push)],
                 );
             }
 
@@ -1464,6 +1470,12 @@ impl Murphy {
             Actor::RedDisk(_) if target_state.is_idle() => MurphySnapTarget::RedDisk,
             _ => return None,
         };
+        let sound = match target_kind {
+            MurphySnapTarget::Base => Some(SoundEffect::Base),
+            MurphySnapTarget::Infotron => Some(SoundEffect::Infotron),
+            // Original Red Disk collection has no dedicated sound request.
+            MurphySnapTarget::RedDisk => None,
+        };
 
         // Preserve the target throughout the strip. Its reserved animation
         // prevents row-major actor scheduling, and collection/removal happens
@@ -1481,7 +1493,7 @@ impl Murphy {
                     ),
                 ),
             ],
-            Vec::new(),
+            sound.into_iter().map(GameEvent::PlaySound).collect(),
         ))
     }
 
@@ -1511,32 +1523,35 @@ impl Murphy {
                 MurphyMoveTarget::Empty,
                 looking_left,
             )),
-            Actor::Base(_) => Some(Transition::move_murphy(
+            Actor::Base(_) => Some(Transition::move_murphy_with_events(
                 position,
                 target,
                 murphy_actor,
                 direction,
                 MurphyMoveTarget::Base,
                 looking_left,
+                vec![GameEvent::PlaySound(SoundEffect::Base)],
             )),
             Actor::Bug(_) if world.is_bug_active(target) => {
                 Some(explode_at(world, position, false))
             }
-            Actor::Bug(_) => Some(Transition::move_murphy(
+            Actor::Bug(_) => Some(Transition::move_murphy_with_events(
                 position,
                 target,
                 murphy_actor,
                 direction,
                 MurphyMoveTarget::Base,
                 looking_left,
+                vec![GameEvent::PlaySound(SoundEffect::Base)],
             )),
-            Actor::Infotron(_) => Some(Transition::move_murphy(
+            Actor::Infotron(_) => Some(Transition::move_murphy_with_events(
                 position,
                 target,
                 murphy_actor,
                 direction,
                 MurphyMoveTarget::Infotron,
                 looking_left,
+                vec![GameEvent::PlaySound(SoundEffect::Infotron)],
             )),
             Actor::RedDisk(_) if world.is_active_red_disk(target) => {
                 // A planted disk is position-owned rather than collectible.
@@ -1566,7 +1581,10 @@ impl Murphy {
                 // The original sets its successful-level flag as soon as the
                 // unlocked Exit is selected. The forty pictures are a terminal
                 // disappearance sequence, not a deferred success condition.
-                vec![GameEvent::Completed],
+                vec![
+                    GameEvent::Completed,
+                    GameEvent::PlaySound(SoundEffect::Exit),
+                ],
             )),
             Actor::Zonk(_) if direction.is_horizontal() && target_state.is_idle() => {
                 self.prepare_push(position, target, direction, world, MurphyPushTarget::Zonk)
@@ -2687,9 +2705,23 @@ impl Actor {
         // settle, explode, or explicitly hand control back to the actor.
         match state.animation.advance() {
             AnimationAdvance::Frame(animation) => {
-                return Some(Transition::replace(
-                    position,
-                    State::animated(self.clone(), animation),
+                // The DOS Bug updater checks all eight neighbors after each
+                // active quarter-tick frame is selected. Dormant frames and
+                // non-Bug animations pass through without an audio request.
+                let events = if matches!(self, Self::Bug(_))
+                    && animation.kind == AnimationKind::Bug
+                    && world.has_neighboring_murphy(position)
+                {
+                    vec![GameEvent::PlaySound(SoundEffect::Bug)]
+                } else {
+                    Vec::new()
+                };
+                return Some(Transition::new(
+                    vec![CellWrite::new(
+                        position,
+                        State::animated(self.clone(), animation),
+                    )],
+                    events,
                 ));
             }
             AnimationAdvance::Finished(AnimationNext::Settle) => {
@@ -2883,9 +2915,19 @@ impl Actor {
             }
             AnimationAdvance::Finished(AnimationNext::ActivateBug) => {
                 debug_assert!(matches!(self, Self::Bug(_)));
-                return Some(Transition::replace(
-                    position,
-                    State::animated(Self::Bug(Bug), Animation::bug_active()),
+                // Reaching active frame zero also performs the proximity check;
+                // waiting until frame one would omit one original Bug chirp.
+                let events = world
+                    .has_neighboring_murphy(position)
+                    .then_some(GameEvent::PlaySound(SoundEffect::Bug))
+                    .into_iter()
+                    .collect();
+                return Some(Transition::new(
+                    vec![CellWrite::new(
+                        position,
+                        State::animated(Self::Bug(Bug), Animation::bug_active()),
+                    )],
+                    events,
                 ));
             }
             AnimationAdvance::Finished(AnimationNext::FinishSnikSnakMove { direction }) => {
@@ -3254,7 +3296,15 @@ impl Actor {
                             Direction::Down,
                         );
                     }
-                    return Transition::replace(position, State::new(Self::Zonk(Zonk::resting())));
+                    // Landing on a non-reactive occupant is the one safe Zonk
+                    // terminal path that selects the original Fall effect.
+                    return Transition::new(
+                        vec![CellWrite::new(
+                            position,
+                            State::new(Self::Zonk(Zonk::resting())),
+                        )],
+                        vec![GameEvent::PlaySound(SoundEffect::Fall)],
+                    );
                 }
             }
             Self::Infotron(infotron) if infotron.falling => {
@@ -3281,11 +3331,20 @@ impl Actor {
                         }
                     }
                     let still_falling = world.is_empty(below);
-                    return Transition::replace(
-                        position,
-                        State::new(Self::Infotron(Infotron {
-                            falling: still_falling,
-                        })),
+                    // A continued vertical transfer remains silent. Only the
+                    // first obstructed settle matches `playFallSound`.
+                    let events = (!still_falling)
+                        .then_some(GameEvent::PlaySound(SoundEffect::Fall))
+                        .into_iter()
+                        .collect();
+                    return Transition::new(
+                        vec![CellWrite::new(
+                            position,
+                            State::new(Self::Infotron(Infotron {
+                                falling: still_falling,
+                            })),
+                        )],
+                        events,
                     );
                 }
             }
@@ -3413,6 +3472,8 @@ pub(crate) enum GameEvent {
     ExplosionStarted,
     /// Clear the original global explosion flag when one visual cell completes.
     ExplosionFinished,
+    /// Forward one actor-selected effect to the platform playback queue.
+    PlaySound(SoundEffect),
 }
 
 /// Atomic multi-cell change applied immediately during the linear update pass.
@@ -3522,6 +3583,29 @@ impl Transition {
         target: MurphyMoveTarget,
         looking_left: bool,
     ) -> Self {
+        Self::move_murphy_with_events(
+            source,
+            destination,
+            actor,
+            direction,
+            target,
+            looking_left,
+            Vec::new(),
+        )
+    }
+
+    /// Moves Murphy while emitting action-start side effects after both writes.
+    fn move_murphy_with_events(
+        source: Position,
+        destination: Position,
+        actor: Actor,
+        direction: Direction,
+        target: MurphyMoveTarget,
+        looking_left: bool,
+        events: Vec<GameEvent>,
+    ) -> Self {
+        // The destination owns animation progress from the initiating update;
+        // the sound belongs to that same atomic start, never to completion.
         let animation = Animation::murphy_move(direction, target, looking_left);
         let frame_count = animation.frame_count;
         Self::new(
@@ -3529,7 +3613,7 @@ impl Transition {
                 CellWrite::new(source, State::vacating_for(direction, frame_count)),
                 CellWrite::new(destination, State::animated(actor, animation)),
             ],
-            Vec::new(),
+            events,
         )
     }
 
@@ -3580,7 +3664,10 @@ fn explode_wave(world: &WorldView<'_>, center: Position, electron_wave: bool) ->
     let mut writes = Vec::new();
     // The original engine uses one global flag for explosion sound and camera
     // shake rather than counting live cells.  Every emitted wave sets it again.
-    let mut events = vec![GameEvent::ExplosionStarted];
+    let mut events = vec![
+        GameEvent::ExplosionStarted,
+        GameEvent::PlaySound(SoundEffect::Explosion),
+    ];
 
     // Signed offsets make edge clipping explicit. Both visible and invisible
     // Hardware are skipped so their indestructibility survives every wave.

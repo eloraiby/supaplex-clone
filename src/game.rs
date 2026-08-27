@@ -280,6 +280,29 @@ pub enum GameStatus {
     Dead,
 }
 
+/// Original gameplay sound selected by an actor transition.
+///
+/// Keeping semantic requests in the platform-independent simulation lets tests
+/// verify the exact trigger tick without opening an SDL audio device. The SDL
+/// front end drains these requests after each batch of fixed simulation steps.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum SoundEffect {
+    /// A normal or Electron 3x3 explosion wave has begun.
+    Explosion,
+    /// Murphy has started moving through or snapping up an Infotron.
+    Infotron,
+    /// A held push has begun, or a planted Red Disk has been committed.
+    Push,
+    /// A falling Zonk or Infotron has landed on a non-explosive obstacle.
+    Fall,
+    /// An active Bug has advanced while Murphy occupies a neighboring cell.
+    Bug,
+    /// Murphy has started eating Base or a currently safe Bug.
+    Base,
+    /// Murphy has selected an unlocked Exit.
+    Exit,
+}
+
 /// Concealed portion of the single Red Disk fuse planted beneath Murphy.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 struct PlantedRedDisk {
@@ -335,6 +358,8 @@ pub struct Game {
     explosion_started: bool,
     /// Remaining updates in the original post-death or post-completion sequence.
     quit_countdown: u8,
+    /// Sound requests waiting for the SDL front end to drain and play them.
+    pending_sound_effects: Vec<SoundEffect>,
 }
 
 impl Game {
@@ -389,6 +414,7 @@ impl Game {
             explosion_timers,
             explosion_started: false,
             quit_countdown: 0,
+            pending_sound_effects: Vec::new(),
         })
     }
 
@@ -442,6 +468,13 @@ impl Game {
     /// Returns the number of fixed simulation steps processed.
     pub fn tick_count(&self) -> u64 {
         self.tick
+    }
+
+    /// Removes and returns every sound requested since the preceding drain.
+    pub fn take_sound_effects(&mut self) -> Vec<SoundEffect> {
+        // Taking the vector guarantees that an effect is presented exactly
+        // once even when rendering runs faster than the fixed simulation.
+        std::mem::take(&mut self.pending_sound_effects)
     }
 
     /// Finds Murphy's current logical destination cell, including during movement.
@@ -606,6 +639,7 @@ impl Game {
                 {
                     self.red_disks -= 1;
                     disk.countdown = 2;
+                    self.pending_sound_effects.push(SoundEffect::Push);
                 }
             }
             GameEvent::Completed => {
@@ -670,6 +704,7 @@ impl Game {
             }
             GameEvent::ExplosionStarted => self.explosion_started = true,
             GameEvent::ExplosionFinished => self.explosion_started = false,
+            GameEvent::PlaySound(effect) => self.pending_sound_effects.push(effect),
         }
     }
 
@@ -1012,6 +1047,21 @@ impl<'board> WorldView<'board> {
             .is_some_and(|state| state.animation().kind() == AnimationKind::Bug)
     }
 
+    /// Reports whether any of the eight surrounding cells currently holds Murphy.
+    pub(crate) fn has_neighboring_murphy(&self, position: Position) -> bool {
+        // Bug sound uses the original 3x3 neighborhood rather than only the
+        // four directions Murphy can enter from, so diagonal proximity counts.
+        (-1_isize..=1).any(|delta_y| {
+            (-1_isize..=1).any(|delta_x| {
+                (delta_x != 0 || delta_y != 0)
+                    && self
+                        .offset_xy(position, delta_x, delta_y)
+                        .and_then(|neighbor| self.state(neighbor))
+                        .is_some_and(|state| matches!(state.actor(), Actor::Murphy(_)))
+            })
+        })
+    }
+
     /// Finds metadata for the special port occupying one exact board coordinate.
     pub(crate) fn special_port(&self, position: Position) -> Option<&SpecialPort> {
         self.special_ports
@@ -1069,7 +1119,7 @@ fn state_from_tile(tile: u8) -> Result<State, BoardError> {
 mod tests {
     //! Focused simulations proving indexing, animation occupancy, and mechanics.
 
-    use super::{Board, Game, GameStatus, Input, PlantedRedDisk};
+    use super::{Board, Game, GameStatus, Input, PlantedRedDisk, SoundEffect};
     use crate::actor::{
         Actor, AnimationKind, Base, Bug, CHAIN_REACTION_FRAMES, Direction, Electron, Empty,
         EnemyTurn, Exit, Explosion, ExplosionResidue, Hardware, Infotron, InvisibleWall, Murphy,
@@ -1119,6 +1169,7 @@ mod tests {
             explosion_timers: vec![0; width * height],
             explosion_started: false,
             quit_countdown: 0,
+            pending_sound_effects: Vec::new(),
         }
     }
 
@@ -1339,6 +1390,110 @@ mod tests {
             game.tick(Input::default());
         }
         assert_eq!(game.remaining_infotrons(), 0);
+    }
+
+    /// Confirms Murphy's material sounds begin with input, not strip completion.
+    #[test]
+    fn murphy_requests_base_and_infotron_sounds_on_the_action_tick() {
+        let murphy = (
+            Position::new(2, 2),
+            State::new(Actor::Murphy(Murphy::new())),
+        );
+        let input = Input {
+            direction: Some(Direction::Right),
+            ..Input::default()
+        };
+
+        // Moving into Base selects the Base effect before any of its eight
+        // visual frames can complete.
+        let mut base = game_with(
+            &[
+                murphy.clone(),
+                (Position::new(3, 2), State::new(Actor::Base(Base))),
+            ],
+            0,
+        );
+        base.tick(input);
+        assert_eq!(base.take_sound_effects(), vec![SoundEffect::Base]);
+        assert!(base.take_sound_effects().is_empty());
+
+        // Infotron movement follows the same timing even though collection is
+        // deliberately deferred until the final animation frame.
+        let mut infotron = game_with(
+            &[
+                murphy,
+                (
+                    Position::new(3, 2),
+                    State::new(Actor::Infotron(Infotron::resting())),
+                ),
+            ],
+            1,
+        );
+        infotron.tick(input);
+        assert_eq!(infotron.take_sound_effects(), vec![SoundEffect::Infotron]);
+        assert_eq!(infotron.remaining_infotrons(), 1);
+    }
+
+    /// Confirms the push effect waits for the original hold counter to expire.
+    #[test]
+    fn murphy_requests_push_sound_only_when_the_push_strip_begins() {
+        let mut game = game_with(
+            &[
+                (
+                    Position::new(2, 2),
+                    State::new(Actor::Murphy(Murphy::new())),
+                ),
+                (
+                    Position::new(3, 2),
+                    State::new(Actor::Zonk(Zonk::resting())),
+                ),
+            ],
+            0,
+        );
+        let held_right = Input {
+            direction: Some(Direction::Right),
+            ..Input::default()
+        };
+
+        // The initiating update plus seven countdown updates remain silent.
+        for _ in 0..8 {
+            game.tick(held_right);
+            assert!(game.take_sound_effects().is_empty());
+        }
+        game.tick(held_right);
+        assert_eq!(game.take_sound_effects(), vec![SoundEffect::Push]);
+    }
+
+    /// Confirms active Bugs chirp only when Murphy is in their 3x3 neighborhood.
+    #[test]
+    fn bug_sound_requires_active_animation_and_neighboring_murphy() {
+        let mut adjacent = game_with(
+            &[
+                (
+                    Position::new(1, 1),
+                    State::new(Actor::Murphy(Murphy::new())),
+                ),
+                (Position::new(2, 2), State::new(Actor::Bug(Bug))),
+            ],
+            0,
+        );
+        adjacent.tick(Input::default());
+        assert_eq!(adjacent.take_sound_effects(), vec![SoundEffect::Bug]);
+
+        // A Bug outside the eight-cell neighborhood advances identically but
+        // makes no request, matching the proximity test in the DOS updater.
+        let mut distant = game_with(
+            &[
+                (
+                    Position::new(1, 4),
+                    State::new(Actor::Murphy(Murphy::new())),
+                ),
+                (Position::new(4, 1), State::new(Actor::Bug(Bug))),
+            ],
+            0,
+        );
+        distant.tick(Input::default());
+        assert!(distant.take_sound_effects().is_empty());
     }
 
     /// Confirms a stable Zonk can be pushed only with free space behind it.
@@ -1673,6 +1828,38 @@ mod tests {
             AnimationKind::Vacating(Direction::Down)
         );
         assert!(!prior_cell.is_empty());
+    }
+
+    /// Confirms the Fall effect marks a completed safe landing, not fall start.
+    #[test]
+    fn falling_zonk_requests_fall_sound_when_it_reaches_support() {
+        let mut game = game_with(
+            &[
+                (
+                    Position::new(1, 4),
+                    State::new(Actor::Murphy(Murphy::new())),
+                ),
+                (
+                    Position::new(3, 1),
+                    State::new(Actor::Zonk(Zonk::resting())),
+                ),
+                (
+                    Position::new(3, 3),
+                    State::new(Actor::Hardware(Hardware::new(0))),
+                ),
+            ],
+            0,
+        );
+
+        // One pre-fall update and all eight transfer pictures are silent. The
+        // following settle callback observes Hardware and requests Fall once.
+        for _ in 0..9 {
+            game.tick(Input::default());
+            assert!(game.take_sound_effects().is_empty());
+        }
+        game.tick(Input::default());
+        assert_eq!(game.take_sound_effects(), vec![SoundEffect::Fall]);
+        assert!(matches!(actor_at(&game, 3, 2), Actor::Zonk(_)));
     }
 
     /// Confirms freeze lets an in-flight fall finish without desynchronizing it.
@@ -2912,7 +3099,9 @@ mod tests {
         open.tick(input);
 
         assert_eq!(locked.status(), GameStatus::Playing);
+        assert!(locked.take_sound_effects().is_empty());
         assert_eq!(open.status(), GameStatus::Completed);
+        assert_eq!(open.take_sound_effects(), vec![SoundEffect::Exit]);
         assert_eq!(
             open.board()
                 .state(Position::new(2, 2))
@@ -2952,6 +3141,7 @@ mod tests {
         });
 
         assert_eq!(game.status(), GameStatus::Dead);
+        assert_eq!(game.take_sound_effects(), vec![SoundEffect::Explosion]);
         assert_eq!(game.quit_countdown, 0x3f);
         assert!(matches!(actor_at(&game, 2, 2), Actor::Explosion(_)));
 
