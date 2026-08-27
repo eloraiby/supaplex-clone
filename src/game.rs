@@ -8,10 +8,10 @@ use std::{
 
 use crate::{
     actor::{
-        Actor, AnimationKind, Base, Bug, Direction, Electron, Empty, Exit, GameEvent, Hardware,
-        Infotron, InvisibleWall, Murphy, OrangeDisk, Port, PortDirections, Position,
-        RED_DISK_FUSE_FRAMES, RamChip, RamChipShape, RedDisk, SnikSnak, State, Terminal,
-        Transition, YellowDisk, Zonk,
+        Actor, AnimationKind, Base, Bug, CHAIN_REACTION_FRAMES, Direction, Electron, Empty, Exit,
+        GameEvent, Hardware, Infotron, InvisibleWall, Murphy, OrangeDisk, Port, PortDirections,
+        Position, RED_DISK_DETONATION_COUNTDOWN, RamChip, RamChipShape, RedDisk, SnikSnak, State,
+        Terminal, Transition, YellowDisk, Zonk,
     },
     level::{LEVEL_HEIGHT, LEVEL_WIDTH, Level, SpecialPort},
 };
@@ -190,8 +190,8 @@ pub enum GameStatus {
 struct PlantedRedDisk {
     /// Board cell where Murphy initiated the planting action.
     position: Position,
-    /// Fuse frames already consumed while Murphy still covers the disk.
-    elapsed_frames: u8,
+    /// Original countdown byte, beginning at two after placement completes.
+    countdown: u8,
 }
 
 /// Derives the ordinary-play RNG seed from the current process wall clock.
@@ -234,6 +234,12 @@ pub struct Game {
     random_seed: u16,
     /// Mask applied to randomized Terminal delays before and after activation.
     terminal_delay_mask: u8,
+    /// Signed secondary-wave timers stored independently from explosion graphics.
+    explosion_timers: Vec<i8>,
+    /// Original global flag controlling one shared random camera-shake draw.
+    explosion_started: bool,
+    /// Remaining updates in the original post-death or post-completion sequence.
+    quit_countdown: u8,
 }
 
 impl Game {
@@ -269,6 +275,8 @@ impl Game {
             u16::from(level.required_infotrons())
         };
 
+        let explosion_timers = vec![0; board.cells().len()];
+
         Ok(Self {
             board,
             title: level.title().to_owned(),
@@ -283,6 +291,9 @@ impl Game {
             tick: 0,
             random_seed,
             terminal_delay_mask: 0x7f,
+            explosion_timers,
+            explosion_started: false,
+            quit_countdown: 0,
         })
     }
 
@@ -353,13 +364,14 @@ impl Game {
 
     /// Applies one Murphy-first, row-major simulation step to the live board.
     pub fn tick(&mut self, input: Input) {
-        // Completion is final. Death still advances only existing Explosion
-        // actors so the visible blast can finish without post-mortem physics.
-        if self.status == GameStatus::Completed {
+        // A terminal status becomes final only after the original countdown.
+        // Until then, every non-Murphy updater, fuse, and timer remains live.
+        if self.status != GameStatus::Playing && self.quit_countdown == 0 {
             return;
         }
 
         let playing = self.status == GameStatus::Playing;
+        let simulating = playing || self.quit_countdown > 0;
         let murphy_source = playing.then(|| self.murphy_position()).flatten();
 
         // Supaplex always updates Murphy before constructing the linear moving-
@@ -390,10 +402,8 @@ impl Game {
                 let is_new_murphy_source = Some(position) == murphy_source
                     && matches!(state.actor(), Actor::Empty(_))
                     && matches!(state.animation().kind(), AnimationKind::Vacating(_));
-                (!is_new_murphy_source
-                    && !matches!(state.actor(), Actor::Murphy(_))
-                    && (playing || matches!(state.actor(), Actor::Explosion(_))))
-                .then(|| (position, std::mem::discriminant(state.actor())))
+                (!is_new_murphy_source && !matches!(state.actor(), Actor::Murphy(_)) && simulating)
+                    .then(|| (position, std::mem::discriminant(state.actor())))
             })
             .collect::<Vec<_>>();
 
@@ -409,8 +419,13 @@ impl Game {
             }
         }
 
-        if self.status == GameStatus::Playing {
+        if simulating {
             self.advance_planted_red_disk();
+            self.advance_explosion_timers();
+            self.consume_explosion_random_value();
+        }
+        if self.quit_countdown > 0 {
+            self.quit_countdown -= 1;
         }
         self.tick = self.tick.saturating_add(1);
     }
@@ -463,12 +478,17 @@ impl Game {
                     self.red_disks -= 1;
                     self.planted_red_disk = Some(PlantedRedDisk {
                         position,
-                        elapsed_frames: 0,
+                        countdown: 2,
                     });
                 }
             }
             GameEvent::Completed => self.status = GameStatus::Completed,
-            GameEvent::Died => self.status = GameStatus::Dead,
+            GameEvent::Died => {
+                self.status = GameStatus::Dead;
+                if self.quit_countdown == 0 {
+                    self.quit_countdown = 0x40;
+                }
+            }
             GameEvent::ApplySpecialPort(port) => {
                 self.gravity = port.gravity;
                 self.freeze_zonks = port.freeze_zonks;
@@ -509,6 +529,16 @@ impl Game {
                     )
                     .expect("scheduled Terminal position remains in bounds");
             }
+            GameEvent::ScheduleExplosion { position, electron } => {
+                // Timer sign carries the future wave type exactly as the DOS
+                // byte array did: positive is regular, negative is Electron.
+                if let Some(index) = self.board.index(position) {
+                    let delay = CHAIN_REACTION_FRAMES as i8;
+                    self.explosion_timers[index] = if electron { -delay } else { delay };
+                }
+            }
+            GameEvent::ExplosionStarted => self.explosion_started = true,
+            GameEvent::ExplosionFinished => self.explosion_started = false,
         }
     }
 
@@ -570,11 +600,17 @@ impl Game {
         let Some(mut planted) = self.planted_red_disk.take() else {
             return;
         };
-        planted.elapsed_frames = planted.elapsed_frames.saturating_add(1);
+        // Values zero and one are the unplanted/arming states. A completely
+        // placed disk starts at two and increments once per gameplay iteration.
+        if planted.countdown <= 1 {
+            self.planted_red_disk = Some(planted);
+            return;
+        }
+        planted.countdown = planted.countdown.saturating_add(1);
 
-        // The concealed fuse keeps running under Murphy. Reaching its terminal
-        // frame detonates the stored position whether or not Murphy escaped.
-        if planted.elapsed_frames >= RED_DISK_FUSE_FRAMES {
+        // The concealed fuse keeps running under Murphy. Reaching 0x28 detonates
+        // the stored position regardless of which actor currently covers it.
+        if planted.countdown >= RED_DISK_DETONATION_COUNTDOWN {
             self.detonate_position(planted.position);
             return;
         }
@@ -595,15 +631,47 @@ impl Game {
                 // A visible State exposes the current animation frame, while
                 // this retained record lets Murphy cross without losing time.
                 self.board
-                    .set(
-                        planted.position,
-                        State::planted_red_disk(planted.elapsed_frames),
-                    )
+                    .set(planted.position, State::planted_red_disk(planted.countdown))
                     .expect("stored planted-disk position must remain in bounds");
                 self.planted_red_disk = Some(planted);
             }
             // Another actor or blast already consumed the concealed disk.
             _ => {}
+        }
+    }
+
+    /// Advances every independent signed chain timer in row-major order.
+    fn advance_explosion_timers(&mut self) {
+        // A wave emitted by an earlier index can install a timer at a later
+        // index, which is then decremented in this same pass.  Iterating the live
+        // vector directly preserves that subtle original ordering behavior.
+        for index in 0..self.explosion_timers.len() {
+            let timer = self.explosion_timers[index];
+            if timer == 0 {
+                continue;
+            }
+
+            let next = if timer < 0 { timer + 1 } else { timer - 1 };
+            self.explosion_timers[index] = next;
+            if next != 0 {
+                continue;
+            }
+
+            let position = self
+                .board
+                .position(index)
+                .expect("explosion timer indices share the board dimensions");
+            let transition = self.explosion_transition(position, timer < 0);
+            self.apply_transition(transition);
+        }
+    }
+
+    /// Consumes the original shared random draw while explosion shake is active.
+    fn consume_explosion_random_value(&mut self) {
+        // The generated value is presentation-only, but advancing this exact
+        // stream is gameplay-significant because Terminals and Bugs use it too.
+        if self.explosion_started {
+            let _ = self.next_random();
         }
     }
 
@@ -911,6 +979,9 @@ mod tests {
             tick: 0,
             random_seed: 0,
             terminal_delay_mask: 0x7f,
+            explosion_timers: vec![0; width * height],
+            explosion_started: false,
+            quit_countdown: 0,
         }
     }
 
@@ -1970,7 +2041,7 @@ mod tests {
         );
         game.planted_red_disk = Some(PlantedRedDisk {
             position: disk_position,
-            elapsed_frames: 5,
+            countdown: 5,
         });
 
         for _ in 0..5 {
@@ -2013,9 +2084,9 @@ mod tests {
         assert_eq!(explosion.residue(), ExplosionResidue::Infotron);
     }
 
-    /// Confirms a later normal wave cannot erase active Infotron residue.
+    /// Confirms a later wave overwrites an earlier visual residue in scan order.
     #[test]
-    fn overlapping_later_blast_preserves_electron_residue() {
+    fn overlapping_later_blast_replaces_electron_residue() {
         let mut game = game_with(
             &[
                 (
@@ -2036,12 +2107,12 @@ mod tests {
         let Actor::Explosion(explosion) = actor_at(&game, 3, 2) else {
             panic!("overlap should remain an explosion");
         };
-        assert_eq!(explosion.residue(), ExplosionResidue::Infotron);
+        assert_eq!(explosion.residue(), ExplosionResidue::Empty);
     }
 
-    /// Confirms a touched chain actor waits for its promised terminal wave.
+    /// Confirms a touched chain actor waits for its independent timer to expire.
     #[test]
-    fn chain_reaction_waits_for_its_animation_to_finish() {
+    fn chain_reaction_waits_for_its_independent_timer() {
         let mut game = game_with(
             &[
                 (
@@ -2058,6 +2129,11 @@ mod tests {
 
         game.detonate_position(Position::new(2, 2));
         assert_eq!(game.status(), GameStatus::Playing);
+        let chain_index = game
+            .board
+            .index(Position::new(3, 2))
+            .expect("Orange Disk chain center should be in bounds");
+        assert_eq!(game.explosion_timers[chain_index], 13);
 
         for _ in 0..CHAIN_REACTION_FRAMES - 1 {
             game.tick(Input::default());
@@ -2066,12 +2142,49 @@ mod tests {
 
         game.tick(Input::default());
         assert_eq!(game.status(), GameStatus::Dead);
+        assert_eq!(game.explosion_timers[chain_index], 0);
         assert!(matches!(actor_at(&game, 4, 2), Actor::Explosion(_)));
     }
 
-    /// Confirms adjacent delayed centers consume each other's stale promises.
+    /// Confirms a completed Red Disk placement uses countdown values two through forty.
     #[test]
-    fn same_deadline_chain_centers_preserve_and_consume_their_own_timers() {
+    fn planted_red_disk_detonates_at_original_countdown_value() {
+        let disk_position = Position::new(3, 2);
+        let mut game = game_with(
+            &[
+                (
+                    Position::new(1, 4),
+                    State::new(Actor::Murphy(Murphy::new())),
+                ),
+                (disk_position, State::planted_red_disk(2)),
+            ],
+            0,
+        );
+        game.planted_red_disk = Some(PlantedRedDisk {
+            position: disk_position,
+            countdown: 2,
+        });
+
+        // Thirty-seven updates leave countdown 39 and the disk intact.
+        for _ in 0..37 {
+            game.tick(Input::default());
+        }
+        assert!(matches!(actor_at(&game, 3, 2), Actor::RedDisk(_)));
+        assert_eq!(
+            game.planted_red_disk
+                .expect("fuse should remain active before value forty")
+                .countdown,
+            39
+        );
+
+        game.tick(Input::default());
+        assert!(game.planted_red_disk.is_none());
+        assert!(matches!(actor_at(&game, 3, 2), Actor::Explosion(_)));
+    }
+
+    /// Confirms adjacent delayed centers retain independent timer-array entries.
+    #[test]
+    fn same_deadline_chain_centers_expire_independently_of_visual_frames() {
         let mut game = game_with(
             &[
                 (
@@ -2091,17 +2204,27 @@ mod tests {
         );
 
         game.detonate_position(Position::new(2, 2));
+        let first_index = game
+            .board
+            .index(Position::new(3, 2))
+            .expect("first chain center should be in bounds");
+        let second_index = game
+            .board
+            .index(Position::new(2, 3))
+            .expect("second chain center should be in bounds");
+        assert_eq!(game.explosion_timers[first_index], 13);
+        assert_eq!(game.explosion_timers[second_index], 13);
+
         for _ in 0..CHAIN_REACTION_FRAMES {
             game.tick(Input::default());
         }
-        for _ in 0..8 {
-            game.tick(Input::default());
-        }
+        assert_eq!(game.explosion_timers[first_index], 0);
+        assert_eq!(game.explosion_timers[second_index], 0);
 
-        // Both secondary waves have completed their normal cleanup. If either
-        // stale promise survived their union, these cells would still be live.
-        assert!(matches!(actor_at(&game, 3, 2), Actor::Empty(_)));
-        assert!(matches!(actor_at(&game, 2, 3), Actor::Empty(_)));
+        // The timer expiry emitted both waves even though their independently
+        // quarter-paced visual cells are still in progress.
+        assert!(matches!(actor_at(&game, 3, 2), Actor::Explosion(_)));
+        assert!(matches!(actor_at(&game, 2, 3), Actor::Explosion(_)));
     }
 
     /// Confirms sequential overlapping blasts retain both outer edges.
@@ -2188,6 +2311,7 @@ mod tests {
         });
 
         assert_eq!(game.status(), GameStatus::Dead);
+        assert_eq!(game.quit_countdown, 0x3f);
         assert!(matches!(actor_at(&game, 2, 2), Actor::Explosion(_)));
 
         let first_frame = game
@@ -2196,6 +2320,7 @@ mod tests {
             .expect("blast cell should exist")
             .animation()
             .frame();
+        // Explosion pictures advance only on global ticks divisible by four.
         game.tick(Input::default());
         let second_frame = game
             .board()
@@ -2203,10 +2328,17 @@ mod tests {
             .expect("blast cell should exist")
             .animation()
             .frame();
-        assert!(
-            second_frame > first_frame,
-            "death blast should keep animating"
-        );
+        assert_eq!(second_frame, first_frame);
+        for _ in 0..3 {
+            game.tick(Input::default());
+        }
+        let quarter_frame = game
+            .board()
+            .state(Position::new(2, 2))
+            .expect("blast cell should survive through its next quarter tick")
+            .animation()
+            .frame();
+        assert!(quarter_frame > second_frame);
     }
 
     /// Confirms special-port metadata is applied by the completed traversal.
@@ -2521,32 +2653,30 @@ mod tests {
             direction: Some(Direction::Right),
             ..Input::default()
         });
-        for _ in 0..8 {
+        let pending_position = Position::new(3, 2);
+        let pending_index = game
+            .board
+            .index(pending_position)
+            .expect("later Yellow center should be in bounds");
+
+        // The first primary wave converted the later Yellow before the live
+        // row-major Yellow scan reached it. Its independent timer was installed
+        // at thirteen and decremented once by the same iteration's timer pass.
+        assert!(matches!(actor_at(&game, 2, 2), Actor::Explosion(_)));
+        assert!(matches!(actor_at(&game, 3, 2), Actor::Explosion(_)));
+        assert_eq!(game.explosion_timers[pending_index], 12);
+
+        for _ in 0..11 {
             game.tick(Input::default());
         }
-
-        // The first primary wave has cleaned up. Its adjacent later Yellow was
-        // already a pending Explosion when the row-major scan reached it. Both
-        // new Explosion cells received their first callback on the activation
-        // tick because Murphy created them before schedule capture.
-        assert!(matches!(actor_at(&game, 2, 2), Actor::Empty(_)));
-        let pending = game
-            .board()
-            .state(Position::new(3, 2))
-            .expect("later Yellow center should exist");
-        assert!(matches!(pending.actor(), Actor::Explosion(_)));
-        assert_eq!(pending.animation().frame(), 9);
-        assert_eq!(pending.animation().frame_count(), CHAIN_REACTION_FRAMES);
-
-        for _ in 9..CHAIN_REACTION_FRAMES {
-            game.tick(Input::default());
-        }
+        assert_eq!(game.explosion_timers[pending_index], 1);
+        game.tick(Input::default());
+        assert_eq!(game.explosion_timers[pending_index], 0);
         let emitted = game
             .board()
-            .state(Position::new(3, 2))
+            .state(pending_position)
             .expect("secondary center should exist");
         assert!(matches!(emitted.actor(), Actor::Explosion(_)));
-        assert_eq!(emitted.animation().frame(), 0);
         assert_eq!(emitted.animation().frame_count(), 8);
     }
 

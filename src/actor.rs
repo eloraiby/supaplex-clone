@@ -21,8 +21,8 @@ pub(crate) const CHAIN_REACTION_FRAMES: u8 = 13;
 /// Number of simulation frames between a Zonk strike and Orange Disk blast.
 const ORANGE_DISK_TRIGGER_FRAMES: u8 = 6;
 
-/// Total visible and concealed simulation frames in one planted Red Disk fuse.
-pub(crate) const RED_DISK_FUSE_FRAMES: u8 = 24;
+/// Countdown value at which a completely planted Red Disk detonates.
+pub(crate) const RED_DISK_DETONATION_COUNTDOWN: u8 = 0x28;
 
 /// A zero-based location on the row-major board.
 #[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
@@ -151,7 +151,7 @@ enum AnimationNext {
     BecomeEmpty,
     /// Replace the animated cell with a stationary Infotron.
     BecomeInfotron,
-    /// Emit a delayed 3×3 wave with the selected final residue.
+    /// Emit a fuse-owned 3×3 wave after a Red or Orange Disk countdown.
     Explode(ExplosionResidue),
 }
 
@@ -309,8 +309,8 @@ impl Animation {
     fn red_disk_fuse(frame: u8) -> Self {
         Self {
             kind: AnimationKind::RedDiskFuse,
-            frame: frame.min(RED_DISK_FUSE_FRAMES - 1),
-            frame_count: RED_DISK_FUSE_FRAMES,
+            frame: frame.min(RED_DISK_DETONATION_COUNTDOWN - 1),
+            frame_count: RED_DISK_DETONATION_COUNTDOWN,
             next: AnimationNext::Explode(ExplosionResidue::Empty),
         }
     }
@@ -348,20 +348,6 @@ impl Animation {
             frame: 0,
             frame_count: EXPLOSION_FRAMES,
             next,
-        }
-    }
-
-    /// Creates a blast cell whose final frame emits a secondary 3×3 wave.
-    fn chained_explosion(residue: ExplosionResidue, wave: ExplosionResidue) -> Self {
-        let kind = match residue {
-            ExplosionResidue::Empty => AnimationKind::Explosion,
-            ExplosionResidue::Infotron => AnimationKind::ElectronExplosion,
-        };
-        Self {
-            kind,
-            frame: 0,
-            frame_count: CHAIN_REACTION_FRAMES,
-            next: AnimationNext::Explode(wave),
         }
     }
 
@@ -1484,7 +1470,10 @@ impl Actor {
         // preserves the active→safe and safe→active collision boundaries.
         if matches!(
             state.animation.kind,
-            AnimationKind::Bug | AnimationKind::BugDormant
+            AnimationKind::Bug
+                | AnimationKind::BugDormant
+                | AnimationKind::Explosion
+                | AnimationKind::ElectronExplosion
         ) && !world.tick_count().is_multiple_of(4)
         {
             return None;
@@ -1532,18 +1521,24 @@ impl Actor {
                 return Some(Transition::replace(position, State::empty()));
             }
             AnimationAdvance::Finished(AnimationNext::BecomeEmpty) => {
-                return Some(Transition::replace(position, State::empty()));
+                return Some(Transition::new(
+                    vec![CellWrite::new(position, State::empty())],
+                    vec![GameEvent::ExplosionFinished],
+                ));
             }
             AnimationAdvance::Finished(AnimationNext::BecomeInfotron) => {
-                return Some(Transition::replace(
-                    position,
-                    State::new(Actor::Infotron(Infotron::resting())),
+                return Some(Transition::new(
+                    vec![CellWrite::new(
+                        position,
+                        State::new(Actor::Infotron(Infotron::resting())),
+                    )],
+                    vec![GameEvent::ExplosionFinished],
                 ));
             }
             AnimationAdvance::Finished(AnimationNext::Explode(residue)) => {
-                // The completed animation, rather than the erased source actor,
-                // carries whether this delayed wave produces Infotrons.
-                return Some(explode_finished_animation(
+                // Only disk fuses use this animation promise. Secondary actor
+                // chains are represented by the game's independent timer array.
+                return Some(explode_at(
                     world,
                     position,
                     residue == ExplosionResidue::Infotron,
@@ -1850,6 +1845,17 @@ pub(crate) enum GameEvent {
     RandomizeBug(Position),
     /// Consume the shared RNG stream and schedule one Terminal screen scroll.
     RandomizeTerminal(Position),
+    /// Start an independent signed thirteen-tick secondary explosion timer.
+    ScheduleExplosion {
+        /// Center whose delayed wave will be emitted when the timer reaches zero.
+        position: Position,
+        /// Whether the delayed wave uses Electron graphics and Infotron residue.
+        electron: bool,
+    },
+    /// Mark the global explosion effect active for deterministic RNG consumption.
+    ExplosionStarted,
+    /// Clear the original global explosion flag when one visual cell completes.
+    ExplosionFinished,
 }
 
 /// Atomic multi-cell change applied immediately during the linear update pass.
@@ -1936,128 +1942,34 @@ fn adjacent_murphy(position: Position, world: &WorldView<'_>) -> Option<Position
     None
 }
 
-/// Returns the stronger of two outcomes for one overlapping explosion cell.
-fn stronger_residue(first: ExplosionResidue, second: ExplosionResidue) -> ExplosionResidue {
-    if first == ExplosionResidue::Infotron || second == ExplosionResidue::Infotron {
-        ExplosionResidue::Infotron
-    } else {
-        ExplosionResidue::Empty
-    }
-}
-
-/// Merges optional delayed waves, preferring an Infotron-producing wave.
-fn stronger_wave(
-    first: Option<ExplosionResidue>,
-    second: Option<ExplosionResidue>,
-) -> Option<ExplosionResidue> {
-    match (first, second) {
-        (Some(first), Some(second)) => Some(stronger_residue(first, second)),
-        (Some(wave), None) | (None, Some(wave)) => Some(wave),
-        (None, None) => None,
-    }
-}
-
-/// Reads a secondary wave promised by an in-progress explosion animation.
-fn promised_wave(state: &State) -> Option<ExplosionResidue> {
-    // Red and Orange fuse animations also end in `Explode`, but only a cell
-    // that is already an Explosion carries a blast-chain promise through an
-    // overlapping wave. Reactive actor handling below schedules disks afresh.
-    if !matches!(state.actor(), Actor::Explosion(_)) {
-        return None;
-    }
-
-    match state.animation.next {
-        AnimationNext::Explode(residue) => Some(residue),
-        _ => None,
-    }
-}
-
-/// Creates a complete blast state with either cleanup or a delayed next wave.
-fn explosion_state(residue: ExplosionResidue, promised_wave: Option<ExplosionResidue>) -> State {
+/// Creates one visual explosion cell independently of all secondary-wave timers.
+fn explosion_state(residue: ExplosionResidue) -> State {
     let actor = Actor::Explosion(Explosion::new(residue));
-    let animation = promised_wave.map_or_else(
-        || Animation::explosion(residue),
-        |wave| Animation::chained_explosion(residue, wave),
-    );
-    State::animated(actor, animation)
-}
-
-/// Overlays a live explosion without resetting its independent timer phase.
-fn merge_explosion_states(
-    existing: &State,
-    incoming: &State,
-    preserve_existing_animation: bool,
-) -> State {
-    let (Actor::Explosion(existing_actor), Actor::Explosion(incoming_actor)) =
-        (existing.actor(), incoming.actor())
-    else {
-        debug_assert!(false, "blast merging requires two explosion states");
-        return incoming.clone();
-    };
-    let residue = stronger_residue(existing_actor.residue(), incoming_actor.residue());
-    let wave = if preserve_existing_animation {
-        stronger_wave(promised_wave(existing), promised_wave(incoming))
-    } else {
-        promised_wave(incoming)
-    };
-
-    if !preserve_existing_animation {
-        return explosion_state(residue, wave);
-    }
-
-    // Original explosion countdowns live separately from tile graphics and a
-    // later wave never rewinds them. Preserve frame/duration while allowing a
-    // stronger Electron residue or wave promise to propagate through the cell.
-    let mut animation = existing.animation.clone();
-    animation.kind = match residue {
-        ExplosionResidue::Empty => AnimationKind::Explosion,
-        ExplosionResidue::Infotron => AnimationKind::ElectronExplosion,
-    };
-    animation.next = wave.map_or_else(
-        || match residue {
-            ExplosionResidue::Empty => AnimationNext::BecomeEmpty,
-            ExplosionResidue::Infotron => AnimationNext::BecomeInfotron,
-        },
-        AnimationNext::Explode,
-    );
-    State::animated(Actor::Explosion(Explosion::new(residue)), animation)
-}
-
-/// Emits the wave promised by a finished animation without rescheduling it.
-fn explode_finished_animation(
-    world: &WorldView<'_>,
-    center: Position,
-    electron: bool,
-) -> Transition {
-    explode_wave(world, center, electron, true)
+    State::animated(actor, Animation::explosion(residue))
 }
 
 /// Builds one immediate 3×3 wave and schedules touched reactive actors.
 pub(crate) fn explode_at(world: &WorldView<'_>, center: Position, electron: bool) -> Transition {
-    explode_wave(world, center, electron, false)
+    // A live Electron always seeds an Electron wave even when the caller only
+    // knows that a generic falling object or player collision caused the blast.
+    let electron_wave = electron
+        || world
+            .state(center)
+            .is_some_and(|state| matches!(state.actor(), Actor::Electron(_)));
+    explode_wave(world, center, electron_wave)
 }
 
-/// Implements a bounded wave while optionally consuming its center's promise.
-fn explode_wave(
-    world: &WorldView<'_>,
-    center: Position,
-    electron: bool,
-    consume_center_promise: bool,
-) -> Transition {
-    // The board actor remains authoritative for a falling object that crushes
-    // an Electron, while a finished delayed animation supplies its own kind.
-    let electron_wave = electron
-        || (!consume_center_promise
-            && world
-                .state(center)
-                .is_some_and(|state| matches!(state.actor(), Actor::Electron(_))));
+/// Implements one bounded, immediately visible wave in original write order.
+fn explode_wave(world: &WorldView<'_>, center: Position, electron_wave: bool) -> Transition {
     let incoming_residue = if electron_wave {
         ExplosionResidue::Infotron
     } else {
         ExplosionResidue::Empty
     };
     let mut writes = Vec::new();
-    let mut events = Vec::new();
+    // The original engine uses one global flag for explosion sound and camera
+    // shake rather than counting live cells.  Every emitted wave sets it again.
+    let mut events = vec![GameEvent::ExplosionStarted];
 
     // Signed offsets make edge clipping explicit. Both visible and invisible
     // Hardware are skipped so their indestructibility survives every wave.
@@ -2073,41 +1985,37 @@ fn explode_wave(
                 continue;
             }
 
-            if matches!(state.actor(), Actor::Murphy(_)) && !events.contains(&GameEvent::Died) {
+            let is_murphy = matches!(state.actor(), Actor::Murphy(_));
+            if is_murphy && !events.contains(&GameEvent::Died) {
                 events.push(GameEvent::Died);
             }
 
-            // A reactive actor touched away from the seed gets a delayed wave.
-            // The seed itself is already emitting now and must not retrigger.
-            let actor_wave = if position == center {
-                None
-            } else {
-                match state.actor() {
-                    Actor::Electron(_) => Some(ExplosionResidue::Infotron),
-                    Actor::OrangeDisk(_) | Actor::YellowDisk(_) | Actor::SnikSnak(_) => {
-                        // Reactive actors retain the sign of the incoming wave:
-                        // an Electron-triggered chain must also leave Infotrons.
-                        Some(incoming_residue)
-                    }
+            // Only actors touched outside the seed receive a delayed secondary
+            // wave.  Electron timers are always negative; the other reactive
+            // actors inherit the sign of the wave that reached them.
+            if position != center {
+                let delayed_electron = match state.actor() {
+                    Actor::Electron(_) => Some(true),
+                    Actor::OrangeDisk(_)
+                    | Actor::YellowDisk(_)
+                    | Actor::SnikSnak(_)
+                    | Actor::Murphy(_) => Some(electron_wave),
                     _ => None,
+                };
+                if let Some(electron) = delayed_electron {
+                    events.push(GameEvent::ScheduleExplosion { position, electron });
                 }
-            };
+            }
 
-            let residue = match state.actor() {
-                Actor::Electron(_) if actor_wave.is_some() => {
-                    stronger_residue(incoming_residue, ExplosionResidue::Infotron)
-                }
-                _ => incoming_residue,
-            };
-            let incoming = explosion_state(residue, actor_wave);
-            let replacement = if matches!(state.actor(), Actor::Explosion(_)) {
-                let preserve_timer = promised_wave(state).is_some()
-                    && !(consume_center_promise && position == center);
-                merge_explosion_states(state, &incoming, preserve_timer)
+            // A directly touched Electron uses Electron graphics immediately;
+            // every other cell uses the current wave's ordinary residue.  Later
+            // waves overwrite the visual state instead of merging strengths.
+            let residue = if matches!(state.actor(), Actor::Electron(_)) {
+                ExplosionResidue::Infotron
             } else {
-                incoming
+                incoming_residue
             };
-            writes.push(CellWrite::new(position, replacement));
+            writes.push(CellWrite::new(position, explosion_state(residue)));
         }
     }
 
