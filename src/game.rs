@@ -1148,9 +1148,10 @@ mod tests {
             })
         );
 
-        // Eight animation ticks release the synchronized source and retain the
-        // final moving pose until Murphy's next input-processing update.
-        for _ in 0..8 {
+        // The initiating update already consumes frame zero. Seven following
+        // updates release the source while retaining final frame seven until
+        // Murphy processes the next input update.
+        for _ in 0..7 {
             game.tick(Input::default());
         }
         let completed = game
@@ -1210,7 +1211,7 @@ mod tests {
 
         assert!(matches!(actor_at(&game, 3, 2), Actor::Murphy(_)));
         assert_eq!(game.remaining_infotrons(), 1);
-        for _ in 0..8 {
+        for _ in 0..7 {
             game.tick(Input::default());
         }
         assert_eq!(game.remaining_infotrons(), 0);
@@ -1238,7 +1239,7 @@ mod tests {
             ..Input::default()
         });
 
-        for _ in 0..16 {
+        for _ in 0..15 {
             game.tick(Input {
                 direction: Some(Direction::Right),
                 ..Input::default()
@@ -1324,7 +1325,7 @@ mod tests {
             })
         );
 
-        for _ in 0..7 {
+        for _ in 0..6 {
             game.tick(Input::default());
         }
         assert_eq!(game.remaining_infotrons(), 0);
@@ -1802,7 +1803,7 @@ mod tests {
         // Movement completion releases the old collision reservation during
         // Murphy's player-first update but keeps his final Down pose. The later
         // Zonk arms in its original cell without entering the released source.
-        for _ in 0..9 {
+        for _ in 0..8 {
             game.tick(down);
         }
         let ready = game
@@ -1890,9 +1891,9 @@ mod tests {
             direction: Some(Direction::Right),
             ..Input::default()
         };
-        // Eight more steps finish the original Down animation without applying
+        // Seven more steps finish the original Down animation without applying
         // the newly held Right direction during the completion update.
-        for _ in 0..8 {
+        for _ in 0..7 {
             game.tick(turn);
         }
         let ready = game
@@ -2032,7 +2033,7 @@ mod tests {
             ..Input::default()
         });
 
-        for _ in 0..16 {
+        for _ in 0..15 {
             game.tick(Input {
                 direction: Some(Direction::Right),
                 ..Input::default()
@@ -2340,7 +2341,7 @@ mod tests {
 
         // The disk materializes only after Murphy's collision reservation has
         // released the source; its independent fuse has continued throughout.
-        for _ in 0..8 {
+        for _ in 0..7 {
             game.tick(Input::default());
         }
 
@@ -2757,7 +2758,7 @@ mod tests {
             AnimationKind::Murphy(MurphyAnimation::Exit)
         );
         // The terminal status does not freeze the disappearance sequence.
-        for _ in 0..40 {
+        for _ in 0..39 {
             open.tick(Input::default());
         }
         assert_eq!(open.status(), GameStatus::Completed);
@@ -3090,7 +3091,7 @@ mod tests {
         assert!(!game.freeze_zonks());
         assert!(!game.freeze_enemies());
 
-        for _ in 0..8 {
+        for _ in 0..7 {
             game.tick(Input::default());
         }
         assert!(matches!(actor_at(&game, 4, 2), Actor::Murphy(_)));

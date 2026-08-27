@@ -860,6 +860,17 @@ impl Animation {
             return AnimationAdvance::Ready;
         }
 
+        // Starting a Murphy action calls the original animation routine
+        // immediately, so frame zero consumes the action's first update. On
+        // the update that draws the last coordinate, the DOS routine also
+        // performs the promised collision, collection, or board transfer. Our
+        // retained `frame` is the last picture already displayed; therefore a
+        // Murphy strip must finish when its final picture is the next one, not
+        // wait for a subsequent ninth callback after an eight-picture strip.
+        if matches!(self.kind, AnimationKind::Murphy(_)) && self.frame + 2 >= self.frame_count {
+            return AnimationAdvance::Finished(self.next);
+        }
+
         if self.frame + 1 < self.frame_count {
             let mut animation = self.clone();
             animation.frame += 1;
