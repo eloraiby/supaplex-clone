@@ -295,8 +295,12 @@ pub enum AnimationKind {
     SnikSnakMove(Direction),
     /// Stable source reservation retained until the moving Snik Snak releases it.
     SnikSnakVacating(Direction),
-    /// The cyclic spark frames of an Electron.
-    Electron,
+    /// One of the original eight-frame Electron turn cycles.
+    ElectronTurn(EnemyTurn),
+    /// An eight-update Electron transfer in one cardinal direction.
+    ElectronMove(Direction),
+    /// Stable source reservation retained until the moving Electron releases it.
+    ElectronVacating(Direction),
     /// The current retained scroll frame of a Terminal screen.
     Terminal,
     /// A Red Disk counting down before it explodes.
@@ -363,6 +367,11 @@ enum AnimationNext {
     ActivateBug,
     /// Resolve the original left/forward/right choices after a Snik Snak transfer.
     FinishSnikSnakMove {
+        /// Direction of the transfer that has just reached its final frame.
+        direction: Direction,
+    },
+    /// Resolve the original left/forward/right choices after an Electron transfer.
+    FinishElectronMove {
         /// Direction of the transfer that has just reached its final frame.
         direction: Direction,
     },
@@ -627,16 +636,6 @@ impl Animation {
         }
     }
 
-    /// Creates an actor cycle that requests a movement decision after it plays.
-    fn cycle_then_act(kind: AnimationKind, frame_count: u8) -> Self {
-        Self {
-            kind,
-            frame: 0,
-            frame_count,
-            next: AnimationNext::Act,
-        }
-    }
-
     /// Creates an explicitly positioned Snik Snak turn-cycle frame.
     fn snik_snak_turn(turn: EnemyTurn, frame: u8) -> Self {
         // Turn cycles are advanced by the global modulo-four schedule in the
@@ -675,6 +674,48 @@ impl Animation {
         // pause both halves of the movement exactly as in the original.
         Self {
             kind: AnimationKind::SnikSnakVacating(direction),
+            frame: 0,
+            frame_count: 1,
+            next: AnimationNext::Act,
+        }
+    }
+
+    /// Creates an explicitly positioned Electron turn-cycle frame.
+    fn electron_turn(turn: EnemyTurn, frame: u8) -> Self {
+        // Electron turn states share Snik Snak's global cadence but retain a
+        // separate animation kind so their source table and explosion residue
+        // cannot accidentally be interchanged.
+        Self {
+            kind: AnimationKind::ElectronTurn(turn),
+            frame: frame & 7,
+            frame_count: 8,
+            next: AnimationNext::Act,
+        }
+    }
+
+    /// Creates the eight original transfer frames for a moving Electron.
+    fn electron_move(direction: Direction) -> Self {
+        Self::electron_move_at(direction, 0)
+    }
+
+    /// Restores one validated frame within an Electron transfer.
+    fn electron_move_at(direction: Direction, frame: u8) -> Self {
+        // The frame-specific constructor lets movement frame seven release its
+        // old source in the same atomic transition that advances the Electron.
+        Self {
+            kind: AnimationKind::ElectronMove(direction),
+            frame: frame.min(MOVEMENT_FRAMES - 1),
+            frame_count: MOVEMENT_FRAMES,
+            next: AnimationNext::FinishElectronMove { direction },
+        }
+    }
+
+    /// Creates a non-advancing source reservation owned by a moving Electron.
+    fn electron_vacating(direction: Direction) -> Self {
+        // The reservation has no autonomous countdown: enemy freeze and a
+        // destination-side frame-seven release control its complete lifetime.
+        Self {
+            kind: AnimationKind::ElectronVacating(direction),
             frame: 0,
             frame_count: 1,
             next: AnimationNext::Act,
@@ -805,6 +846,7 @@ impl Animation {
                 | AnimationKind::RoundedSide
                 | AnimationKind::RoundedDestination
                 | AnimationKind::SnikSnakVacating(_)
+                | AnimationKind::ElectronVacating(_)
         ) {
             return AnimationAdvance::Ready;
         }
@@ -920,6 +962,7 @@ impl State {
                 self.animation.kind,
                 AnimationKind::Vacating(_)
                     | AnimationKind::SnikSnakVacating(_)
+                    | AnimationKind::ElectronVacating(_)
                     | AnimationKind::MurphyDestination
                     | AnimationKind::RoundedSide
                     | AnimationKind::RoundedDestination
@@ -2175,7 +2218,7 @@ pub struct Electron {
 }
 
 impl Electron {
-    /// Creates an Electron with a deterministic initial heading.
+    /// Creates an Electron whose first left-turn candidate follows `heading`.
     pub const fn new(heading: Direction) -> Self {
         Self { heading }
     }
@@ -2185,44 +2228,163 @@ impl Electron {
         self.heading
     }
 
-    /// Attacks adjacent Murphy or chooses the next wall-following step.
-    fn transition(&self, position: Position, world: &WorldView<'_>) -> Option<Transition> {
+    /// Advances or evaluates the current globally phased turn animation.
+    fn transition(
+        &self,
+        state: &State,
+        position: Position,
+        world: &WorldView<'_>,
+    ) -> Option<Transition> {
         if world.freeze_enemies() {
+            // Freezing must preserve both the exact turn picture and logical
+            // state byte; restarting the Electron at frame zero changes paths.
+            return None;
+        }
+
+        let AnimationKind::ElectronTurn(turn) = state.animation.kind else {
+            // A valid transfer is consumed by the finite-animation path before
+            // this method runs. Recover only malformed idle state here.
+            debug_assert!(
+                matches!(state.animation.kind, AnimationKind::Idle),
+                "Electron decisions require a turn animation"
+            );
             return Some(Transition::replace(
                 position,
-                State::new(Actor::Electron(*self)),
+                State::animated(
+                    Actor::Electron(*self),
+                    Animation::electron_turn(
+                        EnemyTurn::Left,
+                        EnemyTurn::Left.initial_frame(self.heading),
+                    ),
+                ),
+            ));
+        };
+
+        if world.tick_count().is_multiple_of(4) {
+            // As with the original state byte, retain the selected cycle's high
+            // group while its low three bits wrap from seven back to zero.
+            let next_frame = (state.animation.frame + 1) & 7;
+            return Some(Transition::replace(
+                position,
+                State::animated(
+                    Actor::Electron(*self),
+                    Animation::electron_turn(turn, next_frame),
+                ),
             ));
         }
 
-        if adjacent_murphy(position, world).is_some() {
-            // Electron residue is centered on the Electron rather than shifted
-            // onto the adjacent player cell.
-            return Some(explode_at(world, position, true));
+        if world.tick_count() % 4 != 3 {
+            return None;
         }
 
-        // Electrons use the mirrored wall-following preference of Snik Snaks.
-        for direction in [
-            self.heading.right(),
-            self.heading,
-            self.heading.left(),
-            self.heading.opposite(),
-        ] {
-            if let Some(destination) = world.offset(position, direction)
-                && world.is_empty(destination)
-            {
-                return Some(Transition::move_actor(
+        let direction = turn.direction_at_frame(state.animation.frame)?;
+        let destination = world.offset(position, direction)?;
+        if world.is_empty(destination) {
+            return Some(Transition::move_electron(
+                position,
+                destination,
+                Actor::Electron(Self { heading: direction }),
+                direction,
+            ));
+        }
+
+        // Unlike a Snik Snak, an Electron has no exception for Murphy's four
+        // port states: any targeted Murphy state detonates an Infotron wave.
+        world
+            .state(destination)
+            .is_some_and(|target| matches!(target.actor(), Actor::Murphy(_)))
+            .then(|| explode_at(world, position, true))
+    }
+
+    /// Releases the old source on the original seventh movement callback.
+    fn advance_penultimate_movement(
+        &self,
+        position: Position,
+        direction: Direction,
+        state: &State,
+        world: &WorldView<'_>,
+    ) -> Transition {
+        debug_assert_eq!(state.animation.frame, 6);
+        let mut writes = vec![CellWrite::new(
+            position,
+            State::animated(
+                Actor::Electron(*self),
+                Animation::electron_move_at(direction, 7),
+            ),
+        )];
+
+        if let Some(source) = world.offset(position, direction.opposite())
+            && world.state(source).is_some_and(|source_state| {
+                matches!(source_state.actor(), Actor::Empty(_))
+                    && source_state.animation.kind == AnimationKind::ElectronVacating(direction)
+            })
+        {
+            // An explosion that reached the old cell wins over movement cleanup
+            // and must never be replaced by Space.
+            writes.push(CellWrite::new(source, State::empty()));
+        }
+
+        Transition::new(writes, Vec::new())
+    }
+
+    /// Resolves left, forward, right, then turn-around after a completed move.
+    fn finish_movement(
+        &self,
+        position: Position,
+        direction: Direction,
+        world: &WorldView<'_>,
+    ) -> Transition {
+        let left = direction.left();
+        if self.is_empty_or_murphy(position, left, world) {
+            return self.begin_turn(position, EnemyTurn::Left, left);
+        }
+
+        if let Some(forward) = world.offset(position, direction) {
+            if world.is_empty(forward) {
+                return Transition::move_electron(
                     position,
-                    destination,
-                    Actor::Electron(Self { heading: direction }),
+                    forward,
+                    Actor::Electron(*self),
                     direction,
-                ));
+                );
+            }
+            if world
+                .state(forward)
+                .is_some_and(|state| matches!(state.actor(), Actor::Murphy(_)))
+            {
+                return explode_at(world, position, true);
             }
         }
 
-        Some(Transition::replace(
-            position,
-            State::new(Actor::Electron(*self)),
-        ))
+        let right = direction.right();
+        if self.is_empty_or_murphy(position, right, world) {
+            return self.begin_turn(position, EnemyTurn::Right, right);
+        }
+
+        // A fully blocked Electron starts a left-cycle U-turn, preserving the
+        // chance to take a side cell that opens while the cycle is in progress.
+        self.begin_turn(position, EnemyTurn::Left, left)
+    }
+
+    /// Reports whether a side cell requests a turn without attacking yet.
+    fn is_empty_or_murphy(
+        &self,
+        position: Position,
+        direction: Direction,
+        world: &WorldView<'_>,
+    ) -> bool {
+        // Side Murphy contact is intentionally deferred to the matching turn
+        // state; only forward contact at movement completion explodes at once.
+        world
+            .offset(position, direction)
+            .and_then(|target| world.state(target))
+            .is_some_and(|state| state.is_empty() || matches!(state.actor(), Actor::Murphy(_)))
+    }
+
+    /// Builds the odd intermediate frame preceding one side candidate.
+    fn begin_turn(&self, position: Position, turn: EnemyTurn, candidate: Direction) -> Transition {
+        let animation = Animation::electron_turn(turn, turn.preceding_frame(candidate));
+        Transition::replace(position, State::animated(Actor::Electron(*self), animation))
     }
 }
 
@@ -2345,6 +2507,26 @@ impl Actor {
                     );
                 }
                 AnimationKind::SnikSnakMove(_) => {}
+                _ => {}
+            }
+        }
+
+        // Electron turns and source cleanup obey the same split scheduling as
+        // Snik Snaks, while retaining Electron-specific collision and residue.
+        if let Self::Electron(electron) = self {
+            if world.freeze_enemies() {
+                return None;
+            }
+            match state.animation.kind {
+                AnimationKind::ElectronTurn(_) => {
+                    return electron.transition(state, position, world);
+                }
+                AnimationKind::ElectronMove(direction) if state.animation.frame == 6 => {
+                    return Some(
+                        electron.advance_penultimate_movement(position, direction, state, world),
+                    );
+                }
+                AnimationKind::ElectronMove(_) => {}
                 _ => {}
             }
         }
@@ -2584,6 +2766,15 @@ impl Actor {
                 };
                 return Some(snik_snak.finish_movement(position, direction, world));
             }
+            AnimationAdvance::Finished(AnimationNext::FinishElectronMove { direction }) => {
+                let Self::Electron(electron) = self else {
+                    // Only `Animation::electron_move` constructs this promise;
+                    // avoid neighbor writes if internal state is corrupted.
+                    debug_assert!(false, "only an Electron may finish this movement");
+                    return Some(Transition::replace(position, State::new(self.clone())));
+                };
+                return Some(electron.finish_movement(position, direction, world));
+            }
             AnimationAdvance::Finished(AnimationNext::Release) => {
                 return Some(Transition::replace(position, State::empty()));
             }
@@ -2773,7 +2964,7 @@ impl Actor {
             Self::YellowDisk(actor) => actor.transition(position, world),
             Self::Terminal(actor) => actor.transition(position, world),
             Self::RedDisk(actor) => actor.transition(position, world),
-            Self::Electron(actor) => actor.transition(position, world),
+            Self::Electron(actor) => actor.transition(state, position, world),
             Self::Bug(actor) => actor.transition(position, world),
             Self::InvisibleWall(actor) => actor.transition(position, world),
             Self::Explosion(actor) => actor.transition(position, world),
@@ -2787,7 +2978,10 @@ impl Actor {
                 EnemyTurn::Left,
                 EnemyTurn::Left.initial_frame(actor.heading),
             ),
-            Self::Electron(_) => Animation::cycle_then_act(AnimationKind::Electron, 8),
+            Self::Electron(actor) => Animation::electron_turn(
+                EnemyTurn::Left,
+                EnemyTurn::Left.initial_frame(actor.heading),
+            ),
             Self::Bug(_) => Animation::bug_active(),
             Self::Terminal(terminal) => Animation::terminal(terminal.screen_frame),
             Self::Explosion(explosion) => Animation::explosion(explosion.residue),
@@ -3143,6 +3337,27 @@ impl Transition {
         )
     }
 
+    /// Starts an Electron transfer with destination-owned source cleanup.
+    fn move_electron(
+        source: Position,
+        destination: Position,
+        actor: Actor,
+        direction: Direction,
+    ) -> Self {
+        // Separate animation kinds keep Electron reservations distinguishable
+        // from a Snik Snak or generic actor crossing the same cells later.
+        let destination_state = State::animated(actor, Animation::electron_move(direction));
+        let source_state =
+            State::animated(Actor::Empty(Empty), Animation::electron_vacating(direction));
+        Self::new(
+            vec![
+                CellWrite::new(source, source_state),
+                CellWrite::new(destination, destination_state),
+            ],
+            Vec::new(),
+        )
+    }
+
     /// Moves Murphy with a target-specific eight- or nine-frame descriptor.
     fn move_murphy(
         source: Position,
@@ -3181,19 +3396,6 @@ impl Transition {
             Vec::new(),
         )
     }
-}
-
-/// Finds an orthogonally adjacent Murphy on the current live board.
-fn adjacent_murphy(position: Position, world: &WorldView<'_>) -> Option<Position> {
-    for direction in Direction::ALL {
-        if let Some(neighbor) = world.offset(position, direction)
-            && matches!(world.state(neighbor)?.actor(), Actor::Murphy(_))
-        {
-            return Some(neighbor);
-        }
-    }
-
-    None
 }
 
 /// Creates one visual explosion cell independently of all secondary-wave timers.

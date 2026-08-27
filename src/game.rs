@@ -938,7 +938,9 @@ fn state_from_tile(tile: u8) -> Result<State, BoardError> {
         21 => Actor::Port(Port::new(PortDirections::Vertical, false)),
         22 => Actor::Port(Port::new(PortDirections::Horizontal, false)),
         23 => Actor::Port(Port::new(PortDirections::Any, false)),
-        24 => Actor::Electron(Electron::new(Direction::Left)),
+        // Electrons begin in the same original state-zero left-turn cycle as
+        // Snik Snaks; a rightward prior heading makes its first candidate Up.
+        24 => Actor::Electron(Electron::new(Direction::Right)),
         25 => Actor::Bug(Bug),
         26 => Actor::RamChip(RamChip::new(RamChipShape::Left)),
         27 => Actor::RamChip(RamChip::new(RamChipShape::Right)),
@@ -2727,6 +2729,108 @@ mod tests {
         game.tick(Input::default());
         assert_eq!(game.status(), GameStatus::Dead);
         assert!(matches!(actor_at(&game, 3, 3), Actor::Explosion(_)));
+    }
+
+    /// Confirms Electrons use the original left-hand turn and transfer phases.
+    #[test]
+    fn electron_uses_left_hand_turning_and_destination_owned_source_cleanup() {
+        let source = Position::new(3, 3);
+        let left_destination = Position::new(2, 3);
+        let mut game = game_with(
+            &[
+                (
+                    Position::new(5, 4),
+                    State::new(Actor::Murphy(Murphy::new())),
+                ),
+                (
+                    source,
+                    State::new(Actor::Electron(Electron::new(Direction::Right))),
+                ),
+            ],
+            0,
+        );
+
+        for _ in 0..7 {
+            game.tick(Input::default());
+        }
+        assert!(matches!(
+            actor_at(&game, source.x, source.y),
+            Actor::Electron(_)
+        ));
+        game.tick(Input::default());
+        assert_eq!(
+            game.board()
+                .state(left_destination)
+                .expect("moving Electron destination should exist")
+                .animation()
+                .kind(),
+            AnimationKind::ElectronMove(Direction::Left)
+        );
+
+        for _ in 0..6 {
+            game.tick(Input::default());
+        }
+        assert_eq!(
+            game.board()
+                .state(source)
+                .expect("Electron source reservation should exist")
+                .animation()
+                .kind(),
+            AnimationKind::ElectronVacating(Direction::Left)
+        );
+        game.tick(Input::default());
+        assert!(
+            game.board()
+                .state(source)
+                .expect("released Electron source should remain addressable")
+                .is_empty()
+        );
+    }
+
+    /// Confirms only Snik Snaks exempt Murphy's original port movement states.
+    #[test]
+    fn electron_turn_contact_detonates_during_murphy_port_traversal() {
+        let placements = |enemy| {
+            [
+                (
+                    Position::new(3, 2),
+                    State::new(Actor::Murphy(Murphy::new())),
+                ),
+                (
+                    Position::new(4, 2),
+                    State::new(Actor::Port(Port::new(
+                        PortDirections::OneWay(Direction::Right),
+                        false,
+                    ))),
+                ),
+                (Position::new(3, 3), State::new(enemy)),
+            ]
+        };
+        let mut snik_snak = game_with(
+            &placements(Actor::SnikSnak(SnikSnak::new(Direction::Right))),
+            0,
+        );
+        let mut electron = game_with(
+            &placements(Actor::Electron(Electron::new(Direction::Right))),
+            0,
+        );
+        snik_snak.tick = 3;
+        electron.tick = 3;
+        let enter_port = Input {
+            direction: Some(Direction::Right),
+            ..Input::default()
+        };
+
+        snik_snak.tick(enter_port);
+        electron.tick(enter_port);
+
+        assert_eq!(snik_snak.status(), GameStatus::Playing);
+        assert!(matches!(actor_at(&snik_snak, 3, 3), Actor::SnikSnak(_)));
+        assert_eq!(electron.status(), GameStatus::Dead);
+        let Actor::Explosion(center) = actor_at(&electron, 3, 3) else {
+            panic!("Electron contact should replace its center with an explosion");
+        };
+        assert_eq!(center.residue(), ExplosionResidue::Infotron);
     }
 
     /// Confirms special-port metadata is applied by the completed traversal.

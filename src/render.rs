@@ -177,6 +177,7 @@ impl<'textures> Renderer<'textures> {
                         | AnimationKind::Rolling(_)
                         | AnimationKind::OrangeFalling
                         | AnimationKind::SnikSnakMove(_)
+                        | AnimationKind::ElectronMove(_)
                         | AnimationKind::Murphy(_)
                 );
                 if is_interpolated != moving_pass {
@@ -240,6 +241,14 @@ impl<'textures> Renderer<'textures> {
             )
         {
             return self.draw_snik_snak_animation(canvas, position, state, camera);
+        }
+        if matches!(state.actor(), Actor::Electron(_))
+            && matches!(
+                state.animation().kind(),
+                AnimationKind::ElectronTurn(_) | AnimationKind::ElectronMove(_)
+            )
+        {
+            return self.draw_electron_animation(canvas, position, state, camera);
         }
 
         let sprite = sprite_for_state(state);
@@ -365,6 +374,24 @@ impl<'textures> Renderer<'textures> {
         };
         // Enemy frames share the same colorkeyed MOVING.DAT conversion and
         // unscaled offset convention as Murphy and gravity actors.
+        self.draw_murphy_part(canvas, position, part, camera)
+    }
+
+    /// Draws one exact original Electron turn or transfer rectangle.
+    fn draw_electron_animation(
+        &mut self,
+        canvas: &mut Canvas<Window>,
+        position: Position,
+        state: &State,
+        camera: Camera,
+    ) -> Result<(), RenderError> {
+        let Some(part) = electron_sprite_part(state.animation().kind(), state.animation().frame())
+        else {
+            debug_assert!(false, "Electron renderer received an unsupported phase");
+            return Ok(());
+        };
+        // Electron artwork is copied from the same transparent MOVING.DAT
+        // texture while retaining its own literal coordinate table.
         self.draw_murphy_part(canvas, position, part, camera)
     }
 
@@ -644,6 +671,99 @@ fn snik_snak_sprite_part(kind: AnimationKind, frame: u8) -> Option<SpritePart> {
     })
 }
 
+/// Original `MOVING.DAT` coordinates for all Electron turn and transfer states.
+///
+/// Indices follow the state byte exactly: left turn, right turn, Up, Left,
+/// Down, and Right. Some vertical source rows deliberately differ by one pixel.
+const ELECTRON_SOURCE_POINTS: [SourcePoint; 48] = [
+    SourcePoint { x: 0, y: 404 },
+    SourcePoint { x: 16, y: 404 },
+    SourcePoint { x: 32, y: 404 },
+    SourcePoint { x: 48, y: 404 },
+    SourcePoint { x: 64, y: 404 },
+    SourcePoint { x: 80, y: 404 },
+    SourcePoint { x: 96, y: 404 },
+    SourcePoint { x: 112, y: 404 },
+    SourcePoint { x: 0, y: 404 },
+    SourcePoint { x: 112, y: 404 },
+    SourcePoint { x: 96, y: 404 },
+    SourcePoint { x: 80, y: 404 },
+    SourcePoint { x: 64, y: 404 },
+    SourcePoint { x: 48, y: 404 },
+    SourcePoint { x: 32, y: 404 },
+    SourcePoint { x: 16, y: 404 },
+    SourcePoint { x: 144, y: 404 },
+    SourcePoint { x: 160, y: 404 },
+    SourcePoint { x: 176, y: 404 },
+    SourcePoint { x: 192, y: 404 },
+    SourcePoint { x: 208, y: 404 },
+    SourcePoint { x: 224, y: 404 },
+    SourcePoint { x: 240, y: 404 },
+    SourcePoint { x: 256, y: 404 },
+    SourcePoint { x: 0, y: 372 },
+    SourcePoint { x: 32, y: 372 },
+    SourcePoint { x: 64, y: 372 },
+    SourcePoint { x: 96, y: 372 },
+    SourcePoint { x: 128, y: 372 },
+    SourcePoint { x: 160, y: 372 },
+    SourcePoint { x: 192, y: 372 },
+    SourcePoint { x: 224, y: 372 },
+    SourcePoint { x: 0, y: 402 },
+    SourcePoint { x: 16, y: 402 },
+    SourcePoint { x: 32, y: 402 },
+    SourcePoint { x: 48, y: 402 },
+    SourcePoint { x: 64, y: 402 },
+    SourcePoint { x: 80, y: 403 },
+    SourcePoint { x: 96, y: 403 },
+    SourcePoint { x: 112, y: 402 },
+    SourcePoint { x: 256, y: 372 },
+    SourcePoint { x: 288, y: 372 },
+    SourcePoint { x: 0, y: 388 },
+    SourcePoint { x: 32, y: 388 },
+    SourcePoint { x: 64, y: 388 },
+    SourcePoint { x: 96, y: 388 },
+    SourcePoint { x: 128, y: 388 },
+    SourcePoint { x: 160, y: 388 },
+];
+
+/// Selects one variably sized Electron rectangle and its logical-cell offset.
+fn electron_sprite_part(kind: AnimationKind, frame: u8) -> Option<SpritePart> {
+    let frame = frame.min(7);
+    let (source_index, width, height, offset_x, offset_y) = match kind {
+        AnimationKind::ElectronTurn(turn) => {
+            let cycle_start = match turn {
+                EnemyTurn::Left => 0,
+                EnemyTurn::Right => 8,
+            };
+            (cycle_start + usize::from(frame), 16, 16, 0, 0)
+        }
+        AnimationKind::ElectronMove(Direction::Up) => (
+            16 + usize::from(frame),
+            16,
+            18,
+            0,
+            14 - i32::from(frame) * 2,
+        ),
+        AnimationKind::ElectronMove(Direction::Left) => (24 + usize::from(frame), 32, 16, 0, 0),
+        AnimationKind::ElectronMove(Direction::Down) => (
+            32 + usize::from(frame),
+            16,
+            18,
+            0,
+            -16 + i32::from(frame) * 2,
+        ),
+        AnimationKind::ElectronMove(Direction::Right) => (40 + usize::from(frame), 32, 16, -16, 0),
+        _ => return None,
+    };
+    Some(SpritePart {
+        source: ELECTRON_SOURCE_POINTS[source_index],
+        width,
+        height,
+        offset_x,
+        offset_y,
+    })
+}
+
 /// Returns the rendered width of one string in logical SDL pixels.
 fn text_width(text: &str) -> u32 {
     // Saturating conversion and multiplication keep layout total even for an
@@ -730,7 +850,6 @@ fn sprite_for_state(state: &State) -> SpriteCell {
         AnimationKind::ElectronExplosion => SpriteCell::new(8 + frame.min(7), 4),
         AnimationKind::Bug => bug_sprite(frame),
         AnimationKind::BugDormant => static_sprite(2),
-        AnimationKind::Electron => SpriteCell::new(8 + frame.min(7), 10),
         AnimationKind::Terminal => SpriteCell::new(frame.min(6), 10),
         AnimationKind::Murphy(action) => murphy_animation_sprite(action, frame),
         AnimationKind::Moving(direction) | AnimationKind::Rolling(direction) => {
@@ -750,6 +869,9 @@ fn sprite_for_state(state: &State) -> SpriteCell {
         | AnimationKind::SnikSnakTurn(_)
         | AnimationKind::SnikSnakMove(_)
         | AnimationKind::SnikSnakVacating(_)
+        | AnimationKind::ElectronTurn(_)
+        | AnimationKind::ElectronMove(_)
+        | AnimationKind::ElectronVacating(_)
         | AnimationKind::RedDiskFuse
         | AnimationKind::OrangeDiskFuse => static_sprite(state.actor().tile_code()),
     }
@@ -760,7 +882,6 @@ fn moving_sprite(state: &State, direction: Direction, frame: u8) -> SpriteCell {
     match state.actor() {
         Actor::Zonk(_) if direction.is_horizontal() => zonk_moving_sprite(direction, frame),
         Actor::Infotron(_) if direction.is_horizontal() => infotron_moving_sprite(direction, frame),
-        Actor::Electron(_) => SpriteCell::new(8 + frame.saturating_mul(2).min(7), 10),
         _ => static_sprite(state.actor().tile_code()),
     }
 }
@@ -1029,8 +1150,8 @@ mod tests {
 
     use super::{
         ATLAS_COLUMNS, ATLAS_ROWS, CHARS8_PNG, MOVING_PNG, ROCKS_SP_PNG, bug_sprite, decode_png,
-        gravity_sprite_part, infotron_moving_sprite, ping_pong, snik_snak_sprite_part,
-        static_sprite, zonk_moving_sprite,
+        electron_sprite_part, gravity_sprite_part, infotron_moving_sprite, ping_pong,
+        snik_snak_sprite_part, static_sprite, zonk_moving_sprite,
     };
     use crate::actor::{Actor, AnimationKind, Direction, EnemyTurn, Infotron, OrangeDisk, Zonk};
 
@@ -1167,5 +1288,21 @@ mod tests {
             (move_up.width, move_up.height, move_up.offset_y),
             (16, 18, 14)
         );
+    }
+
+    /// Confirms Electron frames retain exact coordinates and vertical row quirks.
+    #[test]
+    fn electron_frames_preserve_reverse_turns_and_literal_vertical_sources() {
+        let right_turn = electron_sprite_part(AnimationKind::ElectronTurn(EnemyTurn::Right), 1)
+            .expect("right-turn frame should map");
+        let down_five = electron_sprite_part(AnimationKind::ElectronMove(Direction::Down), 5)
+            .expect("down movement frame should map");
+        let move_right = electron_sprite_part(AnimationKind::ElectronMove(Direction::Right), 1)
+            .expect("right movement frame should map");
+
+        assert_eq!((right_turn.source.x, right_turn.source.y), (112, 404));
+        assert_eq!((down_five.source.x, down_five.source.y), (80, 403));
+        assert_eq!((down_five.width, down_five.height), (16, 18));
+        assert_eq!((move_right.width, move_right.offset_x), (32, -16));
     }
 }
