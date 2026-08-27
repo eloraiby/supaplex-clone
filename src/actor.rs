@@ -1,4 +1,4 @@
-//! Actor-owned behavior, animation phases, and atomic transition proposals.
+//! Actor-owned behavior, animation phases, and immediate atomic transitions.
 //!
 //! Every level cell contains one [`State`].  An [`Actor`] is an enum whose
 //! variants wrap actor-specific structs, while [`Animation`] records the visual
@@ -11,6 +11,18 @@ const MOVEMENT_FRAMES: u8 = 4;
 
 /// Number of source frames in either explosion strip of `RocksSP.png`.
 const EXPLOSION_FRAMES: u8 = 8;
+
+/// Number of lethal logical phases in each active Bug cycle.
+const BUG_ACTIVE_FRAMES: u8 = 14;
+
+/// Delay before an actor touched by one blast emits its own secondary wave.
+pub(crate) const CHAIN_REACTION_FRAMES: u8 = 13;
+
+/// Number of simulation frames between a Zonk strike and Orange Disk blast.
+const ORANGE_DISK_TRIGGER_FRAMES: u8 = 6;
+
+/// Total visible and concealed simulation frames in one planted Red Disk fuse.
+pub(crate) const RED_DISK_FUSE_FRAMES: u8 = 24;
 
 /// A zero-based location on the row-major board.
 #[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
@@ -86,12 +98,22 @@ impl Direction {
 pub enum AnimationKind {
     /// A stationary actor rendered with its normal tile sprite.
     Idle,
+    /// A Zonk armed to begin falling once its destination is still free.
+    ZonkPreFall,
+    /// A non-rendered source cell reserved while its actor leaves that cell.
+    Vacating(Direction),
     /// An actor entering its current cell from the opposite direction.
     Moving(Direction),
+    /// A rounded actor entering its current cell diagonally from the row above.
+    Rolling(Direction),
+    /// Murphy entering a cell from two cells away through an intervening port.
+    PortTraversal(Direction),
     /// Murphy acting on an adjacent cell without changing cells.
     Snapping(Direction),
-    /// The cyclic spark frames of a Bug hidden inside Base.
+    /// A Bug's fourteen-frame lethal spark cycle.
     Bug,
+    /// A safe Bug waiting an independently randomized number of quarter ticks.
+    BugDormant,
     /// The cyclic movement frames of a Snik Snak.
     SnikSnak,
     /// The cyclic spark frames of an Electron.
@@ -100,6 +122,8 @@ pub enum AnimationKind {
     Terminal,
     /// A Red Disk counting down before it explodes.
     RedDiskFuse,
+    /// An Orange Disk counting down after being struck by a falling Zonk.
+    OrangeDiskFuse,
     /// A normal explosion that ultimately leaves empty space.
     Explosion,
     /// An Electron explosion that ultimately leaves Infotrons.
@@ -113,14 +137,24 @@ enum AnimationNext {
     Settle,
     /// Run the actor's environment-dependent behavior immediately.
     Act,
+    /// Transfer a pre-fall Zonk only if the cell below remains unoccupied.
+    BeginZonkFall,
+    /// Give completed movement back to Murphy, settling if there is no input.
+    ResumeMurphy,
     /// Restart the same cyclic animation from frame zero.
     Repeat,
+    /// Ask the game session to choose this Bug's next dormant duration.
+    RandomizeBug,
+    /// Return a dormant Bug to lethal active frame zero.
+    ActivateBug,
+    /// Release a movement source reservation as ordinary empty space.
+    Release,
     /// Replace the animated cell with empty space.
     BecomeEmpty,
     /// Replace the animated cell with a stationary Infotron.
     BecomeInfotron,
-    /// Replace the armed disk and its neighborhood with an explosion.
-    Explode,
+    /// Emit a delayed 3×3 wave with the selected final residue.
+    Explode(ExplosionResidue),
 }
 
 /// A validated animation phase, frame, duration, and terminal transition.
@@ -147,6 +181,29 @@ impl Animation {
         }
     }
 
+    /// Creates the one-update arming phase before a resting Zonk falls.
+    fn zonk_pre_fall() -> Self {
+        // A single-frame non-idle animation completes on the Zonk's next
+        // scheduled callback. Keeping the promised transfer in `next` makes
+        // the delay part of cell state rather than an implicit game-loop flag.
+        Self {
+            kind: AnimationKind::ZonkPreFall,
+            frame: 0,
+            frame_count: 1,
+            next: AnimationNext::BeginZonkFall,
+        }
+    }
+
+    /// Creates a synchronized, invisible reservation for a movement source.
+    fn vacating(direction: Direction) -> Self {
+        Self {
+            kind: AnimationKind::Vacating(direction),
+            frame: 0,
+            frame_count: MOVEMENT_FRAMES,
+            next: AnimationNext::Release,
+        }
+    }
+
     /// Creates interpolation frames for an actor already in its destination.
     fn moving(direction: Direction) -> Self {
         Self {
@@ -154,6 +211,43 @@ impl Animation {
             frame: 0,
             frame_count: MOVEMENT_FRAMES,
             next: AnimationNext::Settle,
+        }
+    }
+
+    /// Creates interpolation frames for a diagonal rounded-object roll.
+    fn rolling(direction: Direction) -> Self {
+        Self {
+            kind: AnimationKind::Rolling(direction),
+            frame: 0,
+            frame_count: MOVEMENT_FRAMES,
+            next: AnimationNext::Settle,
+        }
+    }
+
+    /// Creates interpolation frames for Murphy's two-cell port traversal.
+    fn port_traversal(direction: Direction) -> Self {
+        Self {
+            kind: AnimationKind::PortTraversal(direction),
+            frame: 0,
+            frame_count: MOVEMENT_FRAMES,
+            next: AnimationNext::Settle,
+        }
+    }
+
+    /// Holds a completed movement's final pose until Murphy's next update.
+    fn murphy_ready(kind: AnimationKind) -> Self {
+        debug_assert!(
+            matches!(
+                kind,
+                AnimationKind::Moving(_) | AnimationKind::PortTraversal(_)
+            ),
+            "only Murphy movement phases can become input-ready"
+        );
+        Self {
+            kind,
+            frame: MOVEMENT_FRAMES - 1,
+            frame_count: MOVEMENT_FRAMES,
+            next: AnimationNext::ResumeMurphy,
         }
     }
 
@@ -187,14 +281,53 @@ impl Animation {
         }
     }
 
+    /// Creates the synchronized lethal phase used by every newly loaded Bug.
+    fn bug_active() -> Self {
+        Self {
+            kind: AnimationKind::Bug,
+            frame: 0,
+            frame_count: BUG_ACTIVE_FRAMES,
+            next: AnimationNext::RandomizeBug,
+        }
+    }
+
+    /// Creates one safe per-Bug cooldown measured in quarter-rate updates.
+    fn bug_dormant(delay: u8) -> Self {
+        debug_assert!(delay > 0, "a Bug cooldown must consume at least one update");
+        Self {
+            kind: AnimationKind::BugDormant,
+            frame: 0,
+            frame_count: delay.max(1),
+            next: AnimationNext::ActivateBug,
+        }
+    }
+
     /// Creates the finite fuse placed on a dropped Red Disk.
-    fn red_disk_fuse() -> Self {
+    fn red_disk_fuse(frame: u8) -> Self {
         Self {
             kind: AnimationKind::RedDiskFuse,
-            frame: 0,
-            frame_count: 24,
-            next: AnimationNext::Explode,
+            frame: frame.min(RED_DISK_FUSE_FRAMES - 1),
+            frame_count: RED_DISK_FUSE_FRAMES,
+            next: AnimationNext::Explode(ExplosionResidue::Empty),
         }
+    }
+
+    /// Creates the short delayed fuse caused by a Zonk striking Orange Disk.
+    fn orange_disk_fuse() -> Self {
+        Self {
+            kind: AnimationKind::OrangeDiskFuse,
+            frame: 0,
+            frame_count: ORANGE_DISK_TRIGGER_FRAMES,
+            next: AnimationNext::Explode(ExplosionResidue::Empty),
+        }
+    }
+
+    /// Reports whether the phase interpolates an actor between board cells.
+    const fn is_movement(&self) -> bool {
+        matches!(
+            self.kind,
+            AnimationKind::Moving(_) | AnimationKind::Rolling(_) | AnimationKind::PortTraversal(_)
+        )
     }
 
     /// Creates one of the finite eight-frame explosion animations.
@@ -212,6 +345,20 @@ impl Animation {
             frame: 0,
             frame_count: EXPLOSION_FRAMES,
             next,
+        }
+    }
+
+    /// Creates a blast cell whose final frame emits a secondary 3×3 wave.
+    fn chained_explosion(residue: ExplosionResidue, wave: ExplosionResidue) -> Self {
+        let kind = match residue {
+            ExplosionResidue::Empty => AnimationKind::Explosion,
+            ExplosionResidue::Infotron => AnimationKind::ElectronExplosion,
+        };
+        Self {
+            kind,
+            frame: 0,
+            frame_count: CHAIN_REACTION_FRAMES,
+            next: AnimationNext::Explode(wave),
         }
     }
 
@@ -298,6 +445,11 @@ impl State {
         Self::new(Actor::Empty(Empty))
     }
 
+    /// Creates an Empty actor whose animation still reserves a movement source.
+    fn vacating(direction: Direction) -> Self {
+        Self::animated(Actor::Empty(Empty), Animation::vacating(direction))
+    }
+
     /// Returns this cell's actor identity and actor-specific fields.
     pub fn actor(&self) -> &Actor {
         &self.actor
@@ -313,9 +465,20 @@ impl State {
         Self { actor, animation }
     }
 
+    /// Creates a planted Red Disk whose visible fuse resumes at `frame`.
+    pub(crate) fn planted_red_disk(frame: u8) -> Self {
+        Self::animated(Actor::RedDisk(RedDisk), Animation::red_disk_fuse(frame))
+    }
+
+    /// Creates a safe Bug whose independently selected cooldown has just begun.
+    pub(crate) fn dormant_bug(delay: u8) -> Self {
+        Self::animated(Actor::Bug(Bug), Animation::bug_dormant(delay))
+    }
+
     /// Reports whether this state is unoccupied for collision purposes.
     pub fn is_empty(&self) -> bool {
         matches!(self.actor, Actor::Empty(_))
+            && !matches!(self.animation.kind, AnimationKind::Vacating(_))
     }
 
     /// Reports whether the actor is in its stable, non-moving phase.
@@ -324,7 +487,7 @@ impl State {
     }
 }
 
-/// Empty space, which never proposes a transition by itself.
+/// Empty space, which never changes itself during its scheduled update.
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub struct Empty;
 
@@ -362,13 +525,25 @@ impl Zonk {
 
         let below = world.offset(position, Direction::Down)?;
         if world.is_empty(below) {
-            let actor = Actor::Zonk(Self { falling: true });
-            return Some(Transition::move_actor(
+            if self.falling {
+                // Momentum from a completed fall continues directly into the
+                // next cell. The one-update arming delay belongs only to a
+                // stable Zonk beginning a new fall from rest.
+                return Some(Transition::move_actor(
+                    position,
+                    below,
+                    Actor::Zonk(*self),
+                    Direction::Down,
+                ));
+            }
+
+            // The original engine changes a resting Zonk to pre-fall state
+            // `0x41` on this callback and transfers it only on the following
+            // callback. That distinction lets Murphy move first when his old
+            // source opens directly below a trailing Zonk.
+            return Some(Transition::replace(
                 position,
-                below,
-                actor,
-                Direction::Down,
-                TransitionPriority::Physics,
+                State::animated(Actor::Zonk(*self), Animation::zonk_pre_fall()),
             ));
         }
 
@@ -382,17 +557,34 @@ impl Zonk {
             let side = world.offset(position, direction)?;
             let diagonal = world.offset(side, Direction::Down)?;
             if world.is_empty(side) && world.is_empty(diagonal) {
-                return Some(Transition::move_actor(
+                return Some(Transition::roll_actor(
                     position,
                     diagonal,
                     Actor::Zonk(Self { falling: false }),
                     direction,
-                    TransitionPriority::Physics,
                 ));
             }
         }
 
         None
+    }
+
+    /// Starts the armed fall when its destination survived the intervening tick.
+    fn begin_fall(&self, position: Position, world: &WorldView<'_>) -> Option<Transition> {
+        let below = world.offset(position, Direction::Down)?;
+        if !world.is_empty(below) {
+            // OpenSupaplex holds state `0x41` while the destination is blocked.
+            // In particular, it does not reconsider a diagonal roll until the
+            // pending vertical fall either succeeds or the Zonk is replaced.
+            return None;
+        }
+
+        Some(Transition::move_actor(
+            position,
+            below,
+            Actor::Zonk(Self { falling: true }),
+            Direction::Down,
+        ))
     }
 }
 
@@ -429,51 +621,72 @@ impl Murphy {
 
     /// Interprets player intent against complete neighboring cell states.
     fn transition(&self, position: Position, world: &WorldView<'_>) -> Option<Transition> {
-        // Dropping a collected Red Disk is a distinct action so it cannot be
-        // confused with snapping an adjacent collectible.
-        if world.input().drop_disk
-            && world.red_disks() > 0
-            && let Some(target) = world.offset(position, self.facing)
-            && world.is_empty(target)
-        {
+        let input = world.input();
+
+        // Original Murphy gravity rewrites unsupported input to Down. The only
+        // exceptions are plain Up/Left/Right commands that eat Base, plus an
+        // upward-capable port directly above Murphy that acts as a handhold.
+        if self.is_pulled_by_gravity(position, world) {
+            let base_exception = !input.action
+                && !input.drop_disk
+                && input.direction.is_some_and(|direction| {
+                    direction != Direction::Down
+                        && world
+                            .offset(position, direction)
+                            .and_then(|target| world.state(target))
+                            .is_some_and(|state| {
+                                state.is_idle() && matches!(state.actor(), Actor::Base(_))
+                            })
+                });
+            if !base_exception {
+                return self.move_or_interact(position, Direction::Down, world);
+            }
+        }
+
+        // Space without a direction is the classic plant command; D is kept as
+        // an ergonomic one-shot alias. The game event records this exact cell,
+        // so the disk appears underneath Murphy only after he moves away.
+        let plant_disk = input.drop_disk || (input.action && input.direction.is_none());
+        if plant_disk && world.red_disks() > 0 && !world.has_active_red_disk() {
             let murphy = State::animated(Actor::Murphy(*self), Animation::snapping(self.facing));
-            let disk = State::animated(Actor::RedDisk(RedDisk), Animation::red_disk_fuse());
             return Some(Transition::new(
-                position,
-                TransitionPriority::Player,
-                vec![
-                    CellWrite::new(position, murphy),
-                    CellWrite::new(target, disk),
-                ],
-                vec![GameEvent::SpendRedDisk],
+                vec![CellWrite::new(position, murphy)],
+                vec![GameEvent::PlantRedDisk(position)],
             ));
         }
 
-        if let Some(direction) = world.input().direction {
-            if world.input().action {
+        if let Some(direction) = input.direction {
+            if input.action {
                 return self.snap(position, direction, world);
             }
             return self.move_or_interact(position, direction, world);
         }
 
-        // Gravity is evaluated only when no directional command was supplied.
-        // This preserves responsive horizontal movement while gravity is active.
-        if world.gravity() {
-            let below = world.offset(position, Direction::Down)?;
-            if world.is_empty(below) {
-                return Some(Transition::move_actor(
-                    position,
-                    below,
-                    Actor::Murphy(Self {
-                        facing: Direction::Down,
-                    }),
-                    Direction::Down,
-                    TransitionPriority::Player,
-                ));
-            }
+        None
+    }
+
+    /// Reports whether gravity must override Murphy's current player command.
+    fn is_pulled_by_gravity(&self, position: Position, world: &WorldView<'_>) -> bool {
+        if !world.gravity() {
+            return false;
         }
 
-        None
+        let Some(below) = world.offset(position, Direction::Down) else {
+            return false;
+        };
+        if !world.is_empty(below) {
+            return false;
+        }
+
+        // Only a port immediately above Murphy can suspend him over empty
+        // space, and it must accept travel upward through that tile.
+        let held_by_port = world
+            .offset(position, Direction::Up)
+            .and_then(|above| world.state(above))
+            .is_some_and(
+                |state| matches!(state.actor(), Actor::Port(port) if port.allows(Direction::Up)),
+            );
+        !held_by_port
     }
 
     /// Removes or collects one adjacent actor without moving Murphy.
@@ -492,17 +705,15 @@ impl Murphy {
             Actor::Bug(_) if !world.is_bug_active(target) => {}
             Actor::Bug(_) => return Some(explode_at(world, position, false)),
             Actor::Infotron(_) => events.push(GameEvent::CollectInfotron),
-            Actor::RedDisk(_) => events.push(GameEvent::CollectRedDisk),
+            Actor::RedDisk(_) if target_state.is_idle() => events.push(GameEvent::CollectRedDisk),
             _ => return None,
         }
 
-        // The source animation and target removal share one proposal so an
-        // overlapping explosion cannot accept only half of the action.
+        // The source animation and target removal share one transition so no
+        // later actor observes only half of the completed snap action.
         let actor = Actor::Murphy(Self { facing: direction });
         let state = State::animated(actor, Animation::snapping(direction));
         Some(Transition::new(
-            position,
-            TransitionPriority::Player,
             vec![
                 CellWrite::new(position, state),
                 CellWrite::new(target, State::empty()),
@@ -523,12 +734,21 @@ impl Murphy {
         let murphy_actor = Actor::Murphy(Self { facing: direction });
 
         match target_state.actor() {
-            Actor::Empty(_) | Actor::Base(_) => Some(Transition::move_actor(
+            // An Empty actor can still be a synchronized `Vacating` collision
+            // reservation. Consult the complete State before entering it;
+            // matching only the actor identity would let Murphy cut through a
+            // rock's or Infotron's still-active source animation.
+            Actor::Empty(_) if target_state.is_empty() => Some(Transition::move_actor(
                 position,
                 target,
                 murphy_actor,
                 direction,
-                TransitionPriority::Player,
+            )),
+            Actor::Base(_) => Some(Transition::move_actor(
+                position,
+                target,
+                murphy_actor,
+                direction,
             )),
             Actor::Bug(_) if world.is_bug_active(target) => {
                 Some(explode_at(world, position, false))
@@ -538,50 +758,84 @@ impl Murphy {
                 target,
                 murphy_actor,
                 direction,
-                TransitionPriority::Player,
             )),
             Actor::Infotron(_) => Some(Transition::move_actor_with_events(
                 position,
                 target,
                 murphy_actor,
                 direction,
-                TransitionPriority::Player,
                 vec![GameEvent::CollectInfotron],
             )),
-            Actor::RedDisk(_) => Some(Transition::move_actor_with_events(
-                position,
-                target,
-                murphy_actor,
-                direction,
-                TransitionPriority::Player,
-                vec![GameEvent::CollectRedDisk],
-            )),
+            Actor::RedDisk(_) if world.is_active_red_disk(target) => {
+                // A planted disk is position-owned rather than collectible.
+                // Murphy may cover it, and the game-level fuse keeps ticking.
+                Some(Transition::move_actor(
+                    position,
+                    target,
+                    murphy_actor,
+                    direction,
+                ))
+            }
+            Actor::RedDisk(_) if target_state.is_idle() => {
+                Some(Transition::move_actor_with_events(
+                    position,
+                    target,
+                    murphy_actor,
+                    direction,
+                    vec![GameEvent::CollectRedDisk],
+                ))
+            }
             Actor::Exit(_) if world.remaining_infotrons() == 0 => Some(Transition::new(
-                position,
-                TransitionPriority::Player,
                 vec![CellWrite::new(
                     position,
                     State::animated(murphy_actor, Animation::snapping(direction)),
                 )],
                 vec![GameEvent::Completed],
             )),
-            Actor::Zonk(_) if direction.is_horizontal() && target_state.is_idle() => {
-                self.push(position, target, direction, murphy_actor, world, true)
-            }
-            Actor::YellowDisk(_) if target_state.is_idle() => {
-                self.push(position, target, direction, murphy_actor, world, false)
-            }
+            Actor::Zonk(_) if direction.is_horizontal() && target_state.is_idle() => self.push(
+                position,
+                target,
+                direction,
+                murphy_actor,
+                world,
+                Actor::Zonk(Zonk::resting()),
+            ),
+            Actor::YellowDisk(_) if target_state.is_idle() => self.push(
+                position,
+                target,
+                direction,
+                murphy_actor,
+                world,
+                Actor::YellowDisk(YellowDisk),
+            ),
+            Actor::OrangeDisk(_) if direction.is_horizontal() && target_state.is_idle() => self
+                .push(
+                    position,
+                    target,
+                    direction,
+                    murphy_actor,
+                    world,
+                    Actor::OrangeDisk(OrangeDisk::resting()),
+                ),
             Actor::Port(port) if port.allows(direction) => {
                 self.cross_port(position, target, direction, murphy_actor, *port, world)
             }
-            Actor::Terminal(_) => Some(Transition::new(
-                position,
-                TransitionPriority::Player,
-                vec![CellWrite::new(
-                    position,
-                    State::animated(murphy_actor, Animation::snapping(direction)),
-                )],
+            Actor::Terminal(terminal) if !terminal.is_activated() => Some(Transition::new(
+                vec![
+                    CellWrite::new(
+                        position,
+                        State::animated(murphy_actor, Animation::snapping(direction)),
+                    ),
+                    CellWrite::new(target, State::new(Actor::Terminal(Terminal::activated()))),
+                ],
                 vec![GameEvent::ActivateTerminal],
+            )),
+            Actor::SnikSnak(_) => Some(explode_at(world, target, false)),
+            Actor::Electron(_) => Some(explode_at(world, target, true)),
+            Actor::Explosion(explosion) => Some(explode_at(
+                world,
+                position,
+                explosion.residue == ExplosionResidue::Infotron,
             )),
             _ => None,
         }
@@ -595,20 +849,15 @@ impl Murphy {
         direction: Direction,
         murphy_actor: Actor,
         world: &WorldView<'_>,
-        zonk: bool,
+        pushed_actor: Actor,
     ) -> Option<Transition> {
         let destination = world.offset(target, direction)?;
         if !world.is_empty(destination) {
             return None;
         }
 
-        let pushed_actor = if zonk {
-            Actor::Zonk(Zonk::resting())
-        } else {
-            Actor::YellowDisk(YellowDisk)
-        };
         let writes = vec![
-            CellWrite::new(position, State::empty()),
+            CellWrite::new(position, State::vacating(direction)),
             CellWrite::new(
                 target,
                 State::animated(murphy_actor, Animation::moving(direction)),
@@ -619,12 +868,7 @@ impl Murphy {
             ),
         ];
 
-        Some(Transition::new(
-            position,
-            TransitionPriority::Player,
-            writes,
-            Vec::new(),
-        ))
+        Some(Transition::new(writes, Vec::new()))
     }
 
     /// Atomically moves Murphy through a passable port into the cell beyond it.
@@ -651,13 +895,11 @@ impl Murphy {
 
         // The port remains unchanged between the source and destination writes.
         Some(Transition::new(
-            position,
-            TransitionPriority::Player,
             vec![
-                CellWrite::new(position, State::empty()),
+                CellWrite::new(position, State::vacating(direction)),
                 CellWrite::new(
                     destination,
-                    State::animated(murphy_actor, Animation::moving(direction)),
+                    State::animated(murphy_actor, Animation::port_traversal(direction)),
                 ),
             ],
             events,
@@ -699,7 +941,6 @@ impl Infotron {
                 below,
                 Actor::Infotron(Self { falling: true }),
                 Direction::Down,
-                TransitionPriority::Physics,
             ));
         }
 
@@ -711,12 +952,11 @@ impl Infotron {
             let side = world.offset(position, direction)?;
             let diagonal = world.offset(side, Direction::Down)?;
             if world.is_empty(side) && world.is_empty(diagonal) {
-                return Some(Transition::move_actor(
+                return Some(Transition::roll_actor(
                     position,
                     diagonal,
                     Actor::Infotron(Self { falling: false }),
                     direction,
-                    TransitionPriority::Physics,
                 ));
             }
         }
@@ -837,7 +1077,6 @@ impl OrangeDisk {
                 below,
                 Actor::OrangeDisk(Self { falling: true }),
                 Direction::Down,
-                TransitionPriority::Physics,
             ));
         }
 
@@ -900,7 +1139,7 @@ impl Port {
         }
     }
 
-    /// Remains stationary because traversal is proposed by Murphy atomically.
+    /// Remains stationary because Murphy performs the complete traversal write.
     fn transition(&self, _position: Position, _world: &WorldView<'_>) -> Option<Transition> {
         None
     }
@@ -930,16 +1169,17 @@ impl SnikSnak {
             return Some(Transition::replace(
                 position,
                 State::new(Actor::SnikSnak(*self)),
-                TransitionPriority::Animation,
             ));
         }
 
-        if let Some(murphy) = adjacent_murphy(position, world) {
-            return Some(explode_at(world, murphy, false));
+        if adjacent_murphy(position, world).is_some() {
+            // The blast belongs to the enemy's cell; Murphy is merely one of
+            // the adjacent affected cells and therefore receives the death event.
+            return Some(explode_at(world, position, false));
         }
 
-        // Snik Snaks keep their left side near a wall. All candidates are read
-        // from the same immutable snapshot, so competing enemies cannot overlap.
+        // Snik Snaks keep their left side near a wall. Each candidate is read
+        // from the board left by every earlier cell in the linear update pass.
         for direction in [
             self.heading.left(),
             self.heading,
@@ -954,7 +1194,6 @@ impl SnikSnak {
                     destination,
                     Actor::SnikSnak(Self { heading: direction }),
                     direction,
-                    TransitionPriority::Physics,
                 ));
             }
         }
@@ -962,12 +1201,11 @@ impl SnikSnak {
         Some(Transition::replace(
             position,
             State::new(Actor::SnikSnak(*self)),
-            TransitionPriority::Animation,
         ))
     }
 }
 
-/// Pushable disk detonated simultaneously by any activated Terminal.
+/// Pushable disk detonated by a Terminal's live row-major scan.
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub struct YellowDisk;
 
@@ -978,14 +1216,39 @@ impl YellowDisk {
     }
 }
 
-/// Computer terminal whose interaction detonates every Yellow Disk.
-#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
-pub struct Terminal;
+/// Computer terminal whose first interaction detonates idle Yellow Disks.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct Terminal {
+    /// Whether Murphy has already used this panel during the current level.
+    activated: bool,
+}
 
 impl Terminal {
-    /// Has no physical behavior; its repeating animation is resolved centrally.
+    /// Creates a panel that has not yet emitted its one detonation event.
+    pub const fn new() -> Self {
+        Self { activated: false }
+    }
+
+    /// Creates the persistent post-use form written by Murphy's interaction.
+    pub(crate) const fn activated() -> Self {
+        Self { activated: true }
+    }
+
+    /// Reports whether this panel has already been used.
+    pub const fn is_activated(self) -> bool {
+        self.activated
+    }
+
+    /// Has no physical behavior; Murphy owns the one-shot interaction event.
     fn transition(&self, _position: Position, _world: &WorldView<'_>) -> Option<Transition> {
         None
+    }
+}
+
+impl Default for Terminal {
+    /// Creates the normal unused panel found in serialized levels.
+    fn default() -> Self {
+        Self::new()
     }
 }
 
@@ -1024,12 +1287,13 @@ impl Electron {
             return Some(Transition::replace(
                 position,
                 State::new(Actor::Electron(*self)),
-                TransitionPriority::Animation,
             ));
         }
 
-        if let Some(murphy) = adjacent_murphy(position, world) {
-            return Some(explode_at(world, murphy, true));
+        if adjacent_murphy(position, world).is_some() {
+            // Electron residue is centered on the Electron rather than shifted
+            // onto the adjacent player cell.
+            return Some(explode_at(world, position, true));
         }
 
         // Electrons use the mirrored wall-following preference of Snik Snaks.
@@ -1047,7 +1311,6 @@ impl Electron {
                     destination,
                     Actor::Electron(Self { heading: direction }),
                     direction,
-                    TransitionPriority::Physics,
                 ));
             }
         }
@@ -1055,7 +1318,6 @@ impl Electron {
         Some(Transition::replace(
             position,
             State::new(Actor::Electron(*self)),
-            TransitionPriority::Animation,
         ))
     }
 }
@@ -1153,6 +1415,33 @@ impl Actor {
         position: Position,
         world: &WorldView<'_>,
     ) -> Option<Transition> {
+        // Freeze pauses both stable and pre-fall Zonks. A transfer already
+        // represented by synchronized destination/source animations must
+        // finish, or its Vacating source would release out of phase with a
+        // permanently paused destination.
+        if matches!(self, Self::Zonk(_)) && world.freeze_zonks() && !state.animation.is_movement() {
+            return None;
+        }
+
+        // The game session owns a planted fuse even while Murphy covers its
+        // cell. It updates the State frame after the linear actor pass, preventing the
+        // visible actor and concealed timer from advancing independently.
+        if state.animation.kind == AnimationKind::RedDiskFuse && world.is_active_red_disk(position)
+        {
+            return None;
+        }
+
+        // Bug state changes happen only on the global four-tick cadence. Murphy
+        // has already interacted before this row-major actor callback, which
+        // preserves the active→safe and safe→active collision boundaries.
+        if matches!(
+            state.animation.kind,
+            AnimationKind::Bug | AnimationKind::BugDormant
+        ) && !world.tick_count().is_multiple_of(4)
+        {
+            return None;
+        }
+
         // Animations advance before actor decisions. Their terminal action may
         // settle, repeat, explode, or explicitly hand control back to the actor.
         match state.animation.advance() {
@@ -1160,7 +1449,6 @@ impl Actor {
                 return Some(Transition::replace(
                     position,
                     State::animated(self.clone(), animation),
-                    TransitionPriority::Animation,
                 ));
             }
             AnimationAdvance::Finished(AnimationNext::Settle) => {
@@ -1170,25 +1458,78 @@ impl Actor {
                 return Some(Transition::replace(
                     position,
                     State::animated(self.clone(), state.animation.restarted()),
-                    TransitionPriority::Animation,
                 ));
             }
-            AnimationAdvance::Finished(AnimationNext::BecomeEmpty) => {
+            AnimationAdvance::Finished(AnimationNext::BeginZonkFall) => {
+                let Self::Zonk(zonk) = self else {
+                    // `Animation::zonk_pre_fall` is the only constructor for
+                    // this promise. Recover malformed internal state as idle
+                    // instead of allowing an unrelated actor to fall.
+                    debug_assert!(false, "only a Zonk may finish pre-fall");
+                    return Some(Transition::replace(position, State::new(self.clone())));
+                };
+                return zonk.begin_fall(position, world);
+            }
+            AnimationAdvance::Finished(AnimationNext::RandomizeBug) => {
+                // The shared session RNG must be consumed at application time
+                // so Bugs ending together draw distinct values in row order.
+                debug_assert!(matches!(self, Self::Bug(_)));
+                return Some(Transition::new(
+                    Vec::new(),
+                    vec![GameEvent::RandomizeBug(position)],
+                ));
+            }
+            AnimationAdvance::Finished(AnimationNext::ActivateBug) => {
+                debug_assert!(matches!(self, Self::Bug(_)));
                 return Some(Transition::replace(
                     position,
-                    State::empty(),
-                    TransitionPriority::Explosion,
+                    State::animated(Self::Bug(Bug), Animation::bug_active()),
                 ));
+            }
+            AnimationAdvance::Finished(AnimationNext::Release) => {
+                return Some(Transition::replace(position, State::empty()));
+            }
+            AnimationAdvance::Finished(AnimationNext::BecomeEmpty) => {
+                return Some(Transition::replace(position, State::empty()));
             }
             AnimationAdvance::Finished(AnimationNext::BecomeInfotron) => {
                 return Some(Transition::replace(
                     position,
                     State::new(Actor::Infotron(Infotron::resting())),
-                    TransitionPriority::Explosion,
                 ));
             }
-            AnimationAdvance::Finished(AnimationNext::Explode) => {
-                return Some(explode_at(world, position, false));
+            AnimationAdvance::Finished(AnimationNext::Explode(residue)) => {
+                // The completed animation, rather than the erased source actor,
+                // carries whether this delayed wave produces Infotrons.
+                return Some(explode_finished_animation(
+                    world,
+                    position,
+                    residue == ExplosionResidue::Infotron,
+                ));
+            }
+            AnimationAdvance::Finished(AnimationNext::ResumeMurphy) => {
+                // A movement's final pose intentionally survives one complete
+                // update after its source reservation is released. Only now
+                // may fresh input begin another move, matching the original
+                // separation between movement completion and direction input.
+                let Self::Murphy(murphy) = self else {
+                    // `Animation::murphy_ready` is the sole constructor for
+                    // this promise, so a different actor would be an internal
+                    // state-construction bug. Recover as a stable actor in
+                    // release builds instead of leaving an immortal animation.
+                    debug_assert!(false, "only Murphy may resume after movement");
+                    return Some(Transition::replace(position, State::new(self.clone())));
+                };
+
+                return murphy.transition(position, world).or_else(|| {
+                    // No usable input leaves Murphy genuinely idle. This is
+                    // not an extra movement frame: the final moving pose was
+                    // already retained for the preceding simulation update.
+                    Some(Transition::replace(
+                        position,
+                        State::new(Self::Murphy(*murphy)),
+                    ))
+                });
             }
             AnimationAdvance::Finished(AnimationNext::Act) | AnimationAdvance::Ready => {}
         }
@@ -1220,7 +1561,7 @@ impl Actor {
         match self {
             Self::SnikSnak(_) => Animation::cycle_then_act(AnimationKind::SnikSnak, 4),
             Self::Electron(_) => Animation::cycle_then_act(AnimationKind::Electron, 8),
-            Self::Bug(_) => Animation::repeating(AnimationKind::Bug, 8),
+            Self::Bug(_) => Animation::bug_active(),
             Self::Terminal(_) => Animation::repeating(AnimationKind::Terminal, 7),
             Self::Explosion(explosion) => Animation::explosion(explosion.residue),
             _ => Animation::idle(),
@@ -1230,25 +1571,124 @@ impl Actor {
     /// Resolves movement completion using the latest neighboring cell states.
     fn settle(&self, position: Position, state: &State, world: &WorldView<'_>) -> Transition {
         match self {
+            Self::Murphy(_) if state.animation.is_movement() => {
+                // Completion keeps the last interpolated pose, but changes its
+                // promised action to input resumption. The synchronized source
+                // reservation releases in this same tick. Murphy is processed
+                // before the later row-major actor pass, so trailing hazards
+                // observe the updated reservation rather than stale occupancy.
+                let (direction, source_distance) = match state.animation.kind {
+                    AnimationKind::Moving(direction) => (direction, 1),
+                    AnimationKind::PortTraversal(direction) => (direction, 2),
+                    // Murphy never owns Rolling, but retaining a total fallback
+                    // makes malformed internal states settle without erasing a
+                    // potentially unrelated neighboring cell.
+                    _ => {
+                        return Transition::replace(
+                            position,
+                            State::animated(
+                                self.clone(),
+                                Animation::murphy_ready(state.animation.kind),
+                            ),
+                        );
+                    }
+                };
+                let mut source = Some(position);
+                for _ in 0..source_distance {
+                    source = source.and_then(|cell| world.offset(cell, direction.opposite()));
+                }
+
+                let mut writes = vec![CellWrite::new(
+                    position,
+                    State::animated(self.clone(), Animation::murphy_ready(state.animation.kind)),
+                )];
+                if let Some(source) = source
+                    && world.state(source).is_some_and(|source_state| {
+                        matches!(source_state.actor(), Actor::Empty(_))
+                            && source_state.animation.kind == AnimationKind::Vacating(direction)
+                    })
+                {
+                    // Never erase an explosion or actor that replaced the
+                    // reservation while Murphy was in flight.
+                    writes.push(CellWrite::new(source, State::empty()));
+                }
+                return Transition::new(writes, Vec::new());
+            }
+            Self::Zonk(_) if world.freeze_zonks() && state.animation.is_movement() => {
+                // The in-flight transfer reaches its destination, then loses
+                // falling momentum without inspecting the next cell. This is
+                // where an original in-flight Zonk first observes freeze.
+                return Transition::replace(position, State::new(Self::Zonk(Zonk::resting())));
+            }
             Self::Zonk(zonk) if zonk.falling => {
                 if let Some(below) = world.offset(position, Direction::Down) {
-                    if world.is_crushable(below) {
-                        return explode_at(world, below, false);
+                    if let Some(target) = world.state(below) {
+                        match target.actor() {
+                            Actor::Murphy(_) => {
+                                // Murphy has already taken his player-first
+                                // update this tick. Remaining here therefore
+                                // means the falling Zonk genuinely crushes him.
+                                return explode_at(world, below, false);
+                            }
+                            Actor::SnikSnak(_) | Actor::Electron(_) => {
+                                return explode_at(world, below, false);
+                            }
+                            Actor::OrangeDisk(_) if target.is_idle() => {
+                                // A Zonk arms an otherwise stable Orange Disk
+                                // after a short delay while itself comes to rest.
+                                let orange = State::animated(
+                                    Actor::OrangeDisk(OrangeDisk::resting()),
+                                    Animation::orange_disk_fuse(),
+                                );
+                                return Transition::new(
+                                    vec![
+                                        CellWrite::new(
+                                            position,
+                                            State::new(Self::Zonk(Zonk::resting())),
+                                        ),
+                                        CellWrite::new(below, orange),
+                                    ],
+                                    Vec::new(),
+                                );
+                            }
+                            _ => {}
+                        }
                     }
-                    let still_falling = world.is_empty(below);
-                    return Transition::replace(
-                        position,
-                        State::new(Self::Zonk(Zonk {
-                            falling: still_falling,
-                        })),
-                        TransitionPriority::Physics,
-                    );
+                    if world.is_empty(below) {
+                        // Retained momentum begins the next cell transfer on
+                        // this completion callback. Only the first unsupported
+                        // resting state uses `ZonkPreFall`; inserting an idle
+                        // update here would make a long fall visibly stutter.
+                        return Transition::move_actor(
+                            position,
+                            below,
+                            Self::Zonk(Zonk { falling: true }),
+                            Direction::Down,
+                        );
+                    }
+                    return Transition::replace(position, State::new(Self::Zonk(Zonk::resting())));
                 }
             }
             Self::Infotron(infotron) if infotron.falling => {
                 if let Some(below) = world.offset(position, Direction::Down) {
-                    if world.is_crushable(below) {
-                        return explode_at(world, below, false);
+                    if let Some(target) = world.state(below) {
+                        if matches!(target.actor(), Actor::Murphy(_)) {
+                            // As with a Zonk, sequential player-first mutation
+                            // has already decided whether Murphy escaped.
+                            return explode_at(world, below, false);
+                        }
+                        let hits_living_actor =
+                            matches!(target.actor(), Actor::SnikSnak(_) | Actor::Electron(_));
+                        let hits_idle_disk = target.is_idle()
+                            && matches!(
+                                target.actor(),
+                                Actor::RedDisk(_) | Actor::YellowDisk(_) | Actor::OrangeDisk(_)
+                            );
+                        let hits_active_red_disk = matches!(target.actor(), Actor::RedDisk(_))
+                            && world.is_active_red_disk(below);
+                        if hits_living_actor || hits_idle_disk || hits_active_red_disk {
+                            return explode_at(world, below, false);
+                        }
                     }
                     let still_falling = world.is_empty(below);
                     return Transition::replace(
@@ -1256,7 +1696,6 @@ impl Actor {
                         State::new(Self::Infotron(Infotron {
                             falling: still_falling,
                         })),
-                        TransitionPriority::Physics,
                     );
                 }
             }
@@ -1266,26 +1705,14 @@ impl Actor {
                 {
                     return explode_at(world, position, false);
                 }
-                return Transition::replace(
-                    position,
-                    State::new(Self::OrangeDisk(*disk)),
-                    TransitionPriority::Physics,
-                );
+                return Transition::replace(position, State::new(Self::OrangeDisk(*disk)));
             }
             _ => {}
         }
 
         // Actors without a special landing rule simply retain their persistent
         // fields and return to their type-specific idle or cyclic animation.
-        Transition::replace(
-            position,
-            State::new(self.clone()),
-            if matches!(state.animation.kind, AnimationKind::Moving(_)) {
-                TransitionPriority::Physics
-            } else {
-                TransitionPriority::Animation
-            },
-        )
+        Transition::replace(position, State::new(self.clone()))
     }
 
     /// Returns the serialized tile code used for this actor's static sprite.
@@ -1344,91 +1771,66 @@ impl Port {
     }
 }
 
-/// One atomic write included in a proposed board transition.
+/// One atomic write included in an actor's immediate board transition.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) struct CellWrite {
-    /// Cell replaced when this proposal is accepted.
+    /// Cell replaced as part of its actor's indivisible transition.
     pub(crate) position: Position,
     /// Complete actor and animation state written to that cell.
     pub(crate) state: State,
 }
 
 impl CellWrite {
-    /// Creates a write whose position participates in conflict arbitration.
-    fn new(position: Position, state: State) -> Self {
+    /// Creates one write to be committed before the next actor is called.
+    pub(crate) fn new(position: Position, state: State) -> Self {
         Self { position, state }
     }
 }
 
-/// Gameplay side effect emitted only when its transition is accepted.
+/// Gameplay side effect emitted after its transition is applied.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum GameEvent {
     /// Decrease the number of Infotrons still required.
     CollectInfotron,
     /// Add one Red Disk to Murphy's inventory.
     CollectRedDisk,
-    /// Remove one Red Disk after placing its timed instance.
-    SpendRedDisk,
+    /// Spend one disk and begin its one-at-a-time fuse under Murphy's cell.
+    PlantRedDisk(Position),
     /// Mark the current level as successfully completed.
     Completed,
     /// Mark Murphy as destroyed.
     Died,
     /// Replace global toggles with a special port's metadata.
     ApplySpecialPort(SpecialPort),
-    /// Detonate all Yellow Disks currently present on the board.
+    /// Detonate all idle Yellow Disks currently present on the board.
     ActivateTerminal,
+    /// Consume the shared RNG stream and schedule one Bug's safe interval.
+    RandomizeBug(Position),
 }
 
-/// Conflict priority for simultaneous proposals from one immutable snapshot.
-#[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
-pub(crate) enum TransitionPriority {
-    /// Pure frame advancement, which yields to every physical action.
-    Animation,
-    /// Falling, rolling, and enemy movement.
-    Physics,
-    /// Direct player intent, which wins ordinary destination races.
-    Player,
-    /// Explosion writes, which override every lower-priority action.
-    Explosion,
-}
-
-/// Atomic multi-cell change proposed by one actor for the next board snapshot.
+/// Atomic multi-cell change applied immediately during the linear update pass.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) struct Transition {
-    /// Actor location used to break equal-priority ties deterministically.
-    pub(crate) source: Position,
-    /// Arbitration priority of every write and event in this proposal.
-    pub(crate) priority: TransitionPriority,
-    /// Cell replacements accepted or rejected as a single unit.
+    /// Cell replacements committed together before the next actor is updated.
     pub(crate) writes: Vec<CellWrite>,
-    /// Side effects applied only if all write locations were claimable.
+    /// Side effects applied after all cell replacements in this transition.
     pub(crate) events: Vec<GameEvent>,
 }
 
 impl Transition {
-    /// Creates a fully specified atomic proposal.
-    fn new(
-        source: Position,
-        priority: TransitionPriority,
-        writes: Vec<CellWrite>,
-        events: Vec<GameEvent>,
-    ) -> Self {
-        Self {
-            source,
-            priority,
-            writes,
-            events,
-        }
+    /// Creates one fully specified immediate board transition.
+    fn new(writes: Vec<CellWrite>, events: Vec<GameEvent>) -> Self {
+        Self { writes, events }
     }
 
-    /// Replaces only the proposing actor's current cell.
-    fn replace(position: Position, state: State, priority: TransitionPriority) -> Self {
-        Self::new(
-            position,
-            priority,
-            vec![CellWrite::new(position, state)],
-            Vec::new(),
-        )
+    /// Creates an explosion transition for immediate sequential application.
+    fn blast(writes: Vec<CellWrite>, events: Vec<GameEvent>) -> Self {
+        Self::new(writes, events)
+    }
+
+    /// Replaces only the currently updating actor's cell.
+    fn replace(position: Position, state: State) -> Self {
+        Self::new(vec![CellWrite::new(position, state)], Vec::new())
     }
 
     /// Moves an actor atomically without producing a gameplay event.
@@ -1437,34 +1839,47 @@ impl Transition {
         destination: Position,
         actor: Actor,
         direction: Direction,
-        priority: TransitionPriority,
     ) -> Self {
-        Self::move_actor_with_events(source, destination, actor, direction, priority, Vec::new())
+        Self::move_actor_with_events(source, destination, actor, direction, Vec::new())
     }
 
-    /// Moves an actor atomically and emits side effects after acceptance.
+    /// Moves an actor atomically and emits side effects after its cell writes.
     fn move_actor_with_events(
         source: Position,
         destination: Position,
         actor: Actor,
         direction: Direction,
-        priority: TransitionPriority,
         events: Vec<GameEvent>,
     ) -> Self {
         let destination_state = State::animated(actor, Animation::moving(direction));
         Self::new(
-            source,
-            priority,
             vec![
-                CellWrite::new(source, State::empty()),
+                CellWrite::new(source, State::vacating(direction)),
                 CellWrite::new(destination, destination_state),
             ],
             events,
         )
     }
+
+    /// Moves a rounded actor diagonally while reserving its final cell at once.
+    fn roll_actor(
+        source: Position,
+        destination: Position,
+        actor: Actor,
+        direction: Direction,
+    ) -> Self {
+        let destination_state = State::animated(actor, Animation::rolling(direction));
+        Self::new(
+            vec![
+                CellWrite::new(source, State::vacating(direction)),
+                CellWrite::new(destination, destination_state),
+            ],
+            Vec::new(),
+        )
+    }
 }
 
-/// Finds an orthogonally adjacent Murphy from the current immutable snapshot.
+/// Finds an orthogonally adjacent Murphy on the current live board.
 fn adjacent_murphy(position: Position, world: &WorldView<'_>) -> Option<Position> {
     for direction in Direction::ALL {
         if let Some(neighbor) = world.offset(position, direction)
@@ -1477,89 +1892,180 @@ fn adjacent_murphy(position: Position, world: &WorldView<'_>) -> Option<Position
     None
 }
 
-/// Builds a priority explosion proposal over the in-bounds 3×3 neighborhood.
-pub(crate) fn explode_at(world: &WorldView<'_>, center: Position, electron: bool) -> Transition {
-    let mut blast_centers = vec![(center, electron)];
-    let mut cursor = 0;
+/// Returns the stronger of two outcomes for one overlapping explosion cell.
+fn stronger_residue(first: ExplosionResidue, second: ExplosionResidue) -> ExplosionResidue {
+    if first == ExplosionResidue::Infotron || second == ExplosionResidue::Infotron {
+        ExplosionResidue::Infotron
+    } else {
+        ExplosionResidue::Empty
+    }
+}
 
-    // Discover every Electron touched by the growing blast. Each discovered
-    // Electron contributes its own Infotron-producing 3x3 neighborhood, which
-    // can discover further Electrons without recursive stack growth.
-    while cursor < blast_centers.len() {
-        let (blast_center, _) = blast_centers[cursor];
-        cursor += 1;
-        for delta_y in -1_isize..=1 {
-            for delta_x in -1_isize..=1 {
-                let Some(position) = world.offset_xy(blast_center, delta_x, delta_y) else {
-                    continue;
-                };
-                let is_electron = world
-                    .state(position)
-                    .is_some_and(|state| matches!(state.actor(), Actor::Electron(_)));
-                if is_electron
-                    && !blast_centers
-                        .iter()
-                        .any(|(existing, _)| *existing == position)
-                {
-                    blast_centers.push((position, true));
-                }
-            }
-        }
+/// Merges optional delayed waves, preferring an Infotron-producing wave.
+fn stronger_wave(
+    first: Option<ExplosionResidue>,
+    second: Option<ExplosionResidue>,
+) -> Option<ExplosionResidue> {
+    match (first, second) {
+        (Some(first), Some(second)) => Some(stronger_residue(first, second)),
+        (Some(wave), None) | (None, Some(wave)) => Some(wave),
+        (None, None) => None,
+    }
+}
+
+/// Reads a secondary wave promised by an in-progress explosion animation.
+fn promised_wave(state: &State) -> Option<ExplosionResidue> {
+    // Red and Orange fuse animations also end in `Explode`, but only a cell
+    // that is already an Explosion carries a blast-chain promise through an
+    // overlapping wave. Reactive actor handling below schedules disks afresh.
+    if !matches!(state.actor(), Actor::Explosion(_)) {
+        return None;
     }
 
-    let mut affected: Vec<(Position, ExplosionResidue)> = Vec::new();
+    match state.animation.next {
+        AnimationNext::Explode(residue) => Some(residue),
+        _ => None,
+    }
+}
+
+/// Creates a complete blast state with either cleanup or a delayed next wave.
+fn explosion_state(residue: ExplosionResidue, promised_wave: Option<ExplosionResidue>) -> State {
+    let actor = Actor::Explosion(Explosion::new(residue));
+    let animation = promised_wave.map_or_else(
+        || Animation::explosion(residue),
+        |wave| Animation::chained_explosion(residue, wave),
+    );
+    State::animated(actor, animation)
+}
+
+/// Overlays a live explosion without resetting its independent timer phase.
+fn merge_explosion_states(
+    existing: &State,
+    incoming: &State,
+    preserve_existing_animation: bool,
+) -> State {
+    let (Actor::Explosion(existing_actor), Actor::Explosion(incoming_actor)) =
+        (existing.actor(), incoming.actor())
+    else {
+        debug_assert!(false, "blast merging requires two explosion states");
+        return incoming.clone();
+    };
+    let residue = stronger_residue(existing_actor.residue(), incoming_actor.residue());
+    let wave = if preserve_existing_animation {
+        stronger_wave(promised_wave(existing), promised_wave(incoming))
+    } else {
+        promised_wave(incoming)
+    };
+
+    if !preserve_existing_animation {
+        return explosion_state(residue, wave);
+    }
+
+    // Original explosion countdowns live separately from tile graphics and a
+    // later wave never rewinds them. Preserve frame/duration while allowing a
+    // stronger Electron residue or wave promise to propagate through the cell.
+    let mut animation = existing.animation.clone();
+    animation.kind = match residue {
+        ExplosionResidue::Empty => AnimationKind::Explosion,
+        ExplosionResidue::Infotron => AnimationKind::ElectronExplosion,
+    };
+    animation.next = wave.map_or_else(
+        || match residue {
+            ExplosionResidue::Empty => AnimationNext::BecomeEmpty,
+            ExplosionResidue::Infotron => AnimationNext::BecomeInfotron,
+        },
+        AnimationNext::Explode,
+    );
+    State::animated(Actor::Explosion(Explosion::new(residue)), animation)
+}
+
+/// Emits the wave promised by a finished animation without rescheduling it.
+fn explode_finished_animation(
+    world: &WorldView<'_>,
+    center: Position,
+    electron: bool,
+) -> Transition {
+    explode_wave(world, center, electron, true)
+}
+
+/// Builds one immediate 3×3 wave and schedules touched reactive actors.
+pub(crate) fn explode_at(world: &WorldView<'_>, center: Position, electron: bool) -> Transition {
+    explode_wave(world, center, electron, false)
+}
+
+/// Implements a bounded wave while optionally consuming its center's promise.
+fn explode_wave(
+    world: &WorldView<'_>,
+    center: Position,
+    electron: bool,
+    consume_center_promise: bool,
+) -> Transition {
+    // The board actor remains authoritative for a falling object that crushes
+    // an Electron, while a finished delayed animation supplies its own kind.
+    let electron_wave = electron
+        || (!consume_center_promise
+            && world
+                .state(center)
+                .is_some_and(|state| matches!(state.actor(), Actor::Electron(_))));
+    let incoming_residue = if electron_wave {
+        ExplosionResidue::Infotron
+    } else {
+        ExplosionResidue::Empty
+    };
+    let mut writes = Vec::new();
     let mut events = Vec::new();
 
-    for (blast_center, electron_blast) in blast_centers {
-        // Signed offsets make edge clipping explicit. Both visible and invisible
-        // Hardware are skipped so their indestructibility survives every chain.
-        for delta_y in -1_isize..=1 {
-            for delta_x in -1_isize..=1 {
-                let Some(position) = world.offset_xy(blast_center, delta_x, delta_y) else {
-                    continue;
-                };
-                let Some(state) = world.state(position) else {
-                    continue;
-                };
-                if matches!(state.actor(), Actor::Hardware(_) | Actor::InvisibleWall(_)) {
-                    continue;
-                }
-
-                if matches!(state.actor(), Actor::Murphy(_)) && !events.contains(&GameEvent::Died) {
-                    events.push(GameEvent::Died);
-                }
-
-                let residue = if electron_blast {
-                    ExplosionResidue::Infotron
-                } else {
-                    ExplosionResidue::Empty
-                };
-                if let Some((_, existing_residue)) = affected
-                    .iter_mut()
-                    .find(|(existing, _)| *existing == position)
-                {
-                    // Infotron residue wins where a normal and Electron blast
-                    // overlap because the Electron blast is the stronger result.
-                    if residue == ExplosionResidue::Infotron {
-                        *existing_residue = residue;
-                    }
-                } else {
-                    affected.push((position, residue));
-                }
+    // Signed offsets make edge clipping explicit. Both visible and invisible
+    // Hardware are skipped so their indestructibility survives every wave.
+    for delta_y in -1_isize..=1 {
+        for delta_x in -1_isize..=1 {
+            let Some(position) = world.offset_xy(center, delta_x, delta_y) else {
+                continue;
+            };
+            let Some(state) = world.state(position) else {
+                continue;
+            };
+            if matches!(state.actor(), Actor::Hardware(_) | Actor::InvisibleWall(_)) {
+                continue;
             }
+
+            if matches!(state.actor(), Actor::Murphy(_)) && !events.contains(&GameEvent::Died) {
+                events.push(GameEvent::Died);
+            }
+
+            // A reactive actor touched away from the seed gets a delayed wave.
+            // The seed itself is already emitting now and must not retrigger.
+            let actor_wave = if position == center {
+                None
+            } else {
+                match state.actor() {
+                    Actor::Electron(_) => Some(ExplosionResidue::Infotron),
+                    Actor::OrangeDisk(_) | Actor::YellowDisk(_) | Actor::SnikSnak(_) => {
+                        // Reactive actors retain the sign of the incoming wave:
+                        // an Electron-triggered chain must also leave Infotrons.
+                        Some(incoming_residue)
+                    }
+                    _ => None,
+                }
+            };
+
+            let residue = match state.actor() {
+                Actor::Electron(_) if actor_wave.is_some() => {
+                    stronger_residue(incoming_residue, ExplosionResidue::Infotron)
+                }
+                _ => incoming_residue,
+            };
+            let incoming = explosion_state(residue, actor_wave);
+            let replacement = if matches!(state.actor(), Actor::Explosion(_)) {
+                let preserve_timer = promised_wave(state).is_some()
+                    && !(consume_center_promise && position == center);
+                merge_explosion_states(state, &incoming, preserve_timer)
+            } else {
+                incoming
+            };
+            writes.push(CellWrite::new(position, replacement));
         }
     }
 
-    let writes = affected
-        .into_iter()
-        .map(|(position, residue)| {
-            let explosion = Actor::Explosion(Explosion::new(residue));
-            CellWrite::new(
-                position,
-                State::animated(explosion, Animation::explosion(residue)),
-            )
-        })
-        .collect();
-
-    Transition::new(center, TransitionPriority::Explosion, writes, events)
+    Transition::blast(writes, events)
 }

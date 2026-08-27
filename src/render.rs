@@ -150,12 +150,29 @@ impl<'textures> Renderer<'textures> {
             self.camera = camera;
         }
         let camera = self.camera;
-        for (index, state) in game.board().cells().iter().enumerate() {
-            let position = game
-                .board()
-                .position(index)
-                .expect("enumerated board indices are always valid");
-            self.draw_state(canvas, position, state, camera)?;
+
+        // Logical destinations hold actors while their sprites interpolate
+        // from a source cell. Paint stationary cells first and interpolated
+        // actors second so row-major ordering cannot hide a leftward roll or
+        // port traversal behind the terrain it visually overlaps.
+        for moving_pass in [false, true] {
+            for (index, state) in game.board().cells().iter().enumerate() {
+                let is_interpolated = matches!(
+                    state.animation().kind(),
+                    AnimationKind::Moving(_)
+                        | AnimationKind::Rolling(_)
+                        | AnimationKind::PortTraversal(_)
+                );
+                if is_interpolated != moving_pass {
+                    continue;
+                }
+
+                let position = game
+                    .board()
+                    .position(index)
+                    .expect("enumerated board indices are always valid");
+                self.draw_state(canvas, position, state, camera)?;
+            }
         }
 
         self.draw_hud(canvas, game, level_number)?;
@@ -389,14 +406,19 @@ fn sprite_for_state(state: &State) -> SpriteCell {
         AnimationKind::Explosion => SpriteCell::new(8 + frame.min(7), 3),
         AnimationKind::ElectronExplosion => SpriteCell::new(8 + frame.min(7), 4),
         AnimationKind::Bug => bug_sprite(frame),
+        AnimationKind::BugDormant => static_sprite(2),
         AnimationKind::Electron => SpriteCell::new(8 + frame.min(7), 10),
         AnimationKind::Terminal => SpriteCell::new(frame.min(6), 10),
         AnimationKind::SnikSnak => snik_sprite(state, frame),
         AnimationKind::Snapping(direction) => murphy_action_sprite(direction),
-        AnimationKind::Moving(direction) => moving_sprite(state, direction, frame),
-        AnimationKind::Idle | AnimationKind::RedDiskFuse => {
-            static_sprite(state.actor().tile_code())
-        }
+        AnimationKind::Moving(direction)
+        | AnimationKind::Rolling(direction)
+        | AnimationKind::PortTraversal(direction) => moving_sprite(state, direction, frame),
+        AnimationKind::Idle
+        | AnimationKind::ZonkPreFall
+        | AnimationKind::Vacating(_)
+        | AnimationKind::RedDiskFuse
+        | AnimationKind::OrangeDiskFuse => static_sprite(state.actor().tile_code()),
     }
 }
 
@@ -416,14 +438,19 @@ fn moving_sprite(state: &State, direction: Direction, frame: u8) -> SpriteCell {
     }
 }
 
-/// Selects a Bug frame whose appearance agrees with its collision phase.
+/// Selects the original fourteen-frame active Bug presentation sequence.
 fn bug_sprite(frame: u8) -> SpriteCell {
-    // Gameplay treats frames zero through three as dangerous. Later frames use
-    // the inactive Bug tile so identical pixels never mean both safe and lethal.
-    if frame < 4 {
-        SpriteCell::new(8 + frame, 6)
-    } else {
-        static_sprite(25)
+    // Frame thirteen deliberately looks exactly like safe Base even though its
+    // `AnimationKind::Bug` remains lethal until the following Bug update. This
+    // visual ambiguity is part of the original timing rather than a collision
+    // shortcut based on sprite identity.
+    match frame.min(13) {
+        0 | 12 => SpriteCell::new(8, 6),
+        1 | 11 => SpriteCell::new(9, 6),
+        2 | 6 | 10 => SpriteCell::new(10, 6),
+        3 | 5 | 7 | 9 => SpriteCell::new(11, 6),
+        4 | 8 => SpriteCell::new(12, 6),
+        13.. => static_sprite(2),
     }
 }
 
@@ -527,19 +554,29 @@ fn ping_pong(frame: u8, frame_count: u8) -> u8 {
 
 /// Returns the sub-cell pixel offset implied by a movement animation.
 fn movement_offset(state: &State) -> (i32, i32) {
-    let AnimationKind::Moving(direction) = state.animation().kind() else {
-        return (0, 0);
-    };
-
     // The actor already occupies its logical destination. At frame zero it is
-    // drawn one cell back, then approaches offset zero over subsequent frames.
+    // drawn at its prior logical location, then approaches zero displacement.
     let remaining = 1.0 - state.animation().progress();
     let distance = (remaining * TILE_SIZE as f32).round() as i32;
-    match direction {
-        Direction::Up => (0, distance),
-        Direction::Right => (-distance, 0),
-        Direction::Down => (0, -distance),
-        Direction::Left => (distance, 0),
+    match state.animation().kind() {
+        AnimationKind::Moving(direction) => match direction {
+            Direction::Up => (0, distance),
+            Direction::Right => (-distance, 0),
+            Direction::Down => (0, -distance),
+            Direction::Left => (distance, 0),
+        },
+        AnimationKind::Rolling(direction) => match direction {
+            Direction::Left => (distance, -distance),
+            Direction::Right => (-distance, -distance),
+            Direction::Up | Direction::Down => (0, 0),
+        },
+        AnimationKind::PortTraversal(direction) => match direction {
+            Direction::Up => (0, distance * 2),
+            Direction::Right => (-distance * 2, 0),
+            Direction::Down => (0, -distance * 2),
+            Direction::Left => (distance * 2, 0),
+        },
+        _ => (0, 0),
     }
 }
 
@@ -679,11 +716,10 @@ mod tests {
         assert_eq!(frames, vec![0, 1, 2, 3, 2, 1, 0, 1]);
     }
 
-    /// Confirms safe Bug phases cannot reuse a visibly dangerous spark frame.
+    /// Confirms the Bug atlas follows the original fourteen active frames.
     #[test]
-    fn bug_frames_visually_telegraph_the_collision_phase() {
-        let active = (0..4).map(bug_sprite).collect::<Vec<_>>();
-        let inactive = static_sprite(25);
+    fn bug_frames_follow_the_original_spark_and_base_sequence() {
+        let active = (0..14).map(bug_sprite).collect::<Vec<_>>();
 
         assert_eq!(
             active,
@@ -692,11 +728,18 @@ mod tests {
                 super::SpriteCell::new(9, 6),
                 super::SpriteCell::new(10, 6),
                 super::SpriteCell::new(11, 6),
+                super::SpriteCell::new(12, 6),
+                super::SpriteCell::new(11, 6),
+                super::SpriteCell::new(10, 6),
+                super::SpriteCell::new(11, 6),
+                super::SpriteCell::new(12, 6),
+                super::SpriteCell::new(11, 6),
+                super::SpriteCell::new(10, 6),
+                super::SpriteCell::new(9, 6),
+                super::SpriteCell::new(8, 6),
+                static_sprite(2),
             ]
         );
-        for frame in 4..8 {
-            assert_eq!(bug_sprite(frame), inactive, "safe Bug frame {frame}");
-        }
     }
 
     /// Confirms horizontal rolling follows the direction metadata of each strip.

@@ -117,9 +117,9 @@ fn run(level: &Level, level_number: usize) -> Result<(), String> {
                     repeat: false,
                     ..
                 } => {
-                    // Restarting reconstructs every actor and global toggle from
-                    // the immutable decoded record rather than patching state.
-                    game = Game::new(level).map_err(|error| error.to_string())?;
+                    // Restarting reconstructs actors and level toggles while
+                    // retaining the process RNG stream, as original play does.
+                    game.restart(level).map_err(|error| error.to_string())?;
                     accumulator = Duration::ZERO;
                 }
                 Event::KeyDown {
@@ -184,10 +184,10 @@ fn run(level: &Level, level_number: usize) -> Result<(), String> {
     Ok(())
 }
 
-/// Selects at most one held arrow key in a stable priority order.
+/// Selects at most one held arrow key using stable directional precedence.
 fn keyboard_direction(keyboard: &sdl2::keyboard::KeyboardState<'_>) -> Option<Direction> {
     // A deterministic order avoids diagonal commands, which the original grid
-    // does not support, when the player holds two arrows simultaneously.
+    // does not support when the player holds multiple arrows at once.
     if keyboard.is_scancode_pressed(Scancode::Up) {
         Some(Direction::Up)
     } else if keyboard.is_scancode_pressed(Scancode::Down) {
