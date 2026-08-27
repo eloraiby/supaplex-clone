@@ -1490,7 +1490,10 @@ impl Murphy {
                     position,
                     State::animated(murphy_actor, Animation::murphy_exit()),
                 )],
-                Vec::new(),
+                // The original sets its successful-level flag as soon as the
+                // unlocked Exit is selected. The forty pictures are a terminal
+                // disappearance sequence, not a deferred success condition.
+                vec![GameEvent::Completed],
             )),
             Actor::Zonk(_) if direction.is_horizontal() && target_state.is_idle() => {
                 self.prepare_push(position, target, direction, world, MurphyPushTarget::Zonk)
@@ -2959,10 +2962,9 @@ impl Actor {
             }
             AnimationAdvance::Finished(AnimationNext::FinishMurphyExit) => {
                 debug_assert!(matches!(self, Self::Murphy(_)));
-                return Some(Transition::new(
-                    vec![CellWrite::new(position, State::empty())],
-                    vec![GameEvent::Completed],
-                ));
+                // Success was recorded when Murphy entered the Exit. Finishing
+                // its artwork now only removes his disappearing sprite.
+                return Some(Transition::replace(position, State::empty()));
             }
             AnimationAdvance::Finished(AnimationNext::Act) | AnimationAdvance::Ready => {}
         }

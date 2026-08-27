@@ -386,14 +386,26 @@ impl Game {
 
         let playing = self.status == GameStatus::Playing;
         let simulating = playing || self.quit_countdown > 0;
-        let murphy_source = playing.then(|| self.murphy_position()).flatten();
+        let murphy_source = self.murphy_position();
+        let exit_is_disappearing = self.status == GameStatus::Completed
+            && murphy_source
+                .and_then(|position| self.board.state(position))
+                .is_some_and(|state| {
+                    matches!(
+                        state.animation().kind(),
+                        AnimationKind::Murphy(crate::actor::MurphyAnimation::Exit)
+                    )
+                });
 
         // Supaplex always updates Murphy before constructing the linear moving-
         // object schedule. Every later actor therefore sees his completed move,
-        // turn, source reservation, or interaction from this same tick.
-        if playing
+        // turn, source reservation, or interaction from this same tick. Once
+        // Exit contact records success, only that terminal animation continues;
+        // ordinary player input must not start another action.
+        if (playing || exit_is_disappearing)
             && let Some(position) = murphy_source
-            && let Some(transition) = self.transition_at(position, input)
+            && let Some(transition) =
+                self.transition_at(position, if playing { input } else { Input::default() })
         {
             self.apply_transition(transition);
         }
@@ -2735,7 +2747,7 @@ mod tests {
         open.tick(input);
 
         assert_eq!(locked.status(), GameStatus::Playing);
-        assert_eq!(open.status(), GameStatus::Playing);
+        assert_eq!(open.status(), GameStatus::Completed);
         assert_eq!(
             open.board()
                 .state(Position::new(2, 2))
@@ -2744,10 +2756,12 @@ mod tests {
                 .kind(),
             AnimationKind::Murphy(MurphyAnimation::Exit)
         );
+        // The terminal status does not freeze the disappearance sequence.
         for _ in 0..40 {
             open.tick(Input::default());
         }
         assert_eq!(open.status(), GameStatus::Completed);
+        assert!(open.murphy_position().is_none());
     }
 
     /// Confirms Murphy cannot enter an enemy cell without being destroyed.
