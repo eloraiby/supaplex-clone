@@ -1862,6 +1862,47 @@ mod tests {
         assert!(matches!(actor_at(&game, 3, 2), Actor::Zonk(_)));
     }
 
+    /// Confirms protected push states bypass the falling-object sound branch.
+    #[test]
+    fn falling_actor_lands_silently_on_push_protected_murphy() {
+        for falling_actor in [
+            Actor::Zonk(Zonk::resting()),
+            Actor::Infotron(Infotron::resting()),
+        ] {
+            let mut game = game_with(
+                &[
+                    (Position::new(3, 1), State::new(falling_actor)),
+                    (
+                        Position::new(3, 3),
+                        State::new(Actor::Murphy(Murphy::new())),
+                    ),
+                    (
+                        Position::new(4, 3),
+                        State::new(Actor::Zonk(Zonk::resting())),
+                    ),
+                ],
+                0,
+            );
+            let held_right = Input {
+                direction: Some(Direction::Right),
+                ..Input::default()
+            };
+
+            // Both falling actors reach their final transfer picture while
+            // Murphy's eight-tick hold begins the protected push animation.
+            // The tenth update settles them onto Murphy without adding Fall.
+            for _ in 0..10 {
+                game.tick(held_right);
+            }
+            assert_eq!(game.take_sound_effects(), vec![SoundEffect::Push]);
+            match actor_at(&game, 3, 2) {
+                Actor::Zonk(zonk) => assert!(!zonk.is_falling()),
+                Actor::Infotron(infotron) => assert!(!infotron.is_falling()),
+                actor => panic!("falling actor settled as unexpected {actor:?}"),
+            }
+        }
+    }
+
     /// Confirms freeze lets an in-flight fall finish without desynchronizing it.
     #[test]
     fn freezing_an_in_flight_zonk_finishes_its_source_reservation() {

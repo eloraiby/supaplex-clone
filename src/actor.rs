@@ -3252,7 +3252,12 @@ impl Actor {
                             Actor::Murphy(_) if murphy_is_protected_from_falling_actor(target) => {
                                 // Horizontal push states 0x0e/0x0f/0x25/
                                 // 0x26/0x28/0x29 are explicit original crush
-                                // exceptions; the rounded actor simply lands.
+                                // exceptions. The DOS routine returns before
+                                // its later Fall-sound call on this path.
+                                return Transition::replace(
+                                    position,
+                                    State::new(Self::Zonk(Zonk::resting())),
+                                );
                             }
                             Actor::Murphy(_) => {
                                 // Murphy has already taken his player-first
@@ -3310,11 +3315,17 @@ impl Actor {
             Self::Infotron(infotron) if infotron.falling => {
                 if let Some(below) = world.offset(position, Direction::Down) {
                     if let Some(target) = world.state(below) {
-                        if matches!(target.actor(), Actor::Murphy(_))
-                            && !murphy_is_protected_from_falling_actor(target)
-                        {
-                            // As with a Zonk, sequential player-first mutation
-                            // has already decided whether Murphy escaped.
+                        if matches!(target.actor(), Actor::Murphy(_)) {
+                            if murphy_is_protected_from_falling_actor(target) {
+                                // Protected push states use the same silent
+                                // early return as the Zonk landing routine.
+                                return Transition::replace(
+                                    position,
+                                    State::new(Self::Infotron(Infotron::resting())),
+                                );
+                            }
+                            // Sequential player-first mutation has already
+                            // decided whether Murphy escaped before this hit.
                             return explode_at(world, below, false);
                         }
                         let hits_living_actor =
