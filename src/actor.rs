@@ -9,7 +9,7 @@ use crate::{game::WorldView, level::SpecialPort};
 /// Number of original updates used by a falling or enemy cell transfer.
 const MOVEMENT_FRAMES: u8 = 8;
 
-/// Number of source frames in either explosion strip of `RocksSP.png`.
+/// Number of source frames in either original `MOVING.DAT` explosion strip.
 const EXPLOSION_FRAMES: u8 = 8;
 
 /// Number of lethal logical phases in each active Bug cycle.
@@ -254,7 +254,7 @@ impl MurphyAnimation {
     }
 }
 
-/// Visual family used to select a frame from the sprite atlas.
+/// Visual family used to select a frame from the original fixed or moving data.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum AnimationKind {
     /// A stationary actor rendered with its normal tile sprite.
@@ -2226,7 +2226,7 @@ pub struct Terminal {
     activated: bool,
     /// Signed original-style counter incremented once per simulation update.
     delay: i8,
-    /// Repacked atlas frame representing the screen's current scroll offset.
+    /// FIXED.DAT scanline phase representing the screen's current scroll offset.
     screen_frame: u8,
 }
 
@@ -2256,7 +2256,7 @@ impl Terminal {
         self.activated
     }
 
-    /// Returns the current atlas frame of the scrolling screen.
+    /// Returns the current FIXED.DAT scanline phase of the scrolling screen.
     pub const fn screen_frame(self) -> u8 {
         self.screen_frame
     }

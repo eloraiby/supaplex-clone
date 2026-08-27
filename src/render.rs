@@ -1,4 +1,4 @@
-//! SDL2 rendering for the row-major simulation and repacked sprite atlas.
+//! SDL2 rendering from the original fixed, moving, and font bitmap conversions.
 
 use std::{error::Error, fmt, io::Cursor};
 
@@ -30,17 +30,14 @@ const HUD_HEIGHT: u32 = 64;
 /// Height of the scrolling board viewport above the HUD.
 const VIEW_HEIGHT: u32 = LOGICAL_HEIGHT - HUD_HEIGHT;
 
-/// Displayed width and height of one repacked sprite cell.
+/// Displayed width and height of one board cell.
 const TILE_SIZE: u32 = 32;
 
-/// Source width and height of one `RocksSP.png` atlas cell.
-const ATLAS_CELL_SIZE: u32 = 32;
+/// Source width and height of one tile in the original fixed strip.
+const FIXED_TILE_SIZE: u32 = 16;
 
-/// Number of sprite cells across the supplied atlas.
-const ATLAS_COLUMNS: u8 = 16;
-
-/// Number of sprite cells down the supplied atlas.
-const ATLAS_ROWS: u8 = 15;
+/// Number of serialized, visible tiles stored consecutively in `FIXED.DAT`.
+const FIXED_TILE_COUNT: u8 = 40;
 
 /// Pixel width and height of one decoded font glyph.
 const FONT_CELL_SIZE: u32 = 8;
@@ -51,8 +48,8 @@ const FONT_SCALE: u32 = 2;
 /// Number of glyphs placed horizontally in `CHARS8.DAT`.
 const FONT_GLYPHS: u8 = 64;
 
-/// Repacked, 2× Supaplex actor sprites supplied with the repository.
-const ROCKS_SP_PNG: &[u8] = include_bytes!("../RocksSP.png");
+/// Pixel-perfect conversion of the original `FIXED.DAT` tile strip.
+const FIXED_PNG: &[u8] = include_bytes!("../assets/fixed.png");
 
 /// Font converted from the original headerless `CHARS8.DAT` file.
 const CHARS8_PNG: &[u8] = include_bytes!("../assets/chars8.png");
@@ -65,37 +62,6 @@ const MOVING_SCALE: u32 = 2;
 
 /// Display-space distance Murphy advances during one original movement update.
 const MURPHY_STEP: i32 = 2 * MOVING_SCALE as i32;
-
-/// Grid location of one 32×32 source frame in `RocksSP.png`.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-struct SpriteCell {
-    /// Zero-based atlas column.
-    column: u8,
-    /// Zero-based atlas row.
-    row: u8,
-}
-
-impl SpriteCell {
-    /// Creates an atlas cell whose bounds are checked by mapping tests.
-    const fn new(column: u8, row: u8) -> Self {
-        Self { column, row }
-    }
-
-    /// Converts grid coordinates to an SDL source rectangle.
-    fn source(self) -> Rect {
-        Rect::new(
-            i32::from(self.column) * ATLAS_CELL_SIZE as i32,
-            i32::from(self.row) * ATLAS_CELL_SIZE as i32,
-            ATLAS_CELL_SIZE,
-            ATLAS_CELL_SIZE,
-        )
-    }
-
-    /// Reports whether the frame lies completely inside the known atlas grid.
-    const fn is_valid(self) -> bool {
-        self.column < ATLAS_COLUMNS && self.row < ATLAS_ROWS
-    }
-}
 
 /// Pixel camera origin in full-board coordinates.
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
@@ -122,15 +88,15 @@ struct DecodedPng {
 enum BlackPixelPolicy {
     /// Preserve opaque black so a rectangular DOS blit can erase prior artwork.
     Opaque,
-    /// Convert black to zero alpha for modern overlay-only atlas rendering.
+    /// Convert black to zero alpha for modern overlay-only font rendering.
     Transparent,
 }
 
 /// Textures and mapping logic needed to draw one game snapshot.
 pub struct Renderer<'textures> {
-    /// Repacked actor sprite atlas loaded from `RocksSP.png`.
-    sprites: Texture<'textures>,
-    /// Original variably sized movement frames used for Murphy composites.
+    /// Original fixed 16×16 tiles used for stable actors and target backdrops.
+    fixed: Texture<'textures>,
+    /// Original variably sized frames used for every animated actor composite.
     moving: Texture<'textures>,
     /// Original eight-pixel DOS font converted to an RGBA PNG.
     font: Texture<'textures>,
@@ -146,13 +112,13 @@ impl<'textures> Renderer<'textures> {
     pub fn new(
         texture_creator: &'textures TextureCreator<WindowContext>,
     ) -> Result<Self, RenderError> {
-        let sprites = load_texture(
+        let fixed = load_texture(
             texture_creator,
-            ROCKS_SP_PNG,
-            512,
-            480,
-            "RocksSP.png",
-            BlackPixelPolicy::Transparent,
+            FIXED_PNG,
+            640,
+            16,
+            "assets/fixed.png",
+            BlackPixelPolicy::Opaque,
         )?;
         let moving = load_texture(
             texture_creator,
@@ -172,7 +138,7 @@ impl<'textures> Renderer<'textures> {
         )?;
 
         Ok(Self {
-            sprites,
+            fixed,
             moving,
             font,
             camera: Camera::default(),
@@ -284,26 +250,26 @@ impl<'textures> Renderer<'textures> {
             return self.draw_electron_animation(canvas, position, state, camera);
         }
 
-        let sprite = sprite_for_state(state);
-        debug_assert!(sprite.is_valid(), "sprite mapping must remain inside atlas");
-        let (offset_x, offset_y) = movement_offset(state);
-        let destination = Rect::new(
-            position.x as i32 * TILE_SIZE as i32 - camera.x + offset_x,
-            position.y as i32 * TILE_SIZE as i32 - camera.y + offset_y,
-            TILE_SIZE,
-            TILE_SIZE,
-        );
-
-        // Skip cells completely outside the board viewport, including movement
-        // interpolation that temporarily crosses a viewport edge.
-        let viewport = Rect::new(0, 0, LOGICAL_WIDTH, VIEW_HEIGHT);
-        if !destination.has_intersection(viewport) {
-            return Ok(());
+        if matches!(
+            state.animation().kind(),
+            AnimationKind::Explosion | AnimationKind::ElectronExplosion | AnimationKind::Bug
+        ) {
+            return self.draw_animated_cell(canvas, position, state, camera);
         }
 
-        canvas
-            .copy(&self.sprites, sprite.source(), destination)
-            .map_err(RenderError::Sdl)
+        if state.animation().kind() == AnimationKind::Terminal {
+            return self.draw_terminal(canvas, position, state.animation().frame(), camera);
+        }
+
+        // Dormant Bugs mimic Base even though their actor identity remains
+        // lethal; every other stable state uses its serialized FIXED.DAT code.
+        let tile = if state.animation().kind() == AnimationKind::BugDormant {
+            2
+        } else {
+            state.actor().tile_code()
+        };
+        let (offset_x, offset_y) = movement_offset(state);
+        self.draw_fixed_tile(canvas, position, tile, camera, offset_x, offset_y)
     }
 
     /// Draws one original variably sized Murphy descriptor at two-times scale.
@@ -338,7 +304,7 @@ impl<'textures> Renderer<'textures> {
                     TILE_SIZE,
                 );
                 canvas
-                    .copy(&self.sprites, static_sprite(tile).source(), destination)
+                    .copy(&self.fixed, fixed_tile_source(tile), destination)
                     .map_err(RenderError::Sdl)?;
             }
         }
@@ -349,6 +315,97 @@ impl<'textures> Renderer<'textures> {
         self.draw_murphy_part(canvas, position, parts.primary, camera)?;
         if let Some(secondary) = parts.secondary {
             self.draw_murphy_part(canvas, position, secondary, camera)?;
+        }
+        Ok(())
+    }
+
+    /// Draws a stable FIXED.DAT tile at one optional sub-cell displacement.
+    fn draw_fixed_tile(
+        &mut self,
+        canvas: &mut Canvas<Window>,
+        position: Position,
+        tile: u8,
+        camera: Camera,
+        offset_x: i32,
+        offset_y: i32,
+    ) -> Result<(), RenderError> {
+        // FIXED.DAT stores each original 16×16 tile consecutively. SDL enlarges
+        // that exact source cell to the clone's 32×32 logical board scale.
+        let destination = Rect::new(
+            position.x as i32 * TILE_SIZE as i32 - camera.x + offset_x,
+            position.y as i32 * TILE_SIZE as i32 - camera.y + offset_y,
+            TILE_SIZE,
+            TILE_SIZE,
+        );
+
+        // Skip cells completely outside the board viewport, including a stable
+        // fallback temporarily displaced by an internal movement state.
+        let viewport = Rect::new(0, 0, LOGICAL_WIDTH, VIEW_HEIGHT);
+        if !destination.has_intersection(viewport) {
+            return Ok(());
+        }
+
+        canvas
+            .copy(&self.fixed, fixed_tile_source(tile), destination)
+            .map_err(RenderError::Sdl)
+    }
+
+    /// Draws one opaque 16×16 Bug or explosion frame from MOVING.DAT.
+    fn draw_animated_cell(
+        &mut self,
+        canvas: &mut Canvas<Window>,
+        position: Position,
+        state: &State,
+        camera: Camera,
+    ) -> Result<(), RenderError> {
+        // These animations all replace one complete cell, so their literal
+        // source coordinates share a zero-offset 16×16 descriptor shape.
+        let Some(part) =
+            animated_cell_sprite_part(state.animation().kind(), state.animation().frame())
+        else {
+            debug_assert!(
+                false,
+                "animated-cell renderer received an unsupported phase"
+            );
+            return Ok(());
+        };
+        self.draw_murphy_part(canvas, position, part, camera)
+    }
+
+    /// Reconstructs one Terminal screen scroll directly from its FIXED.DAT tile.
+    fn draw_terminal(
+        &mut self,
+        canvas: &mut Canvas<Window>,
+        position: Position,
+        frame: u8,
+        camera: Camera,
+    ) -> Result<(), RenderError> {
+        // The casing and lamps never move, so begin with the complete original
+        // Terminal tile before replacing only its eight-row green display area.
+        self.draw_fixed_tile(canvas, position, 19, camera, 0, 0)?;
+        let destination_x = position.x as i32 * TILE_SIZE as i32 - camera.x;
+        let destination_y = position.y as i32 * TILE_SIZE as i32 - camera.y;
+
+        for destination_row in 2..=9 {
+            // Each original scroll rotates the display upward by one row. Copy
+            // one source scanline at 2× height to reproduce that byte operation
+            // without retaining a mutable level bitmap inside the renderer.
+            let source_row = terminal_source_row(frame, destination_row);
+            let source = Rect::new(
+                19 * FIXED_TILE_SIZE as i32,
+                i32::from(source_row),
+                FIXED_TILE_SIZE,
+                1,
+            );
+            let destination = Rect::new(
+                destination_x,
+                destination_y + i32::from(destination_row) * MOVING_SCALE as i32,
+                TILE_SIZE,
+                MOVING_SCALE,
+            );
+            canvas
+                .copy(&self.fixed, source, destination)
+                .map_err(RenderError::Sdl)?;
         }
         Ok(())
     }
@@ -412,8 +469,8 @@ impl<'textures> Renderer<'textures> {
             debug_assert!(false, "Snik Snak renderer received an unsupported phase");
             return Ok(());
         };
-        // Enemy frames share the same colorkeyed MOVING.DAT conversion and
-        // unscaled offset convention as Murphy and gravity actors.
+        // Enemy frames share the same opaque MOVING.DAT conversion and unscaled
+        // offset convention as Murphy and gravity actors.
         self.draw_murphy_part(canvas, position, part, camera)
     }
 
@@ -430,8 +487,8 @@ impl<'textures> Renderer<'textures> {
             debug_assert!(false, "Electron renderer received an unsupported phase");
             return Ok(());
         };
-        // Electron artwork is copied from the same transparent MOVING.DAT
-        // texture while retaining its own literal coordinate table.
+        // Electron artwork is copied opaquely from the same MOVING.DAT texture
+        // while retaining its own literal coordinate table.
         self.draw_murphy_part(canvas, position, part, camera)
     }
 
@@ -835,9 +892,9 @@ fn load_texture<'textures>(
         });
     }
 
-    // MOVING.DAT requires opaque black because each frame was historically a
-    // rectangular byte copy. Atlas and font images remain overlay-oriented and
-    // use the modern colorkey behavior selected by their caller.
+    // FIXED.DAT and MOVING.DAT require opaque black because their pictures were
+    // historically rectangular byte copies. The font remains overlay-oriented
+    // and uses the modern colorkey behavior selected by its caller.
     apply_black_pixel_policy(&mut image.pixels, black_pixel_policy);
 
     // Upload the transformed straight-alpha bytes without filtering; the
@@ -901,165 +958,73 @@ fn decode_png(bytes: &[u8]) -> Result<DecodedPng, RenderError> {
     })
 }
 
-/// Selects the best static or animated atlas frame for one complete cell state.
-fn sprite_for_state(state: &State) -> SpriteCell {
-    let frame = state.animation().frame();
-    match state.animation().kind() {
-        AnimationKind::Explosion => SpriteCell::new(8 + frame.min(7), 3),
-        AnimationKind::ElectronExplosion => SpriteCell::new(8 + frame.min(7), 4),
-        AnimationKind::Bug => bug_sprite(frame),
-        AnimationKind::BugDormant => static_sprite(2),
-        AnimationKind::Terminal => SpriteCell::new(frame.min(6), 10),
-        AnimationKind::Murphy(action) => murphy_animation_sprite(action, frame),
-        AnimationKind::Moving(direction) | AnimationKind::Rolling(direction) => {
-            moving_sprite(state, direction, frame)
-        }
-        AnimationKind::Idle
-        | AnimationKind::ZonkPreFall
-        | AnimationKind::InfotronPreFall
-        | AnimationKind::RoundedPreRoll(_)
-        | AnimationKind::Vacating(_)
-        | AnimationKind::MurphyPushTarget
-        | AnimationKind::MurphyDestination
-        | AnimationKind::RoundedSide
-        | AnimationKind::RoundedDestination
-        | AnimationKind::OrangePreFall
-        | AnimationKind::OrangeFalling
-        | AnimationKind::SnikSnakTurn(_)
-        | AnimationKind::SnikSnakMove(_)
-        | AnimationKind::SnikSnakVacating(_)
-        | AnimationKind::ElectronTurn(_)
-        | AnimationKind::ElectronMove(_)
-        | AnimationKind::ElectronVacating(_)
-        | AnimationKind::RedDiskFuse
-        | AnimationKind::OrangeDiskFuse => static_sprite(state.actor().tile_code()),
-    }
+/// Returns the direct FIXED.DAT source rectangle for one serialized tile code.
+fn fixed_tile_source(tile: u8) -> Rect {
+    // Invisible Wall is code forty and has no picture. Callers skip that actor,
+    // while malformed larger codes defensively select the black Space tile.
+    let tile = if tile < FIXED_TILE_COUNT { tile } else { 0 };
+    Rect::new(
+        i32::from(tile) * FIXED_TILE_SIZE as i32,
+        0,
+        FIXED_TILE_SIZE,
+        FIXED_TILE_SIZE,
+    )
 }
 
-/// Selects presentation frames for an actor logically entering its destination.
-fn moving_sprite(state: &State, direction: Direction, frame: u8) -> SpriteCell {
-    match state.actor() {
-        Actor::Zonk(_) if direction.is_horizontal() => zonk_moving_sprite(direction, frame),
-        Actor::Infotron(_) if direction.is_horizontal() => infotron_moving_sprite(direction, frame),
-        _ => static_sprite(state.actor().tile_code()),
-    }
-}
-
-/// Selects the sprite drawn for one non-negative original Bug state.
-///
-/// Bug state zero is the ordinary fixed Bug tile.  On each eligible global
-/// quarter tick, the original updater increments the state and indexes its
-/// coordinate table with states one through thirteen.  States one through
-/// eleven oscillate across four electrical frames, state twelve returns to the
-/// fixed Bug tile, and state thirteen is visually indistinguishable from Base
-/// even though it remains lethal until the next eligible update.
-fn bug_sprite(frame: u8) -> SpriteCell {
-    // The repacked atlas stores the four electrical pictures in row six,
-    // columns eight through eleven.  Column twelve belongs to another actor;
-    // selecting it was the visible Bug-to-Snik-Snak corruption reported by the
-    // fidelity audit.
-    match frame.min(13) {
-        0 | 12 => static_sprite(25),
-        1 | 11 => SpriteCell::new(8, 6),
-        2 | 6 | 10 => SpriteCell::new(9, 6),
-        3 | 5 | 7 | 9 => SpriteCell::new(10, 6),
-        4 | 8 => SpriteCell::new(11, 6),
-        13.. => static_sprite(2),
-    }
-}
-
-/// Selects the atlas rotation order for a horizontally moving Zonk.
-fn zonk_moving_sprite(direction: Direction, frame: u8) -> SpriteCell {
-    // RocksSP stores four clockwise rotations from left to right. Its original
-    // metadata reverses that strip for left motion and begins right motion at
-    // frame one, wrapping after the final cell.
-    let phase = frame % 4;
-    let strip_frame = match direction {
-        Direction::Left => 3 - phase,
-        Direction::Right => (phase + 1) % 4,
-        Direction::Up | Direction::Down => return static_sprite(1),
-    };
-    SpriteCell::new(strip_frame, 6)
-}
-
-/// Selects four evenly sampled rotation frames for a moving Infotron.
-fn infotron_moving_sprite(direction: Direction, frame: u8) -> SpriteCell {
-    // The source strip contains eight frames while movement has four simulation
-    // phases. Left motion samples even frames forward; right motion follows the
-    // atlas's reverse-from-six metadata to produce the mirrored rotation.
-    let forward_frame = frame.min(3) * 2;
-    let strip_frame = match direction {
-        Direction::Left => forward_frame,
-        Direction::Right => 6 - forward_frame,
-        Direction::Up | Direction::Down => return static_sprite(4),
-    };
-    SpriteCell::new(8 + strip_frame, 13)
-}
-
-/// Supplies an atlas fallback for one semantic original Murphy descriptor.
-fn murphy_animation_sprite(action: MurphyAnimation, frame: u8) -> SpriteCell {
-    let direction = match action {
-        MurphyAnimation::Move { direction, .. }
-        | MurphyAnimation::Snap { direction, .. }
-        | MurphyAnimation::Push { direction, .. }
-        | MurphyAnimation::Port { direction } => direction,
-        MurphyAnimation::Exit | MurphyAnimation::PlantRedDisk => return static_sprite(3),
+/// Selects one complete-cell Bug or explosion rectangle from MOVING.DAT.
+fn animated_cell_sprite_part(kind: AnimationKind, frame: u8) -> Option<SpritePart> {
+    // Literal coordinates replace the repacked atlas rows. The original tables
+    // contain eight regular, eight Infotron, and fourteen active Bug pictures.
+    const BUG: [SourcePoint; 14] = [
+        SourcePoint { x: 304, y: 100 },
+        SourcePoint { x: 256, y: 196 },
+        SourcePoint { x: 272, y: 196 },
+        SourcePoint { x: 288, y: 196 },
+        SourcePoint { x: 304, y: 196 },
+        SourcePoint { x: 288, y: 196 },
+        SourcePoint { x: 272, y: 196 },
+        SourcePoint { x: 288, y: 196 },
+        SourcePoint { x: 304, y: 196 },
+        SourcePoint { x: 288, y: 196 },
+        SourcePoint { x: 272, y: 196 },
+        SourcePoint { x: 256, y: 196 },
+        SourcePoint { x: 304, y: 100 },
+        SourcePoint { x: 304, y: 64 },
+    ];
+    let source = match kind {
+        AnimationKind::Explosion => SourcePoint {
+            x: i32::from(frame.min(7)) * 16,
+            y: 196,
+        },
+        AnimationKind::ElectronExplosion => SourcePoint {
+            x: 128 + i32::from(frame.min(7)) * 16,
+            y: 196,
+        },
+        AnimationKind::Bug => BUG[usize::from(frame.min(13))],
+        _ => return None,
     };
 
-    if matches!(action, MurphyAnimation::Move { .. }) {
-        return match direction {
-            Direction::Left => SpriteCell::new(8 + ping_pong(frame, 3), 0),
-            Direction::Right => SpriteCell::new(11 + ping_pong(frame, 3), 0),
-            Direction::Up | Direction::Down => static_sprite(3),
-        };
-    }
-
-    match direction {
-        Direction::Right => SpriteCell::new(8, 1),
-        Direction::Left => SpriteCell::new(9, 1),
-        Direction::Up => SpriteCell::new(14, 0),
-        Direction::Down => SpriteCell::new(15, 0),
-    }
+    Some(SpritePart {
+        source,
+        width: FIXED_TILE_SIZE,
+        height: FIXED_TILE_SIZE,
+        offset_x: 0,
+        offset_y: 0,
+    })
 }
 
-/// Maps a serialized tile code to its static `RocksSP.png` grid cell.
-fn static_sprite(tile: u8) -> SpriteCell {
-    match tile {
-        0 => SpriteCell::new(0, 0),
-        1..=7 => SpriteCell::new(tile, 0),
-        8 => SpriteCell::new(0, 1),
-        9..=12 => SpriteCell::new(tile - 8, 1),
-        13..=16 => SpriteCell::new(tile - 12, 1),
-        17 => SpriteCell::new(1, 2),
-        18 => SpriteCell::new(2, 2),
-        19 => SpriteCell::new(0, 10),
-        20 => SpriteCell::new(4, 2),
-        21..=23 => SpriteCell::new(tile - 16, 2),
-        24 => SpriteCell::new(8, 10),
-        25 => SpriteCell::new(1, 3),
-        26..=27 => SpriteCell::new(tile - 24, 3),
-        28..=31 => SpriteCell::new(tile - 24, 3),
-        32 => SpriteCell::new(0, 4),
-        33..=37 => SpriteCell::new(tile - 32, 4),
-        38..=39 => SpriteCell::new(tile - 32, 4),
-        _ => SpriteCell::new(0, 0),
+/// Maps one Terminal display scanline to its retained FIXED.DAT source row.
+fn terminal_source_row(frame: u8, destination_row: u8) -> u8 {
+    // The initial tile exposes rows two through nine. After its first scroll,
+    // the seven-line pattern in source rows three through nine rotates upward
+    // and repeats its new top row in the eighth display scanline. This literal
+    // mapping reproduces all seven historical terminal pictures from FIXED.DAT.
+    debug_assert!((2..=9).contains(&destination_row));
+    let phase = frame % 7;
+    if phase == 0 {
+        return destination_row;
     }
-}
-
-/// Converts an animation frame to a forward-then-back strip index.
-fn ping_pong(frame: u8, frame_count: u8) -> u8 {
-    // A one-frame strip is stable. Larger strips have a period that does not
-    // duplicate their two endpoints when reversing direction.
-    if frame_count <= 1 {
-        return 0;
-    }
-    let period = frame_count * 2 - 2;
-    let phase = frame % period;
-    if phase < frame_count {
-        phase
-    } else {
-        period - phase
-    }
+    3 + (destination_row - 2 + phase - 1) % 7
 }
 
 /// Returns the sub-cell pixel offset implied by a movement animation.
@@ -1241,10 +1206,10 @@ mod tests {
     //! Pure mapping and decoding tests that do not initialize SDL video.
 
     use super::{
-        ATLAS_COLUMNS, ATLAS_ROWS, BlackPixelPolicy, CHARS8_PNG, MOVING_PNG, ROCKS_SP_PNG,
-        apply_black_pixel_policy, bug_sprite, decode_png, electron_sprite_part,
-        gravity_sprite_part, infotron_moving_sprite, murphy_movement_offset, ping_pong,
-        snik_snak_sprite_part, static_sprite, zonk_moving_sprite,
+        BlackPixelPolicy, CHARS8_PNG, FIXED_PNG, FIXED_TILE_COUNT, FIXED_TILE_SIZE, MOVING_PNG,
+        SourcePoint, animated_cell_sprite_part, apply_black_pixel_policy, decode_png,
+        electron_sprite_part, fixed_tile_source, gravity_sprite_part, murphy_movement_offset,
+        snik_snak_sprite_part, terminal_source_row,
     };
     use crate::actor::{
         Actor, AnimationKind, Direction, EnemyTurn, Infotron, MurphyAnimation, MurphyMoveTarget,
@@ -1254,13 +1219,38 @@ mod tests {
     /// Confirms all embedded resources decode to their contracted RGBA sizes.
     #[test]
     fn embedded_render_assets_are_valid_rgba_pngs() {
-        let sprites = decode_png(ROCKS_SP_PNG).expect("sprite atlas should decode");
+        let fixed = decode_png(FIXED_PNG).expect("original fixed strip should decode");
         let moving = decode_png(MOVING_PNG).expect("original moving sheet should decode");
         let font = decode_png(CHARS8_PNG).expect("font should decode");
 
-        assert_eq!((sprites.width, sprites.height), (512, 480));
+        assert_eq!((fixed.width, fixed.height), (640, 16));
         assert_eq!((moving.width, moving.height), (320, 462));
         assert_eq!((font.width, font.height), (512, 8));
+    }
+
+    /// Confirms Terminal phases reconstruct the original seven-picture row cycle.
+    #[test]
+    fn terminal_scroll_frames_use_fixed_display_scanlines() {
+        let frames = (0..7)
+            .map(|frame| {
+                (2..=9)
+                    .map(|row| terminal_source_row(frame, row))
+                    .collect::<Vec<_>>()
+            })
+            .collect::<Vec<_>>();
+
+        assert_eq!(
+            frames,
+            vec![
+                vec![2, 3, 4, 5, 6, 7, 8, 9],
+                vec![3, 4, 5, 6, 7, 8, 9, 3],
+                vec![4, 5, 6, 7, 8, 9, 3, 4],
+                vec![5, 6, 7, 8, 9, 3, 4, 5],
+                vec![6, 7, 8, 9, 3, 4, 5, 6],
+                vec![7, 8, 9, 3, 4, 5, 6, 7],
+                vec![8, 9, 3, 4, 5, 6, 7, 8],
+            ]
+        );
     }
 
     /// Confirms opaque DOS copies and transparent overlays treat black differently.
@@ -1271,7 +1261,7 @@ mod tests {
         let mut transparent = source;
 
         // Opaque moving frames use black to erase the previously drawn target,
-        // while overlay atlases discard only pure black and retain colored alpha.
+        // while overlay textures discard only pure black and retain colored alpha.
         apply_black_pixel_policy(&mut opaque, BlackPixelPolicy::Opaque);
         apply_black_pixel_policy(&mut transparent, BlackPixelPolicy::Transparent);
 
@@ -1330,25 +1320,23 @@ mod tests {
         }
     }
 
-    /// Confirms every serialized tile maps inside the 16×15 atlas grid.
+    /// Confirms every visible serialized tile maps directly inside FIXED.DAT.
     #[test]
-    fn every_static_tile_mapping_stays_inside_atlas() {
-        for tile in 0..=40 {
-            let sprite = static_sprite(tile);
-            assert!(
-                sprite.column < ATLAS_COLUMNS,
-                "tile {tile} column escaped atlas"
-            );
-            assert!(sprite.row < ATLAS_ROWS, "tile {tile} row escaped atlas");
+    fn every_static_tile_mapping_stays_inside_fixed_strip() {
+        for tile in 0..FIXED_TILE_COUNT {
+            let source = fixed_tile_source(tile);
+
+            assert_eq!(source.x(), i32::from(tile) * FIXED_TILE_SIZE as i32);
+            assert_eq!(source.y(), 0);
+            assert_eq!(source.width(), FIXED_TILE_SIZE);
+            assert_eq!(source.height(), FIXED_TILE_SIZE);
+            assert!(source.right() <= 640, "tile {tile} escaped FIXED.DAT");
         }
-    }
 
-    /// Confirms cyclic frame selection reverses without duplicating endpoints.
-    #[test]
-    fn ping_pong_frames_return_to_the_start() {
-        let frames = (0..8).map(|frame| ping_pong(frame, 4)).collect::<Vec<_>>();
-
-        assert_eq!(frames, vec![0, 1, 2, 3, 2, 1, 0, 1]);
+        // Invisible Wall and malformed codes deliberately fall back to Space;
+        // neither may address a nonexistent forty-first source tile.
+        assert_eq!(fixed_tile_source(40), fixed_tile_source(0));
+        assert_eq!(fixed_tile_source(u8::MAX), fixed_tile_source(0));
     }
 
     /// Confirms chained movement advances on frame zero instead of pausing at a tile boundary.
@@ -1427,49 +1415,81 @@ mod tests {
     /// Confirms every non-negative Bug state follows the original coordinate table.
     #[test]
     fn bug_frames_follow_the_original_spark_and_base_sequence() {
-        let active = (0..14).map(bug_sprite).collect::<Vec<_>>();
+        let active = (0..14)
+            .map(|frame| {
+                animated_cell_sprite_part(AnimationKind::Bug, frame)
+                    .expect("active Bug frame should map")
+                    .source
+            })
+            .collect::<Vec<_>>();
 
         assert_eq!(
             active,
             vec![
-                static_sprite(25),
-                super::SpriteCell::new(8, 6),
-                super::SpriteCell::new(9, 6),
-                super::SpriteCell::new(10, 6),
-                super::SpriteCell::new(11, 6),
-                super::SpriteCell::new(10, 6),
-                super::SpriteCell::new(9, 6),
-                super::SpriteCell::new(10, 6),
-                super::SpriteCell::new(11, 6),
-                super::SpriteCell::new(10, 6),
-                super::SpriteCell::new(9, 6),
-                super::SpriteCell::new(8, 6),
-                static_sprite(25),
-                static_sprite(2),
+                SourcePoint { x: 304, y: 100 },
+                SourcePoint { x: 256, y: 196 },
+                SourcePoint { x: 272, y: 196 },
+                SourcePoint { x: 288, y: 196 },
+                SourcePoint { x: 304, y: 196 },
+                SourcePoint { x: 288, y: 196 },
+                SourcePoint { x: 272, y: 196 },
+                SourcePoint { x: 288, y: 196 },
+                SourcePoint { x: 304, y: 196 },
+                SourcePoint { x: 288, y: 196 },
+                SourcePoint { x: 272, y: 196 },
+                SourcePoint { x: 256, y: 196 },
+                SourcePoint { x: 304, y: 100 },
+                SourcePoint { x: 304, y: 64 },
             ]
         );
     }
 
-    /// Confirms horizontal rolling follows the direction metadata of each strip.
+    /// Confirms regular and Electron explosions use adjacent original MOVING.DAT strips.
     #[test]
-    fn rolling_frames_reverse_between_left_and_right_motion() {
-        let zonk_left = (0..4)
-            .map(|frame| zonk_moving_sprite(Direction::Left, frame).column)
+    fn explosion_frames_use_literal_moving_coordinates() {
+        let regular = (0..8)
+            .map(|frame| {
+                animated_cell_sprite_part(AnimationKind::Explosion, frame)
+                    .expect("regular explosion frame should map")
+                    .source
+            })
             .collect::<Vec<_>>();
-        let zonk_right = (0..4)
-            .map(|frame| zonk_moving_sprite(Direction::Right, frame).column)
-            .collect::<Vec<_>>();
-        let infotron_left = (0..4)
-            .map(|frame| infotron_moving_sprite(Direction::Left, frame).column)
-            .collect::<Vec<_>>();
-        let infotron_right = (0..4)
-            .map(|frame| infotron_moving_sprite(Direction::Right, frame).column)
+        let electron = (0..8)
+            .map(|frame| {
+                animated_cell_sprite_part(AnimationKind::ElectronExplosion, frame)
+                    .expect("Electron explosion frame should map")
+                    .source
+            })
             .collect::<Vec<_>>();
 
-        assert_eq!(zonk_left, vec![3, 2, 1, 0]);
-        assert_eq!(zonk_right, vec![1, 2, 3, 0]);
-        assert_eq!(infotron_left, vec![8, 10, 12, 14]);
-        assert_eq!(infotron_right, vec![14, 12, 10, 8]);
+        // Both families occupy y=196 and advance by one original 16-pixel tile;
+        // the Infotron-producing family begins immediately after the regular one.
+        assert_eq!(regular.first(), Some(&SourcePoint { x: 0, y: 196 }));
+        assert_eq!(regular.last(), Some(&SourcePoint { x: 112, y: 196 }));
+        assert_eq!(electron.first(), Some(&SourcePoint { x: 128, y: 196 }));
+        assert_eq!(electron.last(), Some(&SourcePoint { x: 240, y: 196 }));
+    }
+
+    /// Confirms horizontal rolls use literal MOVING.DAT direction strips.
+    #[test]
+    fn rolling_frames_select_original_source_rows() {
+        let zonk = Actor::Zonk(Zonk::resting());
+        let infotron = Actor::Infotron(Infotron::resting());
+        let zonk_left = gravity_sprite_part(&zonk, AnimationKind::Rolling(Direction::Left), 3)
+            .expect("left Zonk roll should map");
+        let zonk_right = gravity_sprite_part(&zonk, AnimationKind::Rolling(Direction::Right), 3)
+            .expect("right Zonk roll should map");
+        let infotron_left =
+            gravity_sprite_part(&infotron, AnimationKind::Rolling(Direction::Left), 4)
+                .expect("left Infotron roll should map");
+        let infotron_right =
+            gravity_sprite_part(&infotron, AnimationKind::Rolling(Direction::Right), 4)
+                .expect("right Infotron roll should map");
+
+        assert_eq!(zonk_left.source, SourcePoint { x: 96, y: 84 });
+        assert_eq!(zonk_right.source, SourcePoint { x: 96, y: 100 });
+        assert_eq!(infotron_left.source, SourcePoint { x: 8, y: 164 });
+        assert_eq!(infotron_right.source, SourcePoint { x: 128, y: 180 });
     }
 
     /// Confirms falling actors use the original two-pixel gravity increments.

@@ -2,7 +2,8 @@
 
 This project plays the 111 original Supaplex levels in SDL2. It loads the
 bundled DOS `LEVELS.DAT`, simulates actor-owned animation and behavior, and
-renders the supplied `RocksSP.png` sprite atlas with nearest-neighbor scaling.
+renders pixel-perfect conversions of the original `FIXED.DAT`, `MOVING.DAT`,
+and `CHARS8.DAT` assets with nearest-neighbor scaling.
 
 ## Run a level
 
@@ -102,8 +103,8 @@ cargo run --bin dat-to-png -- data/chars8.dat assets/chars8.png
 ```
 
 `FIXED.DAT` becomes 640×16, `MOVING.DAT` becomes 320×462, and `CHARS8.DAT`
-becomes 512×8. Gameplay uses the easier-to-map 16×15 grid of 32×32 frames in
-`RocksSP.png`; the HUD uses the converted original font.
+becomes 512×8. Gameplay addresses the original fixed tiles and variably sized
+moving descriptors directly; the HUD uses the converted original font.
 
 ## Verification
 
@@ -117,7 +118,7 @@ Tests cover the CLI range, complete record layout and metadata, row-major board
 indexing, every supplied level, actor movement and collection, gravity
 overrides, falling-object collision matrices, Red Disk planting, ordered and
 chained explosions, Bug timing/RNG, exit gating, planar and binary graphics
-decoding, PNG assets, and atlas bounds.
+decoding, PNG assets, and fixed-strip bounds.
 
 Format and mapping references:
 
