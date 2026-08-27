@@ -8,3 +8,4 @@ pub mod cli;
 pub mod dat_graphics;
 pub mod game;
 pub mod level;
+pub mod render;
