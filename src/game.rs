@@ -232,6 +232,8 @@ pub struct Game {
     tick: u64,
     /// Shared wrapping 16-bit random stream used for per-Bug cooldowns.
     random_seed: u16,
+    /// Mask applied to randomized Terminal delays before and after activation.
+    terminal_delay_mask: u8,
 }
 
 impl Game {
@@ -280,6 +282,7 @@ impl Game {
             status: GameStatus::Playing,
             tick: 0,
             random_seed,
+            terminal_delay_mask: 0x7f,
         })
     }
 
@@ -486,6 +489,26 @@ impl Game {
                         .expect("scheduled Bug position remains in bounds");
                 }
             }
+            GameEvent::RandomizeTerminal(position) => {
+                // Terminal scrolling shares the same generator as Bugs and all
+                // other original random effects.  The low byte is masked, then
+                // stored as a negative signed delay so subsequent updates count
+                // it back toward zero without consuming more random values.
+                let delay = -i8::try_from((self.next_random() as u8) & self.terminal_delay_mask)
+                    .expect("Terminal delay masks never exceed signed-byte range");
+                let Some(state) = self.board.state(position) else {
+                    return;
+                };
+                let Actor::Terminal(terminal) = state.actor() else {
+                    return;
+                };
+                self.board
+                    .set(
+                        position,
+                        State::new(Actor::Terminal(terminal.after_scroll(delay))),
+                    )
+                    .expect("scheduled Terminal position remains in bounds");
+            }
         }
     }
 
@@ -497,9 +520,13 @@ impl Game {
 
     /// Expands every idle Yellow Disk into a normal 3×3 explosion immediately.
     fn detonate_yellow_disks(&mut self) {
-        // The original latch is level-wide: touching any panel consumes every
-        // other panel as well. Persist that fact in each Terminal actor so a
-        // later interaction cannot detonate disks skipped while they moved.
+        // Activating any panel shortens every panel's future randomized wait
+        // from a 0x7f mask to a 0x07 mask.  This global timing change is part of
+        // the original effect and also changes when the shared RNG is consumed.
+        self.terminal_delay_mask = 7;
+
+        // The detonation latch is level-wide.  Preserve each panel's independent
+        // signed counter and screen frame while marking every panel as consumed.
         let terminal_positions = self
             .board
             .cells()
@@ -512,8 +539,12 @@ impl Game {
             })
             .collect::<Vec<_>>();
         for position in terminal_positions {
+            let terminal = match self.board.state(position).map(State::actor) {
+                Some(Actor::Terminal(terminal)) => terminal.activate(),
+                _ => continue,
+            };
             self.board
-                .set(position, State::new(Actor::Terminal(Terminal::activated())))
+                .set(position, State::new(Actor::Terminal(terminal)))
                 .expect("enumerated Terminal position must remain in bounds");
         }
 
@@ -879,6 +910,7 @@ mod tests {
             status: GameStatus::Playing,
             tick: 0,
             random_seed: 0,
+            terminal_delay_mask: 0x7f,
         }
     }
 
@@ -2252,6 +2284,85 @@ mod tests {
 
         assert!(matches!(actor_at(&game, 4, 3), Actor::Explosion(_)));
         assert!(matches!(actor_at(&game, 3, 3), Actor::Explosion(_)));
+    }
+
+    /// Confirms Terminal scrolling waits on a signed counter between RNG draws.
+    #[test]
+    fn terminal_scrolls_with_original_randomized_signed_delay() {
+        let terminal_position = Position::new(2, 2);
+        let mut game = game_with(
+            &[
+                (
+                    Position::new(1, 4),
+                    State::new(Actor::Murphy(Murphy::new())),
+                ),
+                (
+                    terminal_position,
+                    State::new(Actor::Terminal(Terminal::new())),
+                ),
+            ],
+            0,
+        );
+
+        // Seed zero advances to 49 and returns 24.  With the initial 0x7f
+        // mask, the Terminal therefore stores -24 after its first scroll.
+        game.tick(Input::default());
+        let Actor::Terminal(terminal) = actor_at(&game, 2, 2) else {
+            panic!("terminal should remain in place after scrolling");
+        };
+        assert_eq!(terminal.screen_frame(), 1);
+        assert_eq!(game.random_seed, 49);
+
+        // Twenty-four increments reach zero without consuming the generator.
+        for _ in 0..24 {
+            game.tick(Input::default());
+        }
+        assert_eq!(game.random_seed, 49);
+
+        // The following update increments zero to one, scrolls, and draws the
+        // next value from the same stream that later Bugs will consume.
+        game.tick(Input::default());
+        let Actor::Terminal(terminal) = actor_at(&game, 2, 2) else {
+            panic!("terminal should remain in place after its second scroll");
+        };
+        assert_eq!(terminal.screen_frame(), 2);
+        assert_ne!(game.random_seed, 49);
+    }
+
+    /// Confirms activation shortens future Terminal waits without resetting them.
+    #[test]
+    fn terminal_activation_uses_the_post_detonation_delay_mask() {
+        let mut game = game_with(
+            &[
+                (
+                    Position::new(1, 2),
+                    State::new(Actor::Murphy(Murphy::new())),
+                ),
+                (
+                    Position::new(2, 2),
+                    State::new(Actor::Terminal(Terminal::new())),
+                ),
+            ],
+            0,
+        );
+
+        game.tick(Input {
+            direction: Some(Direction::Right),
+            ..Input::default()
+        });
+        assert_eq!(game.terminal_delay_mask, 7);
+
+        // The first generated value is 24; masking it with seven produces zero,
+        // so the activated panel is immediately eligible again next update.
+        let Actor::Terminal(first) = actor_at(&game, 2, 2) else {
+            panic!("activated terminal should remain in place");
+        };
+        assert_eq!(first.screen_frame(), 1);
+        game.tick(Input::default());
+        let Actor::Terminal(second) = actor_at(&game, 2, 2) else {
+            panic!("activated terminal should continue scrolling");
+        };
+        assert_eq!(second.screen_frame(), 2);
     }
 
     /// Confirms a touched explosive actor contributes its own 3×3 chain wave.

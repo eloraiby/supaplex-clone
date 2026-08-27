@@ -118,7 +118,7 @@ pub enum AnimationKind {
     SnikSnak,
     /// The cyclic spark frames of an Electron.
     Electron,
-    /// The cyclic screen frames of a Terminal.
+    /// The current retained scroll frame of a Terminal screen.
     Terminal,
     /// A Red Disk counting down before it explodes.
     RedDiskFuse,
@@ -141,8 +141,6 @@ enum AnimationNext {
     BeginZonkFall,
     /// Give completed movement back to Murphy, settling if there is no input.
     ResumeMurphy,
-    /// Restart the same cyclic animation from frame zero.
-    Repeat,
     /// Ask the game session to choose this Bug's next dormant duration.
     RandomizeBug,
     /// Return a dormant Bug to lethal active frame zero.
@@ -271,13 +269,18 @@ impl Animation {
         }
     }
 
-    /// Creates a purely visual cycle that starts again after its last frame.
-    fn repeating(kind: AnimationKind, frame_count: u8) -> Self {
+    /// Creates the passive visual state for one Terminal screen offset.
+    ///
+    /// Terminal scrolling is scheduled by the actor's signed delay rather than
+    /// by animation completion.  Keeping the currently displayed screen in an
+    /// `Animation` still gives the renderer one validated frame without making
+    /// the generic animation engine advance it every simulation tick.
+    fn terminal(frame: u8) -> Self {
         Self {
-            kind,
-            frame: 0,
-            frame_count,
-            next: AnimationNext::Repeat,
+            kind: AnimationKind::Terminal,
+            frame: frame % 7,
+            frame_count: 7,
+            next: AnimationNext::Act,
         }
     }
 
@@ -392,7 +395,7 @@ impl Animation {
     fn advance(&self) -> AnimationAdvance {
         // Idle is a stable state rather than a finite animation; actors in this
         // state are allowed to inspect their neighbors and choose new behavior.
-        if self.kind == AnimationKind::Idle {
+        if matches!(self.kind, AnimationKind::Idle | AnimationKind::Terminal) {
             return AnimationAdvance::Ready;
         }
 
@@ -403,13 +406,6 @@ impl Animation {
         } else {
             AnimationAdvance::Finished(self.next)
         }
-    }
-
-    /// Rewinds a cyclic animation while preserving its validated metadata.
-    fn restarted(&self) -> Self {
-        let mut animation = self.clone();
-        animation.frame = 0;
-        animation
     }
 }
 
@@ -826,7 +822,9 @@ impl Murphy {
                         position,
                         State::animated(murphy_actor, Animation::snapping(direction)),
                     ),
-                    CellWrite::new(target, State::new(Actor::Terminal(Terminal::activated()))),
+                    // Preserve this panel's independently randomized wait and
+                    // visible scroll phase when the level-wide latch is set.
+                    CellWrite::new(target, State::new(Actor::Terminal(terminal.activate()))),
                 ],
                 vec![GameEvent::ActivateTerminal],
             )),
@@ -1216,22 +1214,36 @@ impl YellowDisk {
     }
 }
 
-/// Computer terminal whose first interaction detonates idle Yellow Disks.
+/// Computer terminal with an independently delayed scrolling display.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct Terminal {
     /// Whether Murphy has already used this panel during the current level.
     activated: bool,
+    /// Signed original-style counter incremented once per simulation update.
+    delay: i8,
+    /// Repacked atlas frame representing the screen's current scroll offset.
+    screen_frame: u8,
 }
 
 impl Terminal {
-    /// Creates a panel that has not yet emitted its one detonation event.
+    /// Creates an unused panel ready to choose its first randomized delay.
     pub const fn new() -> Self {
-        Self { activated: false }
+        Self {
+            activated: false,
+            delay: 0,
+            screen_frame: 0,
+        }
     }
 
-    /// Creates the persistent post-use form written by Murphy's interaction.
-    pub(crate) const fn activated() -> Self {
-        Self { activated: true }
+    /// Returns a copy with the level-wide Yellow Disk latch marked as consumed.
+    ///
+    /// Activating a terminal must not reset its randomized delay or its current
+    /// screen offset; the original panel continues scrolling after detonation.
+    pub(crate) const fn activate(self) -> Self {
+        Self {
+            activated: true,
+            ..self
+        }
     }
 
     /// Reports whether this panel has already been used.
@@ -1239,9 +1251,45 @@ impl Terminal {
         self.activated
     }
 
-    /// Has no physical behavior; Murphy owns the one-shot interaction event.
-    fn transition(&self, _position: Position, _world: &WorldView<'_>) -> Option<Transition> {
-        None
+    /// Returns the current atlas frame of the scrolling screen.
+    pub const fn screen_frame(self) -> u8 {
+        self.screen_frame
+    }
+
+    /// Replaces the signed delay and advances the displayed scroll position.
+    ///
+    /// The game owns the shared pseudo-random stream, so the actor requests a
+    /// randomized value through an event and receives the resulting state in a
+    /// single row-ordered write.
+    pub(crate) const fn after_scroll(self, delay: i8) -> Self {
+        Self {
+            delay,
+            screen_frame: (self.screen_frame + 1) % 7,
+            ..self
+        }
+    }
+
+    /// Advances the original signed wait counter or requests one screen scroll.
+    fn transition(&self, position: Position, _world: &WorldView<'_>) -> Option<Transition> {
+        // The original byte is interpreted as signed and incremented before it
+        // is tested.  Negative and zero results continue waiting; a positive
+        // result consumes the shared RNG and scrolls the terminal once.
+        let next_delay = self.delay.wrapping_add(1);
+        if next_delay <= 0 {
+            let terminal = Self {
+                delay: next_delay,
+                ..*self
+            };
+            return Some(Transition::replace(
+                position,
+                State::new(Actor::Terminal(terminal)),
+            ));
+        }
+
+        Some(Transition::new(
+            Vec::new(),
+            vec![GameEvent::RandomizeTerminal(position)],
+        ))
     }
 }
 
@@ -1443,7 +1491,7 @@ impl Actor {
         }
 
         // Animations advance before actor decisions. Their terminal action may
-        // settle, repeat, explode, or explicitly hand control back to the actor.
+        // settle, explode, or explicitly hand control back to the actor.
         match state.animation.advance() {
             AnimationAdvance::Frame(animation) => {
                 return Some(Transition::replace(
@@ -1453,12 +1501,6 @@ impl Actor {
             }
             AnimationAdvance::Finished(AnimationNext::Settle) => {
                 return Some(self.settle(position, state, world));
-            }
-            AnimationAdvance::Finished(AnimationNext::Repeat) => {
-                return Some(Transition::replace(
-                    position,
-                    State::animated(self.clone(), state.animation.restarted()),
-                ));
             }
             AnimationAdvance::Finished(AnimationNext::BeginZonkFall) => {
                 let Self::Zonk(zonk) = self else {
@@ -1562,7 +1604,7 @@ impl Actor {
             Self::SnikSnak(_) => Animation::cycle_then_act(AnimationKind::SnikSnak, 4),
             Self::Electron(_) => Animation::cycle_then_act(AnimationKind::Electron, 8),
             Self::Bug(_) => Animation::bug_active(),
-            Self::Terminal(_) => Animation::repeating(AnimationKind::Terminal, 7),
+            Self::Terminal(terminal) => Animation::terminal(terminal.screen_frame),
             Self::Explosion(explosion) => Animation::explosion(explosion.residue),
             _ => Animation::idle(),
         }
@@ -1806,6 +1848,8 @@ pub(crate) enum GameEvent {
     ActivateTerminal,
     /// Consume the shared RNG stream and schedule one Bug's safe interval.
     RandomizeBug(Position),
+    /// Consume the shared RNG stream and schedule one Terminal screen scroll.
+    RandomizeTerminal(Position),
 }
 
 /// Atomic multi-cell change applied immediately during the linear update pass.
