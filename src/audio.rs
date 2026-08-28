@@ -47,8 +47,19 @@ const EMPTY_COMMAND_SLOT: u8 = 0;
 
 /// Owns the live SDL playback device and its callback mixer.
 pub struct AudioPlayer {
-    /// Live SDL callback device, mutated only during final shutdown.
-    device: AudioDevice<Mixer>,
+    /// Live SDL callback device taken and closed explicitly by [`Self::drop`].
+    ///
+    /// The option is populated throughout normal playback. Its empty state
+    /// exists only while destruction is already in progress, allowing `Drop`
+    /// to move the device out and close it before releasing other fields.
+    device: Option<AudioDevice<Mixer>>,
+    /// Independent handle keeping SDL audio initialized through device closure.
+    ///
+    /// `AudioDevice` internally declares its subsystem handle before its device
+    /// identifier. If that internal handle is the last one, its generated field
+    /// destruction calls `SDL_QuitSubSystem` before `SDL_CloseAudioDevice`.
+    /// Retaining this second handle prevents that invalid backend teardown order.
+    _subsystem_guard: AudioSubsystem,
     /// Non-waiting producer for ordered callback operations.
     command_sender: AudioCommandSender,
     /// Atomic request that makes subsequent callbacks return immediate silence.
@@ -73,6 +84,10 @@ impl AudioPlayer {
         let (command_sender, command_receiver) = audio_command_channel();
         let stop_requested = Arc::new(AtomicBool::new(false));
         let mixer_stop_requested = Arc::clone(&stop_requested);
+        // The returned player must retain a handle separate from the one owned
+        // inside `AudioDevice`. `Drop` then closes the device explicitly while
+        // this guard still keeps the backend initialized, including on errors.
+        let subsystem_guard = subsystem.clone();
         let desired = AudioSpecDesired {
             freq: Some(OUTPUT_FREQUENCY),
             channels: Some(OUTPUT_CHANNELS),
@@ -88,7 +103,8 @@ impl AudioPlayer {
         // Resume only after the fully initialized handle is ready to return.
         device.resume();
         Ok(Self {
-            device,
+            device: Some(device),
+            _subsystem_guard: subsystem_guard,
             command_sender,
             stop_requested,
             music_enabled: true,
@@ -166,15 +182,12 @@ impl AudioPlayer {
         self.queue_command(AudioCommand::RestartLevel);
     }
 
-    /// Requests immediate callback silence and lets SDL close the device once.
+    /// Consumes the player and performs its ordered synchronous destruction.
     pub fn shutdown(self) {
-        // The callback checks this atomic before touching commands or synthesis.
-        // Dropping the device invokes SDL's single close operation, which waits
-        // only for a finite callback already in progress. An explicit pause and
-        // guessed sleep are deliberately absent: pause adds a second synchronous
-        // backend transition and caused the restart-then-Escape deadlock.
-        self.stop_requested.store(true, Ordering::Release);
-        drop(self.device);
+        // `Drop` requests callback silence, takes and closes the device while its
+        // subsystem guard remains live, then releases the remaining fields. This
+        // call makes that same sequence explicit at every normal application exit.
+        drop(self);
     }
 
     /// Offers one operation without ever waiting for the audio callback.
@@ -183,6 +196,23 @@ impl AudioPlayer {
         // Dropping that excess request keeps input and shutdown responsive; the
         // ordinary restart/Explosion pair occupies only two of 256 slots.
         let _accepted = self.command_sender.send(command);
+    }
+}
+
+impl Drop for AudioPlayer {
+    /// Makes every destruction path quiesce the callback before device closure.
+    fn drop(&mut self) {
+        // Errors can leave the application after audio initialization without
+        // reaching `shutdown`. Publishing the same terminal flag here gives
+        // implicit and explicit destruction identical callback behavior.
+        self.stop_requested.store(true, Ordering::Release);
+
+        // Taking the device closes it here, while `_subsystem_guard` is still a
+        // live field. Only after this method returns does Rust release that
+        // guard and permit SDL to quit the audio subsystem.
+        if let Some(device) = self.device.take() {
+            drop(device);
+        }
     }
 }
 
