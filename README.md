@@ -100,9 +100,9 @@ real PNG header and compressed image stream.
 The committed files in `assets/` can be reproduced with:
 
 ```bash
-cargo run --bin dat-to-png -- data/fixed.dat assets/fixed.png
-cargo run --bin dat-to-png -- data/moving.dat assets/moving.png
-cargo run --bin dat-to-png -- data/chars8.dat assets/chars8.png
+cargo run --bin dat-to-png -- data/fixed.dat assets/gfx/fixed.png
+cargo run --bin dat-to-png -- data/moving.dat assets/gfx/moving.png
+cargo run --bin dat-to-png -- data/chars8.dat assets/gfx/chars8.png
 ```
 
 `FIXED.DAT` becomes 640×16, `MOVING.DAT` becomes 320×462, and `CHARS8.DAT`

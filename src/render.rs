@@ -49,13 +49,13 @@ const FONT_SCALE: u32 = 2;
 const FONT_GLYPHS: u8 = 64;
 
 /// Pixel-perfect conversion of the original `FIXED.DAT` tile strip.
-const FIXED_PNG: &[u8] = include_bytes!("../assets/fixed.png");
+const FIXED_PNG: &[u8] = include_bytes!("../assets/gfx/fixed.png");
 
 /// Font converted from the original headerless `CHARS8.DAT` file.
-const CHARS8_PNG: &[u8] = include_bytes!("../assets/chars8.png");
+const CHARS8_PNG: &[u8] = include_bytes!("../assets/gfx/chars8.png");
 
 /// Pixel-perfect conversion of the original `MOVING.DAT` sprite sheet.
-const MOVING_PNG: &[u8] = include_bytes!("../assets/moving.png");
+const MOVING_PNG: &[u8] = include_bytes!("../assets/gfx/moving.png");
 
 /// Integer enlargement from original 16-pixel tiles to the 32-pixel board.
 const MOVING_SCALE: u32 = 2;
@@ -117,7 +117,7 @@ impl<'textures> Renderer<'textures> {
             FIXED_PNG,
             640,
             16,
-            "assets/fixed.png",
+            "assets/gfx/fixed.png",
             BlackPixelPolicy::Opaque,
         )?;
         let moving = load_texture(
@@ -125,7 +125,7 @@ impl<'textures> Renderer<'textures> {
             MOVING_PNG,
             320,
             462,
-            "assets/moving.png",
+            "assets/gfx/moving.png",
             BlackPixelPolicy::Opaque,
         )?;
         let font = load_texture(
@@ -133,7 +133,7 @@ impl<'textures> Renderer<'textures> {
             CHARS8_PNG,
             512,
             8,
-            "assets/chars8.png",
+            "assets/gfx/chars8.png",
             BlackPixelPolicy::Transparent,
         )?;
 
