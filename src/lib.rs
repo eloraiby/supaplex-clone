@@ -7,7 +7,6 @@ pub mod actor;
 pub mod assets;
 pub mod audio;
 pub mod cli;
-pub mod dat_graphics;
 pub mod demo;
 pub mod frontend;
 pub mod game;

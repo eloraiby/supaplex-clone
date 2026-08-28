@@ -133,45 +133,24 @@ level progression and three-skip limit. The supplied legacy demos decode their
 original run-length input at fixed-step boundaries and use the deterministic
 zero seed expected by their standalone format.
 
-## Original data and PNG conversion
+## Runtime assets
 
-The graphics `.DAT` files are not PNG streams with only a missing signature.
-They are headerless DOS bitmaps: gameplay sheets use four MSB-first bitplanes,
-fonts use one bit per pixel, and dimensions live outside each file. The
-`dat-to-png` utility decodes those planes with `PALETTES.DAT` and then writes a
-real PNG header and compressed image stream.
+The repository keeps only the files consumed by the game, grouped under one
+distribution root:
 
-The committed files in `assets/gfx/` can be reproduced with:
+- `assets/data/` contains the original level collection and demonstration inputs.
+- `assets/gfx/` contains playback-ready RGBA PNG sheets and screens.
+- `assets/audio/` contains the XM arrangement and playback-ready WAV effects.
 
-```bash
-cargo run --bin dat-to-png -- data/fixed.dat assets/gfx/fixed.png
-cargo run --bin dat-to-png -- data/moving.dat assets/gfx/moving.png
-cargo run --bin dat-to-png -- data/chars8.dat assets/gfx/chars8.png
-cargo run --bin dat-to-png -- data/chars6.dat assets/gfx/chars6.png
-cargo run --bin dat-to-png -- data/title.dat assets/gfx/title.png
-cargo run --bin dat-to-png -- data/menu.dat assets/gfx/menu.png
-cargo run --bin dat-to-png -- data/gfx.dat assets/gfx/gfx.png
-cargo run --bin dat-to-png -- data/controls.dat assets/gfx/controls.png
-cargo run --bin dat-to-png -- data/back.dat assets/gfx/back.png
-cargo run --bin dat-to-png -- data/panel.dat assets/gfx/panel.png
-```
-
-`FIXED.DAT` becomes 640×16, `MOVING.DAT` becomes 320×462, both font strips
-become 512×8, all front-end pictures become 320×200, and `PANEL.DAT` becomes
-320×24. Gameplay addresses the original fixed tiles and variably sized
-moving descriptors directly. The title conversion uses the special palette
-stored in the original executable; the menu, GFX tutor, and panel use gameplay
-palette 1, the controls use palette 2, and the information background uses
-palette 0.
-
-The WAV files in `assets/audio/` are playback-ready renders of the supplied DOS
-Sound Blaster effects. The music remains the original compact XM arrangement;
-the in-tree tracker player decodes its delta-compressed samples and sequences
-the four channels directly in SDL's callback. Effects retain the original
-one-channel priority rules, while music loops independently and pauses when the
-Exit sound is accepted. The default build embeds both asset groups; `unbundle`
-reads them from the same paths instead. Playback requires only SDL2, not
-SDL2_mixer.
+The one-time DOS graphics and sound conversion inputs are intentionally not
+shipped with the runtime tree. Gameplay still addresses the original fixed-tile
+layout and variably sized moving descriptors within the converted PNG sheets.
+The in-tree tracker player decodes the XM module's delta-compressed samples and
+sequences its four channels directly in SDL's callback. Effects retain the
+original one-channel priority rules, while music loops independently and pauses
+when the Exit sound is accepted. The default build embeds the complete asset
+tree; `unbundle` reads the same files from disk. Playback requires only SDL2,
+not SDL2_mixer.
 
 ## Verification
 
@@ -184,12 +163,11 @@ RUSTDOCFLAGS="-D warnings" cargo doc --no-deps
 Tests cover the CLI range, complete record layout and metadata, row-major board
 indexing, every supplied level, actor movement and collection, gravity
 overrides, falling-object collision matrices, Red Disk planting, ordered and
-chained explosions, Bug timing/RNG, exit gating, planar and binary graphics
-decoding, PNG assets, audio event timing, effect priorities, WAV decoding, XM
-parsing and playback, and fixed-strip bounds.
+chained explosions, Bug timing/RNG, exit gating, PNG asset validation, audio
+event timing, effect priorities, WAV decoding, XM parsing and playback, and
+fixed-strip bounds.
 
 Format and mapping references:
 
 - [Historical Supaplex file formats](https://www.elmerproductions.com/sp/filefmt.html)
 - [OpenSupaplex tile and level definitions](https://github.com/sergiou87/open-supaplex/blob/master/src/globals.h)
-- [Superplexed planar graphics decoder](https://github.com/kaimitai/superplexed)

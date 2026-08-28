@@ -1,10 +1,9 @@
 //! SDL audio-device ownership, original AdLib music, and Sound Blaster effects.
 //!
-//! The DOS `.snd` files supplied in `data/` contain executable driver code, so
-//! they cannot be queued as PCM. This module loads WAV renders of their seven
-//! gameplay effects from the configured asset source, converts those short
-//! clips to the opened-device format, and mixes them with an in-tree player for
-//! the original XM arrangement in SDL's real-time callback.
+//! This module loads the seven playback-ready WAV effects from the configured
+//! asset source, converts those short clips to the opened-device format, and
+//! mixes them with an in-tree player for the original XM arrangement in SDL's
+//! real-time callback.
 
 use sdl2::{
     AudioSubsystem,
