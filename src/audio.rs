@@ -85,6 +85,27 @@ impl AudioPlayer {
         mixer.effects_enabled
     }
 
+    /// Sets gameplay-effect playback explicitly and returns the retained state.
+    pub fn set_effects_enabled(&mut self, enabled: bool) -> bool {
+        // Explicit setters let the original hardware buttons choose coherent
+        // music/effect combinations without depending on a previous toggle.
+        let mut mixer = self.device.lock();
+        mixer.effects_enabled = enabled;
+        if !enabled {
+            mixer.effect_voice = None;
+            mixer.current_priority = 0;
+            mixer.priority_frames_remaining = 0;
+        }
+        mixer.effects_enabled
+    }
+
+    /// Returns whether gameplay effects currently accept new requests.
+    pub fn effects_enabled(&mut self) -> bool {
+        // SDL serializes this short read with its callback so the controls
+        // screen never displays a stale value during live playback.
+        self.device.lock().effects_enabled
+    }
+
     /// Toggles soundtrack playback and returns its new enabled state.
     pub fn toggle_music(&mut self) -> bool {
         // User muting and Exit pausing are distinct: toggling back on is an
@@ -93,6 +114,22 @@ impl AudioPlayer {
         mixer.music_enabled = !mixer.music_enabled;
         mixer.music_playing = mixer.music_enabled;
         mixer.music_enabled
+    }
+
+    /// Sets soundtrack playback explicitly and returns the retained state.
+    pub fn set_music_enabled(&mut self, enabled: bool) -> bool {
+        // The user-selected enabled flag and active playback flag change
+        // together here; only protected Exit playback may pause them separately.
+        let mut mixer = self.device.lock();
+        mixer.music_enabled = enabled;
+        mixer.music_playing = enabled;
+        mixer.music_enabled
+    }
+
+    /// Returns whether the soundtrack is enabled by the user.
+    pub fn music_enabled(&mut self) -> bool {
+        // Locking produces a callback-consistent snapshot of the mixer flag.
+        self.device.lock().music_enabled
     }
 
     /// Clears transient effects and resumes enabled music for a restarted level.

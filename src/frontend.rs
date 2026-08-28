@@ -141,6 +141,15 @@ pub enum ControlsTarget {
     Exit,
 }
 
+impl ControlsTarget {
+    /// Returns this target's original inclusive hit rectangle as an SDL-style box.
+    pub const fn original_bounds(self) -> (i32, i32, u32, u32) {
+        // The controls screen has two distinct Exit descriptors, so the shared
+        // variant returns their lower full-width area for ordinary feedback.
+        controls_descriptor(self).dimensions()
+    }
+}
+
 /// Original main-menu descriptors in the exact first-match order used by DOS.
 const MAIN_MENU_DESCRIPTORS: [(OriginalRect, MainMenuTarget); 17] = [
     (OriginalRect::new(5, 6, 157, 14), MainMenuTarget::NewPlayer),
@@ -258,6 +267,21 @@ pub fn main_menu_target_at(logical_x: i32, logical_y: i32) -> Option<MainMenuTar
         .find_map(|(bounds, target)| bounds.contains(x, y).then_some(*target))
 }
 
+/// Returns the clicked offset within the main menu's three-row player list.
+pub fn main_menu_player_row_at(logical_x: i32, logical_y: i32) -> Option<isize> {
+    // The original list handler is empty, but the rendered rows divide its
+    // 27-pixel region evenly. This makes each visible name directly selectable.
+    let (x, y) = original_screen_point(logical_x, logical_y)?;
+    if !OriginalRect::new(11, 154, 67, 180).contains(x, y) {
+        return None;
+    }
+    Some(match y {
+        154..=162 => -1,
+        163..=171 => 0,
+        _ => 1,
+    })
+}
+
 /// Returns the original controls-screen control under one logical-window point.
 pub fn controls_target_at(logical_x: i32, logical_y: i32) -> Option<ControlsTarget> {
     // Both screens share the same centered three-times transform, so only the
@@ -290,6 +314,26 @@ const fn main_menu_descriptor(target: MainMenuTarget) -> OriginalRect {
         MainMenuTarget::LevelUp => OriginalRect::new(142, 142, 306, 153),
         MainMenuTarget::LevelDown => OriginalRect::new(142, 181, 306, 192),
         MainMenuTarget::Credits => OriginalRect::new(297, 37, 312, 52),
+    }
+}
+
+/// Retrieves one representative historical rectangle for a controls target.
+const fn controls_descriptor(target: ControlsTarget) -> OriginalRect {
+    // All non-Exit actions have one descriptor. Exit uses its full-width bottom
+    // bar because it gives the clearest hover outline for both return regions.
+    match target {
+        ControlsTarget::Adlib => OriginalRect::new(12, 13, 107, 36),
+        ControlsTarget::SoundBlaster => OriginalRect::new(12, 49, 107, 72),
+        ControlsTarget::Roland => OriginalRect::new(12, 85, 107, 108),
+        ControlsTarget::Combined => OriginalRect::new(12, 121, 107, 144),
+        ControlsTarget::Internal => OriginalRect::new(132, 13, 211, 31),
+        ControlsTarget::Standard => OriginalRect::new(126, 43, 169, 54),
+        ControlsTarget::Samples => OriginalRect::new(174, 43, 217, 54),
+        ControlsTarget::Music => OriginalRect::new(132, 86, 175, 120),
+        ControlsTarget::Effects => OriginalRect::new(134, 132, 168, 152),
+        ControlsTarget::Keyboard => OriginalRect::new(201, 80, 221, 154),
+        ControlsTarget::Joystick => OriginalRect::new(233, 80, 252, 154),
+        ControlsTarget::Exit => OriginalRect::new(0, 181, 319, 199),
     }
 }
 
@@ -373,6 +417,13 @@ impl MenuSelection {
         // Retaining the validated count avoids duplicating knowledge of the
         // original 111-level collection in the event adapter.
         self.selected_level = self.level_count;
+    }
+
+    /// Selects one requested level while clamping it to the collection.
+    pub fn select(&mut self, level_number: usize) {
+        // Player-profile changes use this to jump to their next unfinished row
+        // without reconstructing or exposing the private collection bound.
+        self.selected_level = level_number.clamp(1, self.level_count);
     }
 }
 

@@ -43,11 +43,19 @@ Paths are relative to the working directory by default. Set
 `SUPAPLEX_ASSET_ROOT` to the directory containing `data/` and `assets/` when
 launching the executable from elsewhere.
 
+Player names, completion time, level results, and the selected profile are saved
+under SDL's per-user preference directory. Set `SUPAPLEX_PROFILE_PATH` to an
+exact file path for a portable installation or an isolated test session.
+
 Controls:
 
 - Any key: advance past the title splash.
+- Mouse: select every original main-menu and controls-screen button; hovered
+  controls receive a visible outline.
 - Menu arrows: select a level; `Page Up`/`Page Down` move ten levels, and
-  `Home`/`End` select the first or last level.
+  `Home`/`End` select the first or last level. `N`, `Delete`, `K`, `T`, `G`,
+  `D`, and `C` activate New Player, Delete Player, Skip Level, Statistics,
+  GFX Tutor, Demo, and Controls respectively.
 - `Enter` or `Space`: start the highlighted menu level.
 - Arrow keys: move Murphy.
 - Space + arrow: eat Base or collect an adjacent Infotron/Red Disk without
@@ -116,8 +124,10 @@ multi-way ports, special-port toggles, Bug timing, Snik Snaks, Electrons,
 Terminal/Yellow Disk detonation, single-fuse planted Red Disks, merged and
 chained 3×3 explosions, Electron-to-Infotron residue, synchronized initial Bug
 cycles with randomized per-Bug cooldowns, animated player death,
-completion, restart, and progression back to the next menu selection. The
-current scope intentionally omits persistent profiles and demos.
+completion, restart, and progression back to the next menu selection. Persistent
+twenty-slot player profiles enforce the original completed/skipped/first-open
+level progression and three-skip limit. The current scope intentionally omits
+demo playback.
 
 ## Original data and PNG conversion
 

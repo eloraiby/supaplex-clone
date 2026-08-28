@@ -19,6 +19,7 @@ use crate::{
         FONT_GRAPHICS_PATH, GFX_TUTOR_GRAPHICS_PATH, MENU_FONT_GRAPHICS_PATH, MENU_GRAPHICS_PATH,
         MOVING_GRAPHICS_PATH, PANEL_GRAPHICS_PATH, TITLE_GRAPHICS_PATH,
     },
+    frontend::{ControlsTarget, MainMenuTarget},
     game::{Game, GameStatus},
     murphy_animation::{SourcePoint, SpritePart, sprite_parts},
 };
@@ -70,6 +71,70 @@ const ORIGINAL_RED_TEXT: Color = Color::RGB(0xe0, 0x10, 0x10);
 
 /// Palette-1 color index 8 used for inactive rows and ordinary panel values.
 const ORIGINAL_BLUE_TEXT: Color = Color::RGB(0x70, 0x90, 0xe0);
+
+/// Palette-1 color index 2 used for the first unfinished playable level.
+const ORIGINAL_YELLOW_TEXT: Color = Color::RGB(0xe0, 0xe0, 0x00);
+
+/// Visual progression category assigned to one main-menu level row.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum MenuLevelStyle {
+    /// First unfinished level, available to start and shown in yellow.
+    Available,
+    /// Previously solved level, available to replay and shown in green.
+    Completed,
+    /// Unfinished suffix level, unavailable and shown in red.
+    Locked,
+    /// Level advanced with a limited skip, available to replay and shown in blue.
+    Skipped,
+}
+
+impl MenuLevelStyle {
+    /// Maps one progression category to its original palette-1 text color.
+    const fn color(self) -> Color {
+        // These are expanded directly from the menu's original palette indices
+        // 2, 4, 6, and 8 rather than invented selection-state colors.
+        match self {
+            Self::Available => ORIGINAL_YELLOW_TEXT,
+            Self::Completed => ORIGINAL_GREEN_TEXT,
+            Self::Locked => ORIGINAL_RED_TEXT,
+            Self::Skipped => ORIGINAL_BLUE_TEXT,
+        }
+    }
+}
+
+/// One optional level-list row ready for original-coordinate menu rendering.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct MenuLevelLine<'text> {
+    /// One-based level number prefixed to the original title.
+    pub number: usize,
+    /// Borrowed decoded `LEVEL.LST` title.
+    pub title: &'text str,
+    /// Player-specific progress color and playability category.
+    pub style: MenuLevelStyle,
+}
+
+/// Complete dynamic text and interaction state painted over `MENU.DAT`.
+#[derive(Debug)]
+pub struct MenuDisplay<'text> {
+    /// Previous, current, and next visible level rows.
+    pub levels: [Option<MenuLevelLine<'text>>; 3],
+    /// Previous, current, and next visible player names.
+    pub players: [Option<&'text str>; 3],
+    /// Accumulated successful-play duration of the selected player.
+    pub player_seconds: u64,
+    /// Selected player's next unfinished level, absent after all are resolved.
+    pub next_level: Option<usize>,
+    /// Twenty-three-character status or prompt drawn across the center field.
+    pub message: &'text str,
+    /// Five preformatted rows in the currently visible ranking window.
+    pub rankings: &'text [String],
+    /// One-based number of the first ranking row shown in the window.
+    pub ranking_position: usize,
+    /// Up to ten preformatted hall-of-fame rows drawn in the upper-right field.
+    pub hall_of_fame: &'text [String],
+    /// Main-menu region under the mouse, used for responsive outline feedback.
+    pub hovered: Option<MainMenuTarget>,
+}
 
 /// Integer enlargement from original 16-pixel tiles to the 32-pixel board.
 const MOVING_SCALE: u32 = 2;
@@ -254,13 +319,11 @@ impl<'textures> Renderer<'textures> {
             .map_err(RenderError::Sdl)
     }
 
-    /// Draws the original main menu with a current player and three level rows.
+    /// Draws the original main menu with live players, rankings, and level state.
     pub fn draw_menu(
         &mut self,
         canvas: &mut Canvas<Window>,
-        previous_level: Option<(usize, &str)>,
-        current_level: (usize, &str),
-        next_level: Option<(usize, &str)>,
+        display: &MenuDisplay<'_>,
     ) -> Result<(), RenderError> {
         // MENU.DAT supplies all borders, labels, arrows, and decorative controls.
         // Repainting it first also clears text left by the previous selection.
@@ -274,50 +337,85 @@ impl<'textures> Renderer<'textures> {
             )
             .map_err(RenderError::Sdl)?;
 
-        // This clone has one local player profile. The coordinates mirror the
-        // original player list, current-player summary, and message-line fields.
-        self.draw_menu_text(canvas, "MURPHY", 16, 164, ORIGINAL_RED_TEXT)?;
-        self.draw_menu_text(canvas, "MURPHY", 168, 93, ORIGINAL_BLUE_TEXT)?;
-        self.draw_menu_text(canvas, "000:00:00", 224, 93, ORIGINAL_BLUE_TEXT)?;
+        // Paint the three player rows in their original blue/red/blue order.
+        // Missing rows remain empty rather than inventing placeholder profiles.
+        let player_y = [155, 164, 173];
+        for (row_index, player) in display.players.iter().enumerate() {
+            if let Some(player) = player {
+                let color = if row_index == 1 {
+                    ORIGINAL_RED_TEXT
+                } else {
+                    ORIGINAL_BLUE_TEXT
+                };
+                self.draw_menu_text(canvas, player, 16, player_y[row_index], color)?;
+            }
+        }
+        let current_player = display.players[1].unwrap_or("--------");
+        self.draw_menu_text(canvas, current_player, 168, 93, ORIGINAL_BLUE_TEXT)?;
         self.draw_menu_text(
             canvas,
-            &format!("{:03}", current_level.0),
-            288,
+            &format_menu_time(display.player_seconds),
+            224,
             93,
             ORIGINAL_BLUE_TEXT,
         )?;
         self.draw_menu_text(
             canvas,
-            "ARROWS SELECT ENTER PLAY",
-            168,
-            127,
-            ORIGINAL_GREEN_TEXT,
+            &display
+                .next_level
+                .map_or_else(|| "---".to_owned(), |level| format!("{level:03}")),
+            288,
+            93,
+            ORIGINAL_BLUE_TEXT,
         )?;
+        self.draw_menu_text(canvas, display.message, 168, 127, ORIGINAL_GREEN_TEXT)?;
 
-        if let Some((number, title)) = previous_level {
-            self.draw_menu_text(
-                canvas,
-                &format_menu_level(number, title),
-                144,
-                155,
-                ORIGINAL_BLUE_TEXT,
-            )?;
+        // Unlike a modern highlight, original level-row colors describe each
+        // row's progression state regardless of which of the three is central.
+        let level_y = [155, 164, 173];
+        for (row_index, level) in display.levels.iter().enumerate() {
+            if let Some(level) = level {
+                self.draw_menu_text(
+                    canvas,
+                    &format_menu_level(level.number, level.title),
+                    144,
+                    level_y[row_index],
+                    level.style.color(),
+                )?;
+            }
+        }
+
+        // Rankings center the third visible row in red, matching the source
+        // list's scrolling window. Hall-of-fame rows remain uniformly blue.
+        for (row_index, ranking) in display.rankings.iter().take(5).enumerate() {
+            let color = if row_index == 2 {
+                ORIGINAL_RED_TEXT
+            } else {
+                ORIGINAL_BLUE_TEXT
+            };
+            self.draw_menu_text(canvas, ranking, 8, 92 + row_index as i32 * 9, color)?;
         }
         self.draw_menu_text(
             canvas,
-            &format_menu_level(current_level.0, current_level.1),
+            &format!("{:02}", display.ranking_position.min(99)),
             144,
-            164,
+            110,
             ORIGINAL_RED_TEXT,
         )?;
-        if let Some((number, title)) = next_level {
+        for (row_index, entry) in display.hall_of_fame.iter().take(10).enumerate() {
             self.draw_menu_text(
                 canvas,
-                &format_menu_level(number, title),
-                144,
-                173,
+                entry,
+                184,
+                28 + row_index as i32 * 9,
                 ORIGINAL_BLUE_TEXT,
             )?;
+        }
+
+        if let Some(target) = display.hovered {
+            // A one-source-pixel yellow outline replaces the animated DOS border
+            // and makes mouse selectability apparent at every window scale.
+            draw_original_outline(canvas, target.original_bounds(), ORIGINAL_YELLOW_TEXT)?;
         }
         Ok(())
     }
@@ -334,6 +432,45 @@ impl<'textures> Renderer<'textures> {
         // Interactive highlights are drawn by the caller after this immutable
         // background, allowing audio state to change without editing the asset.
         draw_original_screen(canvas, &self.controls)
+    }
+
+    /// Draws supported audio/input selections and the current controls hover.
+    pub fn draw_controls_state(
+        &mut self,
+        canvas: &mut Canvas<Window>,
+        music_enabled: bool,
+        effects_enabled: bool,
+        hovered: Option<ControlsTarget>,
+    ) -> Result<(), RenderError> {
+        // Green outlines expose the live settings this port can reproduce. The
+        // keyboard remains selected because gameplay does not silently switch
+        // to an unavailable joystick merely because its artwork was clicked.
+        if music_enabled {
+            draw_original_outline(
+                canvas,
+                ControlsTarget::Music.original_bounds(),
+                ORIGINAL_GREEN_TEXT,
+            )?;
+        }
+        if effects_enabled {
+            draw_original_outline(
+                canvas,
+                ControlsTarget::Effects.original_bounds(),
+                ORIGINAL_GREEN_TEXT,
+            )?;
+        }
+        draw_original_outline(
+            canvas,
+            ControlsTarget::Keyboard.original_bounds(),
+            ORIGINAL_GREEN_TEXT,
+        )?;
+
+        // Yellow has precedence over an active green outline while the mouse
+        // is present, preserving obvious feedback on clickable controls.
+        if let Some(target) = hovered {
+            draw_original_outline(canvas, target.original_bounds(), ORIGINAL_YELLOW_TEXT)?;
+        }
+        Ok(())
     }
 
     /// Draws the original information backdrop and caller-supplied white text.
@@ -932,6 +1069,48 @@ fn draw_original_screen(
             Rect::new(0, ORIGINAL_SCREEN_Y, LOGICAL_WIDTH, ORIGINAL_SCREEN_HEIGHT),
         )
         .map_err(RenderError::Sdl)
+}
+
+/// Draws one scaled outline over an original-coordinate front-end control.
+fn draw_original_outline(
+    canvas: &mut Canvas<Window>,
+    bounds: (i32, i32, u32, u32),
+    color: Color,
+) -> Result<(), RenderError> {
+    // Converting origin and size together preserves the inclusive source box;
+    // the three-logical-pixel stroke matches one original screen pixel.
+    let (x, y, width, height) = bounds;
+    canvas.set_draw_color(color);
+    for inset in 0..ORIGINAL_SCREEN_SCALE {
+        let width = width
+            .saturating_mul(ORIGINAL_SCREEN_SCALE)
+            .saturating_sub(inset * 2);
+        let height = height
+            .saturating_mul(ORIGINAL_SCREEN_SCALE)
+            .saturating_sub(inset * 2);
+        if width == 0 || height == 0 {
+            break;
+        }
+        canvas
+            .draw_rect(Rect::new(
+                x * ORIGINAL_SCREEN_SCALE as i32 + inset as i32,
+                ORIGINAL_SCREEN_Y + y * ORIGINAL_SCREEN_SCALE as i32 + inset as i32,
+                width,
+                height,
+            ))
+            .map_err(RenderError::Sdl)?;
+    }
+    Ok(())
+}
+
+/// Formats accumulated player time as the original three-digit hour counter.
+fn format_menu_time(total_seconds: u64) -> String {
+    // Saturating the visible hours at 999 keeps the fixed ten-character field
+    // intact while preserving minutes and seconds modulo their clock ranges.
+    let hours = (total_seconds / 3_600).min(999);
+    let minutes = total_seconds / 60 % 60;
+    let seconds = total_seconds % 60;
+    format!("{hours:03}:{minutes:02}:{seconds:02}")
 }
 
 /// Formats one original level-list row without exceeding its 29-character field.

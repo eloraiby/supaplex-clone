@@ -1,26 +1,38 @@
 //! SDL2 entry point for the original front end and fixed-step Supaplex play.
 
 use std::{
+    env,
+    path::{Path, PathBuf},
     process::ExitCode,
     time::{Duration, Instant},
 };
 
-use sdl2::{event::Event, keyboard::Scancode};
+use sdl2::{
+    event::Event,
+    keyboard::{Scancode, TextInputUtil},
+    mouse::MouseButton,
+};
 use supaplex_clone::{
     actor::Direction,
     assets,
     audio::AudioPlayer,
     cli::{FIRST_STEP_RATE, LAST_STEP_RATE, Options},
     frontend::{
-        MenuSelection, ORIGINAL_FADE_DURATION, fade_in_opacity, fade_out_opacity, splash_frame,
+        ControlsTarget, MainMenuTarget, MenuSelection, ORIGINAL_FADE_DURATION, controls_target_at,
+        fade_in_opacity, fade_out_opacity, main_menu_player_row_at, main_menu_target_at,
+        splash_frame,
     },
     game::{Game, GameStatus, Input},
     level::{Level, LevelSet},
-    render::{LOGICAL_HEIGHT, LOGICAL_WIDTH, Renderer},
+    profiles::{LevelResult, MAX_PLAYER_NAME_LENGTH, MAX_PLAYERS, PlayerBook, ProfileError},
+    render::{LOGICAL_HEIGHT, LOGICAL_WIDTH, MenuDisplay, MenuLevelLine, MenuLevelStyle, Renderer},
 };
 
 /// Maximum display rate used when vsync is unavailable or ignored.
 const RENDER_INTERVAL: Duration = Duration::from_nanos(1_000_000_000 / 60);
+
+/// Optional exact player-save path used by portable installs and test sessions.
+const PLAYER_PROFILE_PATH_ENVIRONMENT_VARIABLE: &str = "SUPAPLEX_PROFILE_PATH";
 
 /// One decoded level-list row retained between main-menu frames.
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -54,10 +66,62 @@ enum MenuOutcome {
 /// Terminal result of one selected gameplay session.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum GameOutcome {
-    /// Return to the menu with the contained level initially highlighted.
-    Menu(usize),
+    /// Return to the menu with selection and optional successful-play duration.
+    Menu {
+        /// One-based level initially highlighted after the gameplay transition.
+        next_selection: usize,
+        /// Whole successful-session seconds to add to the current player.
+        completed_seconds: Option<u64>,
+    },
     /// Close the application without revisiting the menu.
     Quit,
+}
+
+/// Menu operation awaiting text entry or confirmation through the OK button.
+#[derive(Clone, Debug, Eq, PartialEq)]
+enum PendingMenuAction {
+    /// Name currently being entered for a new player profile.
+    NewPlayer(String),
+    /// Deletion of the selected player awaiting OK or Enter.
+    DeletePlayer,
+    /// Skip of the selected level awaiting OK or Enter.
+    SkipLevel,
+}
+
+/// Original full-screen page displayed temporarily outside the main menu.
+enum AuxiliaryPage<'content> {
+    /// Illustrated actor and hardware GFX tutorial.
+    GfxTutor,
+    /// Information background plus owned text and original coordinates.
+    Information(&'content [(String, i32, i32)]),
+}
+
+/// Persistent and decoded resources shared throughout one main-menu visit.
+struct MainMenuResources<'resource> {
+    /// Borrowed validated level collection used to decode visible titles.
+    level_set: LevelSet<'resource>,
+    /// Number of playable records used to clamp selection state.
+    level_count: usize,
+    /// Mutable player list updated by menu actions and gameplay progression.
+    players: &'resource mut PlayerBook,
+    /// Writable platform preference file receiving immediate player updates.
+    profile_path: &'resource Path,
+    /// SDL text-input controller activated only while entering a new name.
+    text_input: &'resource TextInputUtil,
+}
+
+/// Borrowed dynamic state required to repaint one main-menu snapshot.
+struct MainMenuFrame<'frame> {
+    /// Three retained level titles surrounding the current selection.
+    rows: &'frame MenuLevelRows,
+    /// Current persistent player list and ranking source.
+    players: &'frame PlayerBook,
+    /// Center-field status, prompt, or confirmation message.
+    message: &'frame str,
+    /// Zero-based first row in the visible five-entry ranking window.
+    ranking_offset: usize,
+    /// Button under the mouse for exact-region hover feedback.
+    hovered: Option<MainMenuTarget>,
 }
 
 /// Immutable metadata shared by one game loop and its two palette fades.
@@ -178,6 +242,10 @@ fn run(level_bytes: &[u8], initial_level: usize, steps_per_second: u32) -> Resul
     let level_count = level_set
         .level_count()
         .map_err(|error| format!("validate level collection: {error}"))?;
+    let profile_path = player_profile_path()?;
+    let mut players = PlayerBook::load(&profile_path, level_count)
+        .map_err(|error| format!("load player profiles: {error}"))?;
+    let text_input = video.text_input();
     let mut menu_level = initial_level;
     loop {
         let level_number = match show_main_menu(
@@ -185,9 +253,14 @@ fn run(level_bytes: &[u8], initial_level: usize, steps_per_second: u32) -> Resul
             &mut renderer,
             &mut event_pump,
             &mut audio,
-            level_set,
             menu_level,
-            level_count,
+            MainMenuResources {
+                level_set,
+                level_count,
+                players: &mut players,
+                profile_path: &profile_path,
+                text_input: &text_input,
+            },
         )? {
             MenuOutcome::Play(level_number) => level_number,
             MenuOutcome::Quit => return Ok(()),
@@ -207,10 +280,47 @@ fn run(level_bytes: &[u8], initial_level: usize, steps_per_second: u32) -> Resul
                 steps_per_second,
             },
         )? {
-            GameOutcome::Menu(next_selection) => menu_level = next_selection,
+            GameOutcome::Menu {
+                next_selection,
+                completed_seconds,
+            } => {
+                // Progress is committed only after the terminal animation and
+                // fade have completed, so an interrupted session cannot unlock.
+                if let Some(elapsed_seconds) = completed_seconds {
+                    players
+                        .complete_current(level_number, elapsed_seconds)
+                        .map_err(|error| format!("record completed level: {error}"))?;
+                    save_player_book(&players, &profile_path)?;
+                }
+                menu_level = next_selection;
+            }
             GameOutcome::Quit => return Ok(()),
         }
     }
+}
+
+/// Resolves the cross-platform writable file used for persistent player state.
+fn player_profile_path() -> Result<PathBuf, String> {
+    // An explicit file supports portable installations and isolated automated
+    // sessions without tying profile storage to the asset-root feature.
+    if let Some(path) = env::var_os(PLAYER_PROFILE_PATH_ENVIRONMENT_VARIABLE) {
+        return Ok(PathBuf::from(path));
+    }
+
+    // SDL otherwise chooses the operating system's per-user preference
+    // directory, keeping saves outside both bundled and unbundled asset trees.
+    let directory = sdl2::filesystem::pref_path("eloraiby", "supaplex-clone")
+        .map_err(|error| format!("resolve player profile directory: {error}"))?;
+    Ok(PathBuf::from(directory).join("players.dat"))
+}
+
+/// Persists a mutated player book with one consistent front-end diagnostic.
+fn save_player_book(players: &PlayerBook, path: &Path) -> Result<(), String> {
+    // Menu actions call this immediately after mutation, minimizing progress
+    // loss if the process later closes through the window manager.
+    players
+        .save(path)
+        .map_err(|error| format!("save player profiles: {error}"))
 }
 
 /// Plays one selected level through its entry and exit transitions.
@@ -247,6 +357,7 @@ fn play_level(
     let mut previous = Instant::now();
     let mut accumulator = Duration::ZERO;
     let mut window_title = String::new();
+    let mut completion_tick = None;
 
     loop {
         // The frame start serves both the fixed-step accumulator and the
@@ -278,6 +389,7 @@ fn play_level(
                     if let Some(audio) = audio.as_mut() {
                         audio.restart_level();
                     }
+                    completion_tick = None;
                     accumulator = Duration::ZERO;
                     previous = frame_started;
                 }
@@ -327,7 +439,10 @@ fn play_level(
                 // resume soundtrack playback if it remains user-enabled.
                 audio.restart_level();
             }
-            return Ok(GameOutcome::Menu(session.level_number));
+            return Ok(GameOutcome::Menu {
+                next_selection: session.level_number,
+                completed_seconds: None,
+            });
         }
 
         let mut processed_steps = 0;
@@ -338,6 +453,11 @@ fn play_level(
                 action: keyboard.is_scancode_pressed(Scancode::Space),
             };
             game.tick(input);
+            if game.status() == GameStatus::Completed && completion_tick.is_none() {
+                // Capture the instant completion first appears so the original
+                // terminal delay does not inflate persistent player time.
+                completion_tick = Some(game.tick_count());
+            }
             if let Some(audio) = audio.as_mut() {
                 // Drain after every simulation step so catch-up frames retain
                 // actor event order before the original priority gate runs.
@@ -412,7 +532,11 @@ fn play_level(
             if let Some(audio) = audio.as_mut() {
                 audio.restart_level();
             }
-            return Ok(GameOutcome::Menu(next_selection));
+            return Ok(GameOutcome::Menu {
+                next_selection,
+                completed_seconds: completion_tick
+                    .map(|ticks| ticks / u64::from(session.steps_per_second)),
+            });
         }
 
         // Hardware vsync normally consumes most of this interval. The explicit
@@ -468,29 +592,105 @@ fn fade_game(
     }
 }
 
-/// Runs the keyboard-driven original main menu until play or quit is selected.
+/// Runs the interactive original main menu until play or quit is selected.
 fn show_main_menu(
     canvas: &mut sdl2::render::Canvas<sdl2::video::Window>,
     renderer: &mut Renderer<'_>,
     event_pump: &mut sdl2::EventPump,
     audio: &mut Option<AudioPlayer>,
-    level_set: LevelSet<'_>,
     initial_level: usize,
-    level_count: usize,
+    resources: MainMenuResources<'_>,
 ) -> Result<MenuOutcome, String> {
+    // Destructure once so action branches remain readable while the grouping
+    // keeps this event-loop interface below the clippy complexity threshold.
+    let MainMenuResources {
+        level_set,
+        level_count,
+        players,
+        profile_path,
+        text_input,
+    } = resources;
     // Construction can fail only for an empty validated collection. Keeping the
     // guard here makes the menu safe for custom LEVELS.DAT distributions too.
     let mut selection = MenuSelection::new(initial_level, level_count)
         .ok_or_else(|| "level collection contains no playable records".to_owned())?;
     let mut rows = load_menu_level_rows(level_set, selection)?;
-    let started = Instant::now();
+    let mut reveal_started = Instant::now();
     let mut window_title = String::new();
+    let mut message = "  WELCOME TO SUPAPLEX  ".to_owned();
+    let mut pending = None;
+    let mut hovered = None;
+    let mut ranking_offset = 0usize;
 
     loop {
         let frame_started = Instant::now();
         let selection_before_events = selection;
-        let mut start_level = false;
+        let mut requested_action = None;
+        let mut clicked_player_row = None;
         for event in event_pump.poll_iter() {
+            // Text entry is a modal menu state: ordinary level shortcuts cannot
+            // trigger while an unfinished name is receiving SDL text events.
+            if let Some(PendingMenuAction::NewPlayer(name)) = pending.as_mut() {
+                match event {
+                    Event::Quit { .. } => {
+                        text_input.stop();
+                        return Ok(MenuOutcome::Quit);
+                    }
+                    Event::KeyDown {
+                        scancode: Some(Scancode::Escape),
+                        repeat: false,
+                        ..
+                    } => {
+                        text_input.stop();
+                        pending = None;
+                        message = "  WELCOME TO SUPAPLEX  ".to_owned();
+                    }
+                    Event::KeyDown {
+                        scancode: Some(Scancode::Backspace),
+                        repeat: false,
+                        ..
+                    } => {
+                        name.pop();
+                        message = new_player_prompt(name);
+                    }
+                    Event::KeyDown {
+                        scancode: Some(Scancode::Return | Scancode::KpEnter),
+                        repeat: false,
+                        ..
+                    } => {
+                        let entered_name = name.clone();
+                        match players.add(&entered_name) {
+                            Ok(()) => {
+                                save_player_book(players, profile_path)?;
+                                message = "     PLAYER CREATED    ".to_owned();
+                                pending = None;
+                                text_input.stop();
+                            }
+                            Err(error) => message = profile_menu_message(&error),
+                        }
+                    }
+                    Event::TextInput { text, .. } => {
+                        // SDL may deliver several Unicode characters together.
+                        // Retain only original ASCII name glyphs and the first
+                        // eight bytes that fit the fixed menu field.
+                        for character in text.chars() {
+                            let character = character.to_ascii_uppercase();
+                            if name.len() < MAX_PLAYER_NAME_LENGTH
+                                && (character.is_ascii_uppercase()
+                                    || character.is_ascii_digit()
+                                    || character == ' '
+                                    || character == '-')
+                            {
+                                name.push(character);
+                            }
+                        }
+                        message = new_player_prompt(name);
+                    }
+                    _ => {}
+                }
+                continue;
+            }
+
             match event {
                 Event::Quit { .. }
                 | Event::KeyDown {
@@ -528,7 +728,42 @@ fn show_main_menu(
                     scancode: Some(Scancode::Return | Scancode::KpEnter | Scancode::Space),
                     repeat: false,
                     ..
-                } => start_level = true,
+                } => requested_action = Some(MainMenuTarget::Ok),
+                Event::KeyDown {
+                    scancode: Some(Scancode::N),
+                    repeat: false,
+                    ..
+                } => requested_action = Some(MainMenuTarget::NewPlayer),
+                Event::KeyDown {
+                    scancode: Some(Scancode::Delete),
+                    repeat: false,
+                    ..
+                } => requested_action = Some(MainMenuTarget::DeletePlayer),
+                Event::KeyDown {
+                    scancode: Some(Scancode::K),
+                    repeat: false,
+                    ..
+                } => requested_action = Some(MainMenuTarget::SkipLevel),
+                Event::KeyDown {
+                    scancode: Some(Scancode::T),
+                    repeat: false,
+                    ..
+                } => requested_action = Some(MainMenuTarget::Statistics),
+                Event::KeyDown {
+                    scancode: Some(Scancode::G),
+                    repeat: false,
+                    ..
+                } => requested_action = Some(MainMenuTarget::GfxTutor),
+                Event::KeyDown {
+                    scancode: Some(Scancode::D),
+                    repeat: false,
+                    ..
+                } => requested_action = Some(MainMenuTarget::Demo),
+                Event::KeyDown {
+                    scancode: Some(Scancode::C),
+                    repeat: false,
+                    ..
+                } => requested_action = Some(MainMenuTarget::Controls),
                 Event::KeyDown {
                     scancode: Some(Scancode::M),
                     repeat: false,
@@ -556,6 +791,16 @@ fn show_main_menu(
                         );
                     }
                 }
+                Event::MouseMotion { x, y, .. } => hovered = main_menu_target_at(x, y),
+                Event::MouseButtonDown {
+                    mouse_btn: MouseButton::Left,
+                    x,
+                    y,
+                    ..
+                } => {
+                    requested_action = main_menu_target_at(x, y);
+                    clicked_player_row = main_menu_player_row_at(x, y);
+                }
                 _ => {}
             }
         }
@@ -565,10 +810,176 @@ fn show_main_menu(
             // their three owned title strings without touching LEVELS.DAT.
             rows = load_menu_level_rows(level_set, selection)?;
         }
+        let mut start_level = false;
+        if let Some(action) = requested_action {
+            // Any non-OK action cancels an outstanding confirmation before the
+            // new action runs, matching the original click-away behavior.
+            if action != MainMenuTarget::Ok
+                && matches!(
+                    pending,
+                    Some(PendingMenuAction::DeletePlayer | PendingMenuAction::SkipLevel)
+                )
+            {
+                pending = None;
+            }
+            match action {
+                MainMenuTarget::NewPlayer => {
+                    if players.len() >= MAX_PLAYERS {
+                        message = "PLAYER LIST FULL       ".to_owned();
+                    } else {
+                        pending = Some(PendingMenuAction::NewPlayer(String::new()));
+                        message = new_player_prompt("");
+                        text_input.start();
+                    }
+                }
+                MainMenuTarget::DeletePlayer => {
+                    if let Some(player) = players.current() {
+                        message = format!("DELETE '{:<8}' ???", player.name());
+                        pending = Some(PendingMenuAction::DeletePlayer);
+                    } else {
+                        message = "NO PLAYER SELECTED     ".to_owned();
+                    }
+                }
+                MainMenuTarget::SkipLevel => {
+                    if players.current().is_some() {
+                        message = format!("SKIP LEVEL {:03} ???    ", selection.selected_level());
+                        pending = Some(PendingMenuAction::SkipLevel);
+                    } else {
+                        message = "NO PLAYER SELECTED     ".to_owned();
+                    }
+                }
+                MainMenuTarget::Statistics => {
+                    if let Some(player) = players.current() {
+                        let lines = statistics_lines(player);
+                        if !show_auxiliary_page(
+                            canvas,
+                            renderer,
+                            event_pump,
+                            AuxiliaryPage::Information(&lines),
+                        )? {
+                            return Ok(MenuOutcome::Quit);
+                        }
+                        reveal_started = Instant::now();
+                    } else {
+                        message = "NO PLAYER SELECTED     ".to_owned();
+                    }
+                }
+                MainMenuTarget::GfxTutor => {
+                    if !show_auxiliary_page(canvas, renderer, event_pump, AuxiliaryPage::GfxTutor)?
+                    {
+                        return Ok(MenuOutcome::Quit);
+                    }
+                    reveal_started = Instant::now();
+                }
+                MainMenuTarget::Demo => {
+                    // Demo playback is supplied by the following focused
+                    // front-end change; until then the control remains visibly
+                    // responsive instead of silently swallowing the click.
+                    message = " SELECT DEMO WITH F1-F10".to_owned();
+                }
+                MainMenuTarget::Controls => {
+                    if !show_controls_screen(canvas, renderer, event_pump, audio)? {
+                        return Ok(MenuOutcome::Quit);
+                    }
+                    reveal_started = Instant::now();
+                }
+                MainMenuTarget::RankingUp => ranking_offset = ranking_offset.saturating_sub(1),
+                MainMenuTarget::RankingDown => {
+                    ranking_offset = ranking_offset
+                        .saturating_add(1)
+                        .min(players.len().saturating_sub(5));
+                }
+                MainMenuTarget::Ok => match pending.take() {
+                    Some(PendingMenuAction::DeletePlayer) => {
+                        if players.delete_current().is_some() {
+                            save_player_book(players, profile_path)?;
+                            message = "     PLAYER DELETED    ".to_owned();
+                        } else {
+                            message = "NO PLAYER SELECTED     ".to_owned();
+                        }
+                    }
+                    Some(PendingMenuAction::SkipLevel) => {
+                        match players.skip_current(selection.selected_level()) {
+                            Ok(()) => {
+                                save_player_book(players, profile_path)?;
+                                message = "     LEVEL SKIPPED     ".to_owned();
+                            }
+                            Err(error) => message = profile_menu_message(&error),
+                        }
+                    }
+                    Some(PendingMenuAction::NewPlayer(_)) => {
+                        // Name entry consumes Enter earlier and cannot reach this
+                        // branch; retaining it makes the enum match exhaustive.
+                    }
+                    None if players.can_play(selection.selected_level()) => start_level = true,
+                    None if players.current().is_none() => {
+                        message = "NO PLAYER SELECTED     ".to_owned();
+                    }
+                    None => message = "LEVEL NOT AVAILABLE    ".to_owned(),
+                },
+                MainMenuTarget::LevelSet => {
+                    message = " ORIGINAL DISK ACTIVE  ".to_owned();
+                }
+                MainMenuTarget::PlayerUp => {
+                    players.select_previous();
+                    save_player_book(players, profile_path)?;
+                    select_player_next_level(&mut selection, players);
+                }
+                MainMenuTarget::PlayerDown => {
+                    players.select_next();
+                    save_player_book(players, profile_path)?;
+                    select_player_next_level(&mut selection, players);
+                }
+                MainMenuTarget::PlayerList => match clicked_player_row {
+                    Some(-1) => {
+                        players.select_previous();
+                        save_player_book(players, profile_path)?;
+                        select_player_next_level(&mut selection, players);
+                    }
+                    Some(1) => {
+                        players.select_next();
+                        save_player_book(players, profile_path)?;
+                        select_player_next_level(&mut selection, players);
+                    }
+                    _ => {}
+                },
+                MainMenuTarget::LevelUp => selection.move_by(-1),
+                MainMenuTarget::LevelDown => selection.move_by(1),
+                MainMenuTarget::Credits => {
+                    let lines = credits_lines();
+                    if !show_auxiliary_page(
+                        canvas,
+                        renderer,
+                        event_pump,
+                        AuxiliaryPage::Information(&lines),
+                    )? {
+                        return Ok(MenuOutcome::Quit);
+                    }
+                    reveal_started = Instant::now();
+                }
+            }
+        }
+
+        if selection != selection_before_events {
+            // Mouse actions are processed after polling, so refresh rows again
+            // when their arrows changed the selection outside the first check.
+            rows = load_menu_level_rows(level_set, selection)?;
+        }
         if start_level {
             // Fade the unchanged selected menu to black before constructing the
             // level, hiding the state swap between two opaque terminal frames.
-            if !fade_menu_to_black(canvas, renderer, event_pump, &rows)? {
+            if !fade_menu_to_black(
+                canvas,
+                renderer,
+                event_pump,
+                MainMenuFrame {
+                    rows: &rows,
+                    players,
+                    message: &message,
+                    ranking_offset,
+                    hovered,
+                },
+            )? {
                 return Ok(MenuOutcome::Quit);
             }
             return Ok(MenuOutcome::Play(selection.selected_level()));
@@ -585,9 +996,19 @@ fn show_main_menu(
             window_title = title;
         }
 
-        draw_menu_rows(canvas, renderer, &rows)?;
+        draw_menu_rows(
+            canvas,
+            renderer,
+            MainMenuFrame {
+                rows: &rows,
+                players,
+                message: &message,
+                ranking_offset,
+                hovered,
+            },
+        )?;
         renderer
-            .draw_black_overlay(canvas, fade_in_opacity(started.elapsed()))
+            .draw_black_overlay(canvas, fade_in_opacity(reveal_started.elapsed()))
             .map_err(|error| error.to_string())?;
         canvas.present();
 
@@ -604,7 +1025,7 @@ fn fade_menu_to_black(
     canvas: &mut sdl2::render::Canvas<sdl2::video::Window>,
     renderer: &mut Renderer<'_>,
     event_pump: &mut sdl2::EventPump,
-    rows: &MenuLevelRows,
+    frame: MainMenuFrame<'_>,
 ) -> Result<bool, String> {
     // Redrawing MENU.DAT on every sample keeps the transition independent from
     // back-buffer retention and makes window exposes safe during the fade.
@@ -626,7 +1047,17 @@ fn fade_menu_to_black(
         }
 
         let elapsed = started.elapsed();
-        draw_menu_rows(canvas, renderer, rows)?;
+        draw_menu_rows(
+            canvas,
+            renderer,
+            MainMenuFrame {
+                rows: frame.rows,
+                players: frame.players,
+                message: frame.message,
+                ranking_offset: frame.ranking_offset,
+                hovered: frame.hovered,
+            },
+        )?;
         renderer
             .draw_black_overlay(canvas, fade_out_opacity(elapsed))
             .map_err(|error| error.to_string())?;
@@ -647,22 +1078,505 @@ fn fade_menu_to_black(
 fn draw_menu_rows(
     canvas: &mut sdl2::render::Canvas<sdl2::video::Window>,
     renderer: &mut Renderer<'_>,
-    rows: &MenuLevelRows,
+    frame: MainMenuFrame<'_>,
 ) -> Result<(), String> {
-    // Converting owned rows to short-lived tuples at this boundary avoids
-    // storing references into movable `String` fields inside the menu state.
+    // Format rankings into owned rows before lending both those strings and the
+    // profile/level fields to the renderer for this single immediate frame.
+    let ordered = frame.players.rankings();
+    let rankings: Vec<String> = ordered
+        .iter()
+        .skip(frame.ranking_offset)
+        .take(5)
+        .map(|player| format_ranking_row(player))
+        .collect();
+    let hall_of_fame: Vec<String> = ordered
+        .iter()
+        .take(10)
+        .map(|player| format_hall_of_fame_row(player))
+        .collect();
+    let player_names = frame.players.visible_names();
+    let current = frame.players.current();
+    let levels = [
+        frame.rows.previous.as_ref().map(|row| MenuLevelLine {
+            number: row.number,
+            title: row.title.as_str(),
+            style: menu_level_style(frame.players, row.number),
+        }),
+        Some(MenuLevelLine {
+            number: frame.rows.current.number,
+            title: frame.rows.current.title.as_str(),
+            style: menu_level_style(frame.players, frame.rows.current.number),
+        }),
+        frame.rows.next.as_ref().map(|row| MenuLevelLine {
+            number: row.number,
+            title: row.title.as_str(),
+            style: menu_level_style(frame.players, row.number),
+        }),
+    ];
+    let display = MenuDisplay {
+        levels,
+        players: player_names,
+        player_seconds: current.map_or(0, |player| player.total_seconds()),
+        next_level: current.and_then(|player| player.next_level_to_play()),
+        message: frame.message,
+        rankings: &rankings,
+        ranking_position: frame.ranking_offset.saturating_add(1),
+        hall_of_fame: &hall_of_fame,
+        hovered: frame.hovered,
+    };
     renderer
-        .draw_menu(
-            canvas,
-            rows.previous
-                .as_ref()
-                .map(|row| (row.number, row.title.as_str())),
-            (rows.current.number, rows.current.title.as_str()),
-            rows.next
-                .as_ref()
-                .map(|row| (row.number, row.title.as_str())),
-        )
+        .draw_menu(canvas, &display)
         .map_err(|error| error.to_string())
+}
+
+/// Maps one player's level result and lock boundary to an original row color.
+fn menu_level_style(players: &PlayerBook, level_number: usize) -> MenuLevelStyle {
+    // With no player every row is locked. Otherwise completed/skipped states
+    // take precedence, and only the first unfinished row becomes available.
+    let Some(player) = players.current() else {
+        return MenuLevelStyle::Locked;
+    };
+    match player.level_result(level_number) {
+        Some(LevelResult::Completed) => MenuLevelStyle::Completed,
+        Some(LevelResult::Skipped) => MenuLevelStyle::Skipped,
+        Some(LevelResult::Unfinished) if player.can_play(level_number) => MenuLevelStyle::Available,
+        Some(LevelResult::Unfinished) | None => MenuLevelStyle::Locked,
+    }
+}
+
+/// Formats one original-width ranking entry from a persistent player.
+fn format_ranking_row(player: &supaplex_clone::profiles::PlayerProfile) -> String {
+    // Rankings compare progress first and show the next level beside a padded
+    // name and the original three-digit hour clock.
+    let level = player.next_level_to_play().unwrap_or(999);
+    let seconds = player.total_seconds();
+    format!(
+        "{level:03} {:<8} {:03}:{:02}:{:02}",
+        player.name(),
+        (seconds / 3_600).min(999),
+        seconds / 60 % 60,
+        seconds % 60
+    )
+}
+
+/// Formats one compact upper-right hall-of-fame entry.
+fn format_hall_of_fame_row(player: &supaplex_clone::profiles::PlayerProfile) -> String {
+    // The hall field omits progress and fits an eight-character name plus time.
+    let seconds = player.total_seconds();
+    format!(
+        "{:<8} {:03}:{:02}:{:02}",
+        player.name(),
+        (seconds / 3_600).min(999),
+        seconds / 60 % 60,
+        seconds % 60
+    )
+}
+
+/// Formats the live eight-character New Player entry prompt.
+fn new_player_prompt(name: &str) -> String {
+    // Padding overwrites characters from longer previous frames because MENU.DAT
+    // itself is repainted before every text pass.
+    format!("YOUR NAME: {:<8}    ", name)
+}
+
+/// Converts a profile-domain failure into the original menu's message vocabulary.
+fn profile_menu_message(error: &ProfileError) -> String {
+    // Known user-policy errors receive specific source-style messages; storage
+    // and structural errors remain terminal elsewhere and do not enter here.
+    match error {
+        ProfileError::InvalidName(_) => "INVALID NAME           ".to_owned(),
+        ProfileError::PlayerExists(_) => "PLAYER EXISTS          ".to_owned(),
+        ProfileError::PlayerListFull => "PLAYER LIST FULL       ".to_owned(),
+        ProfileError::NoPlayerSelected => "NO PLAYER SELECTED     ".to_owned(),
+        ProfileError::SkipNotPossible { .. } => "SKIP NOT POSSIBLE      ".to_owned(),
+        _ => "PROFILE ERROR          ".to_owned(),
+    }
+}
+
+/// Jumps the menu selection to the selected player's first unfinished level.
+fn select_player_next_level(selection: &mut MenuSelection, players: &PlayerBook) {
+    // Fully completed or absent players retain the current row; ordinary
+    // profiles reproduce the original autoselection of their next level.
+    if let Some(level) = players
+        .current()
+        .and_then(|player| player.next_level_to_play())
+    {
+        selection.select(level);
+    }
+}
+
+/// Builds the original Statistics page plus current clone progression totals.
+fn statistics_lines(player: &supaplex_clone::profiles::PlayerProfile) -> Vec<(String, i32, i32)> {
+    // Whole-second storage maps back to the original hour/minute/second fields;
+    // the average deliberately counts solved levels rather than skipped rows.
+    let seconds = player.total_seconds();
+    let completed = player.completed_levels();
+    let average_minutes = if completed == 0 {
+        0
+    } else {
+        seconds / completed as u64 / 60
+    };
+    vec![
+        ("SUPAPLEX  BY DREAM FACTORY".to_owned(), 80, 20),
+        ("(C) DIGITAL INTEGRATION LTD 1991".to_owned(), 64, 50),
+        (
+            "________________________________________________".to_owned(),
+            16,
+            60,
+        ),
+        ("SUPAPLEX PLAYER STATISTICS".to_owned(), 80, 80),
+        (format!("CURRENT PLAYER :  {:>8}", player.name()), 80, 100),
+        (
+            format!(
+                "CURRENT LEVEL  :       {:03}",
+                player.next_level_to_play().unwrap_or(999)
+            ),
+            80,
+            110,
+        ),
+        (
+            format!(
+                "TOTAL TIME USED: {:03}:{:02}:{:02}",
+                (seconds / 3_600).min(999),
+                seconds / 60 % 60,
+                seconds % 60
+            ),
+            80,
+            120,
+        ),
+        (
+            format!("LEVELS COMPLETED: {:3}", player.completed_levels()),
+            80,
+            130,
+        ),
+        (
+            format!("LEVELS SKIPPED  : {:3}", player.skipped_levels()),
+            80,
+            140,
+        ),
+        (
+            format!("AVERAGE TIME USED PER LEVEL  {average_minutes:3} MINUTES"),
+            32,
+            155,
+        ),
+        ("PRESS ANY KEY OR MOUSE BUTTON".to_owned(), 72, 180),
+    ]
+}
+
+/// Builds the level-design credits exactly as printed by the original menu.
+fn credits_lines() -> Vec<(String, i32, i32)> {
+    // Keeping these as data makes the shared information-page loop responsible
+    // for transitions and dismissal while preserving every original coordinate.
+    vec![
+        ("SUPAPLEX  BY DREAM FACTORY".to_owned(), 80, 10),
+        ("ORIGINAL DESIGN BY PHILIP JESPERSEN".to_owned(), 56, 40),
+        ("AND MICHAEL STOPP".to_owned(), 88, 50),
+        ("NEARLY ALL LEVELS BY MICHEAL STOPP".to_owned(), 56, 90),
+        ("A FEW LEVELS BY PHILIP JESPERSEN".to_owned(), 64, 100),
+        ("HARDLY ANY LEVELS BY BARBARA STOPP".to_owned(), 56, 110),
+        ("PRESS ANY KEY OR MOUSE BUTTON".to_owned(), 72, 170),
+        ("(C) DIGITAL INTEGRATION LTD 1991".to_owned(), 64, 190),
+    ]
+}
+
+/// Displays one dismissible auxiliary page with palette-style fades.
+fn show_auxiliary_page(
+    canvas: &mut sdl2::render::Canvas<sdl2::video::Window>,
+    renderer: &mut Renderer<'_>,
+    event_pump: &mut sdl2::EventPump,
+    page: AuxiliaryPage<'_>,
+) -> Result<bool, String> {
+    // Fade in from black before accepting dismissal so the opening mouse-down
+    // cannot immediately close the page it requested.
+    let reveal_started = Instant::now();
+    loop {
+        let frame_started = Instant::now();
+        if event_pump
+            .poll_iter()
+            .any(|event| matches!(event, Event::Quit { .. }))
+        {
+            return Ok(false);
+        }
+        draw_auxiliary_page(canvas, renderer, &page)?;
+        renderer
+            .draw_black_overlay(canvas, fade_in_opacity(reveal_started.elapsed()))
+            .map_err(|error| error.to_string())?;
+        canvas.present();
+        if reveal_started.elapsed() >= ORIGINAL_FADE_DURATION {
+            break;
+        }
+        limit_frontend_frame(frame_started);
+    }
+
+    loop {
+        let frame_started = Instant::now();
+        let mut dismissed = false;
+        for event in event_pump.poll_iter() {
+            match event {
+                Event::Quit { .. } => return Ok(false),
+                Event::KeyDown { repeat: false, .. }
+                | Event::MouseButtonDown {
+                    mouse_btn: MouseButton::Left | MouseButton::Right,
+                    ..
+                } => dismissed = true,
+                _ => {}
+            }
+        }
+        draw_auxiliary_page(canvas, renderer, &page)?;
+        canvas.present();
+        if dismissed {
+            break;
+        }
+        limit_frontend_frame(frame_started);
+    }
+
+    // End fully black so the main menu can reveal its restored palette without
+    // a one-frame mixture of the two unrelated screen palettes.
+    let hide_started = Instant::now();
+    loop {
+        let frame_started = Instant::now();
+        if event_pump
+            .poll_iter()
+            .any(|event| matches!(event, Event::Quit { .. }))
+        {
+            return Ok(false);
+        }
+        draw_auxiliary_page(canvas, renderer, &page)?;
+        renderer
+            .draw_black_overlay(canvas, fade_out_opacity(hide_started.elapsed()))
+            .map_err(|error| error.to_string())?;
+        canvas.present();
+        if hide_started.elapsed() >= ORIGINAL_FADE_DURATION {
+            return Ok(true);
+        }
+        limit_frontend_frame(frame_started);
+    }
+}
+
+/// Draws one auxiliary-page variant without owning its event or fade policy.
+fn draw_auxiliary_page(
+    canvas: &mut sdl2::render::Canvas<sdl2::video::Window>,
+    renderer: &mut Renderer<'_>,
+    page: &AuxiliaryPage<'_>,
+) -> Result<(), String> {
+    // Information strings are converted into borrowed triples for the immediate
+    // renderer call; the page retains ownership for the entire modal loop.
+    match page {
+        AuxiliaryPage::GfxTutor => renderer
+            .draw_gfx_tutor(canvas)
+            .map_err(|error| error.to_string()),
+        AuxiliaryPage::Information(lines) => {
+            let borrowed: Vec<_> = lines
+                .iter()
+                .map(|(text, x, y)| (text.as_str(), *x, *y))
+                .collect();
+            renderer
+                .draw_information(canvas, &borrowed)
+                .map_err(|error| error.to_string())
+        }
+    }
+}
+
+/// Runs the clickable original controls screen and updates supported audio state.
+fn show_controls_screen(
+    canvas: &mut sdl2::render::Canvas<sdl2::video::Window>,
+    renderer: &mut Renderer<'_>,
+    event_pump: &mut sdl2::EventPump,
+    audio: &mut Option<AudioPlayer>,
+) -> Result<bool, String> {
+    // Retain flags locally so rendering never needs to lock the callback merely
+    // to repaint an unchanged menu frame.
+    let (mut music_enabled, mut effects_enabled) = match audio.as_mut() {
+        Some(audio) => (audio.music_enabled(), audio.effects_enabled()),
+        None => (false, false),
+    };
+    let mut hovered = None;
+    let mut status = "CLICK MUSIC, FX, DEVICE, OR EXIT".to_owned();
+    let reveal_started = Instant::now();
+
+    loop {
+        let frame_started = Instant::now();
+        let mut leave = false;
+        for event in event_pump.poll_iter() {
+            match event {
+                Event::Quit { .. } => return Ok(false),
+                Event::KeyDown {
+                    scancode: Some(Scancode::Escape),
+                    repeat: false,
+                    ..
+                } => leave = true,
+                Event::KeyDown {
+                    scancode: Some(Scancode::M),
+                    repeat: false,
+                    ..
+                } => {
+                    if let Some(audio) = audio.as_mut() {
+                        music_enabled = audio.toggle_music();
+                        status = audio_status_message(music_enabled, effects_enabled);
+                    }
+                }
+                Event::KeyDown {
+                    scancode: Some(Scancode::S),
+                    repeat: false,
+                    ..
+                } => {
+                    if let Some(audio) = audio.as_mut() {
+                        effects_enabled = audio.toggle_effects();
+                        status = audio_status_message(music_enabled, effects_enabled);
+                    }
+                }
+                Event::MouseMotion { x, y, .. } => hovered = controls_target_at(x, y),
+                Event::MouseButtonDown {
+                    mouse_btn: MouseButton::Left,
+                    x,
+                    y,
+                    ..
+                } => {
+                    if let Some(target) = controls_target_at(x, y) {
+                        if target == ControlsTarget::Exit {
+                            leave = true;
+                        } else {
+                            let result = apply_controls_target(
+                                target,
+                                audio,
+                                music_enabled,
+                                effects_enabled,
+                            );
+                            music_enabled = result.0;
+                            effects_enabled = result.1;
+                            status = result.2;
+                        }
+                    }
+                }
+                _ => {}
+            }
+        }
+
+        let title = format!("Supaplex - Controls - {status}");
+        canvas
+            .window_mut()
+            .set_title(&title)
+            .map_err(|error| format!("update controls window title: {error}"))?;
+        renderer
+            .draw_controls(canvas)
+            .and_then(|()| {
+                renderer.draw_controls_state(canvas, music_enabled, effects_enabled, hovered)
+            })
+            .map_err(|error| error.to_string())?;
+        renderer
+            .draw_black_overlay(canvas, fade_in_opacity(reveal_started.elapsed()))
+            .map_err(|error| error.to_string())?;
+        canvas.present();
+        if leave {
+            return fade_controls_to_black(
+                canvas,
+                renderer,
+                event_pump,
+                music_enabled,
+                effects_enabled,
+                hovered,
+            );
+        }
+        limit_frontend_frame(frame_started);
+    }
+}
+
+/// Applies one supported controls-screen target and returns flags plus feedback.
+fn apply_controls_target(
+    target: ControlsTarget,
+    audio: &mut Option<AudioPlayer>,
+    current_music: bool,
+    current_effects: bool,
+) -> (bool, bool, String) {
+    // Hardware choices map onto the two independent voices this SDL port owns;
+    // unsupported joystick selection is acknowledged without lying about input.
+    let (music, effects, message) = match target {
+        ControlsTarget::Music => (
+            !current_music,
+            current_effects,
+            if current_music {
+                "MUSIC OFF"
+            } else {
+                "MUSIC ON"
+            },
+        ),
+        ControlsTarget::Effects => (
+            current_music,
+            !current_effects,
+            if current_effects { "FX OFF" } else { "FX ON" },
+        ),
+        ControlsTarget::Adlib | ControlsTarget::Roland => (true, false, "MUSIC DEVICE SELECTED"),
+        ControlsTarget::SoundBlaster
+        | ControlsTarget::Internal
+        | ControlsTarget::Standard
+        | ControlsTarget::Samples => (false, true, "EFFECT DEVICE SELECTED"),
+        ControlsTarget::Combined => (true, true, "MUSIC AND FX SELECTED"),
+        ControlsTarget::Keyboard => (current_music, current_effects, "KEYBOARD SELECTED"),
+        ControlsTarget::Joystick => (current_music, current_effects, "JOYSTICK UNAVAILABLE"),
+        ControlsTarget::Exit => (current_music, current_effects, "EXIT"),
+    };
+    if let Some(audio) = audio.as_mut() {
+        audio.set_music_enabled(music);
+        audio.set_effects_enabled(effects);
+        (music, effects, message.to_owned())
+    } else {
+        (false, false, "AUDIO DEVICE UNAVAILABLE".to_owned())
+    }
+}
+
+/// Formats concise controls-screen audio feedback from two independent voices.
+fn audio_status_message(music_enabled: bool, effects_enabled: bool) -> String {
+    // A fixed four-state vocabulary keeps the native window title stable.
+    format!(
+        "MUSIC {} / FX {}",
+        if music_enabled { "ON" } else { "OFF" },
+        if effects_enabled { "ON" } else { "OFF" }
+    )
+}
+
+/// Fades the current controls snapshot to black before restoring the main menu.
+fn fade_controls_to_black(
+    canvas: &mut sdl2::render::Canvas<sdl2::video::Window>,
+    renderer: &mut Renderer<'_>,
+    event_pump: &mut sdl2::EventPump,
+    music_enabled: bool,
+    effects_enabled: bool,
+    hovered: Option<ControlsTarget>,
+) -> Result<bool, String> {
+    // Audio state remains visually fixed while only black opacity advances.
+    let started = Instant::now();
+    loop {
+        let frame_started = Instant::now();
+        if event_pump
+            .poll_iter()
+            .any(|event| matches!(event, Event::Quit { .. }))
+        {
+            return Ok(false);
+        }
+        renderer
+            .draw_controls(canvas)
+            .and_then(|()| {
+                renderer.draw_controls_state(canvas, music_enabled, effects_enabled, hovered)
+            })
+            .map_err(|error| error.to_string())?;
+        renderer
+            .draw_black_overlay(canvas, fade_out_opacity(started.elapsed()))
+            .map_err(|error| error.to_string())?;
+        canvas.present();
+        if started.elapsed() >= ORIGINAL_FADE_DURATION {
+            return Ok(true);
+        }
+        limit_frontend_frame(frame_started);
+    }
+}
+
+/// Sleeps for the unused portion of one non-gameplay display frame.
+fn limit_frontend_frame(frame_started: Instant) {
+    // Hardware vsync usually consumes this budget; dummy and software backends
+    // receive an explicit cap without affecting wall-clock fade calculations.
+    if let Some(remaining) = RENDER_INTERVAL.checked_sub(frame_started.elapsed()) {
+        std::thread::sleep(remaining);
+    }
 }
 
 /// Decodes the at-most-three original titles visible around one menu selection.
