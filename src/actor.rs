@@ -1466,7 +1466,10 @@ impl Murphy {
             Actor::Base(_) => MurphySnapTarget::Base,
             Actor::Bug(_) if !world.is_bug_active(target) => MurphySnapTarget::Base,
             Actor::Bug(_) => return Some(explode_at(world, position, false)),
-            Actor::Infotron(_) => MurphySnapTarget::Infotron,
+            // Every original Space+direction branch requires an idle
+            // Infotron. A moving or roll-reserved tile keeps its updater and
+            // is allowed to run later in this same Murphy-first linear pass.
+            Actor::Infotron(_) if target_state.is_idle() => MurphySnapTarget::Infotron,
             Actor::RedDisk(_) if target_state.is_idle() => MurphySnapTarget::RedDisk,
             _ => return None,
         };
@@ -1544,15 +1547,20 @@ impl Murphy {
                 looking_left,
                 vec![GameEvent::PlaySound(SoundEffect::Base)],
             )),
-            Actor::Infotron(_) => Some(Transition::move_murphy_with_events(
-                position,
-                target,
-                murphy_actor,
-                direction,
-                MurphyMoveTarget::Infotron,
-                looking_left,
-                vec![GameEvent::PlaySound(SoundEffect::Infotron)],
-            )),
+            // Original ordinary movement checks Infotron state zero from Up,
+            // Left, and Right. Its Down branch historically checks only the
+            // tile kind, an observable directional quirk retained explicitly.
+            Actor::Infotron(_) if direction == Direction::Down || target_state.is_idle() => {
+                Some(Transition::move_murphy_with_events(
+                    position,
+                    target,
+                    murphy_actor,
+                    direction,
+                    MurphyMoveTarget::Infotron,
+                    looking_left,
+                    vec![GameEvent::PlaySound(SoundEffect::Infotron)],
+                ))
+            }
             Actor::RedDisk(_) if world.is_active_red_disk(target) => {
                 // A planted disk is position-owned rather than collectible.
                 // Murphy may cover it, and the game-level fuse keeps ticking.
@@ -3654,6 +3662,46 @@ fn explosion_state(residue: ExplosionResidue) -> State {
     State::animated(actor, Animation::explosion(residue))
 }
 
+/// Finds the temporary cell owned by one moving Zonk or Infotron phase.
+///
+/// The original blast dispatcher decodes the actor's state high nibble and
+/// clears the corresponding old, side, or diagonal Space marker. Typed
+/// animations carry that same topology here, so cleanup stays phase-specific
+/// instead of reviving autonomous behavior in temporary Empty cells.
+fn rounded_actor_reservation(
+    world: &WorldView<'_>,
+    position: Position,
+    state: &State,
+) -> Option<Position> {
+    if !matches!(state.actor(), Actor::Zonk(_) | Actor::Infotron(_)) {
+        return None;
+    }
+
+    let (reservation, expected_kind) = match state.animation.kind {
+        AnimationKind::Moving(Direction::Down) => (
+            world.offset(position, Direction::Up)?,
+            AnimationKind::Vacating(Direction::Down),
+        ),
+        AnimationKind::RoundedPreRoll(direction) => (
+            world.offset(position, direction)?,
+            AnimationKind::RoundedSide,
+        ),
+        AnimationKind::Rolling(_) => (
+            world.offset(position, Direction::Down)?,
+            AnimationKind::RoundedDestination,
+        ),
+        _ => return None,
+    };
+
+    world
+        .state(reservation)
+        .is_some_and(|reservation_state| {
+            matches!(reservation_state.actor(), Actor::Empty(_))
+                && reservation_state.animation.kind == expected_kind
+        })
+        .then_some(reservation)
+}
+
 /// Builds one immediate 3×3 wave and schedules touched reactive actors.
 pub(crate) fn explode_at(world: &WorldView<'_>, center: Position, electron: bool) -> Transition {
     // A live Electron always seeds an Electron wave even when the caller only
@@ -3673,6 +3721,7 @@ fn explode_wave(world: &WorldView<'_>, center: Position, electron_wave: bool) ->
         ExplosionResidue::Empty
     };
     let mut writes = Vec::new();
+    let mut rounded_cleanup = Vec::new();
     // The original engine uses one global flag for explosion sound and camera
     // shake rather than counting live cells.  Every emitted wave sets it again.
     let mut events = vec![
@@ -3692,6 +3741,12 @@ fn explode_wave(world: &WorldView<'_>, center: Position, electron_wave: bool) ->
             };
             if matches!(state.actor(), Actor::Hardware(_) | Actor::InvisibleWall(_)) {
                 continue;
+            }
+
+            if let Some(reservation) = rounded_actor_reservation(world, position, state)
+                && !rounded_cleanup.contains(&reservation)
+            {
+                rounded_cleanup.push(reservation);
             }
 
             let is_murphy = matches!(state.actor(), Actor::Murphy(_));
@@ -3725,6 +3780,15 @@ fn explode_wave(world: &WorldView<'_>, center: Position, electron_wave: bool) ->
                 incoming_residue
             };
             writes.push(CellWrite::new(position, explosion_state(residue)));
+        }
+    }
+
+    // A reservation inside the 3x3 footprint has already become Explosion and
+    // must win over cleanup, just as the original helper preserves a blast it
+    // encounters. Only out-of-wave markers become ordinary empty space.
+    for reservation in rounded_cleanup {
+        if !writes.iter().any(|write| write.position == reservation) {
+            writes.push(CellWrite::new(reservation, State::empty()));
         }
     }
 

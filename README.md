@@ -118,7 +118,11 @@ their source on state `0x16`, before their last two pictures. Murphy releases hi
 old cell while retaining the final moving pose, and processes new direction
 input on his next update. A trailing Zonk that sees the newly opened cell later
 in the same pass first enters `ZonkPreFall`; it transfers only on the following
-pass, after Murphy has received that next input.
+pass, after Murphy has received that next input. Explosions that replace a
+moving or rolling Zonk/Infotron clear the reservation selected by that actor's
+live movement phase. Murphy may collect only idle Infotrons when snapping or
+moving up, left, or right; ordinary downward movement retains the original
+tile-only collision check.
 
 Implemented play mechanics include Base removal, Infotron and Red Disk
 collection, locked exits, horizontal Zonk and Orange Disk pushing, player

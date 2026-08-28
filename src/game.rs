@@ -1648,6 +1648,145 @@ mod tests {
         );
     }
 
+    /// Confirms Murphy-first input cannot consume a moving Infotron from the
+    /// three directions where the original requires target state zero.
+    #[test]
+    fn murphy_refuses_moving_infotrons_before_their_linear_update() {
+        let murphy_position = Position::new(3, 3);
+        let cases = [
+            (Direction::Up, Position::new(3, 2), Position::new(3, 1)),
+            (Direction::Left, Position::new(2, 3), Position::new(2, 2)),
+            (Direction::Right, Position::new(4, 3), Position::new(4, 2)),
+        ];
+
+        for action in [false, true] {
+            for (direction, target, source) in cases {
+                let mut placements = vec![
+                    (murphy_position, State::new(Actor::Murphy(Murphy::new()))),
+                    (source, State::new(Actor::Infotron(Infotron::resting()))),
+                ];
+                if direction.is_horizontal() {
+                    placements.push((
+                        Position::new(target.x, target.y + 1),
+                        State::new(Actor::Hardware(Hardware::new(0))),
+                    ));
+                }
+                let mut game = game_with(&placements, 1);
+
+                // Arm the Infotron, then transfer it into Murphy's neighboring
+                // cell. Its destination owns the still-solid source marker.
+                game.tick(Input::default());
+                game.tick(Input::default());
+                let moving = game
+                    .board()
+                    .state(target)
+                    .expect("the falling Infotron should occupy its destination");
+                assert_eq!(
+                    moving.animation().kind(),
+                    AnimationKind::Moving(Direction::Down)
+                );
+                assert_eq!(moving.animation().frame(), 0);
+
+                game.tick(Input {
+                    direction: Some(direction),
+                    action,
+                });
+
+                // Murphy is evaluated first and must refuse the interaction.
+                // The retained Infotron is then present in the captured linear
+                // schedule and advances once during this same tick.
+                let murphy = game
+                    .board()
+                    .state(murphy_position)
+                    .expect("Murphy should retain his cell");
+                assert!(
+                    matches!(murphy.actor(), Actor::Murphy(_)),
+                    "direction {direction:?}, action {action}"
+                );
+                assert_eq!(
+                    murphy.animation().kind(),
+                    AnimationKind::Idle,
+                    "direction {direction:?}, action {action}"
+                );
+                assert_eq!(game.remaining_infotrons(), 1);
+                let moving = game
+                    .board()
+                    .state(target)
+                    .expect("the refused Infotron should remain scheduled");
+                assert!(matches!(moving.actor(), Actor::Infotron(_)));
+                assert_eq!(
+                    moving.animation().kind(),
+                    AnimationKind::Moving(Direction::Down)
+                );
+                assert_eq!(moving.animation().frame(), 1);
+
+                // Destination-owned cleanup must still run at original state
+                // 0x16 now that Murphy no longer removes its updater.
+                for _ in 0..5 {
+                    game.tick(Input::default());
+                }
+                assert!(
+                    game.board()
+                        .state(source)
+                        .expect("the released source remains addressable")
+                        .is_empty(),
+                    "direction {direction:?}, action {action}"
+                );
+            }
+        }
+    }
+
+    /// Confirms ordinary downward movement retains the original tile-only
+    /// Infotron check rather than normalizing all four directions to state zero.
+    #[test]
+    fn murphy_downward_move_accepts_a_non_idle_infotron() {
+        let murphy_position = Position::new(3, 1);
+        let target = Position::new(3, 2);
+        let mut game = game_with(
+            &[
+                (murphy_position, State::new(Actor::Murphy(Murphy::new()))),
+                (target, State::new(Actor::Infotron(Infotron::resting()))),
+                (
+                    Position::new(3, 3),
+                    State::new(Actor::Zonk(Zonk::resting())),
+                ),
+                (
+                    Position::new(3, 4),
+                    State::new(Actor::Hardware(Hardware::new(0))),
+                ),
+            ],
+            1,
+        );
+
+        game.tick(Input::default());
+        assert_eq!(
+            game.board()
+                .state(target)
+                .expect("the rounded Infotron should retain its cell")
+                .animation()
+                .kind(),
+            AnimationKind::RoundedPreRoll(Direction::Left)
+        );
+
+        game.tick(Input {
+            direction: Some(Direction::Down),
+            ..Input::default()
+        });
+        assert!(matches!(actor_at(&game, 3, 2), Actor::Murphy(_)));
+        assert_eq!(
+            game.board()
+                .state(target)
+                .expect("Murphy should begin the downward eating strip")
+                .animation()
+                .kind(),
+            AnimationKind::Murphy(MurphyAnimation::Move {
+                direction: Direction::Down,
+                target: crate::actor::MurphyMoveTarget::Infotron,
+                looking_left: false,
+            })
+        );
+    }
+
     /// Confirms a Zonk arms for one update before one captured fall begins.
     #[test]
     fn zonk_arms_then_falls_once_without_a_double_update() {
@@ -2880,6 +3019,235 @@ mod tests {
             .index(destination)
             .expect("the Orange destination should remain in bounds");
         assert_eq!(game.explosion_timers[destination_index], 0);
+    }
+
+    /// Confirms a blast that consumes a falling owner also releases the
+    /// destination-owned source marker just outside the visible 3x3 wave.
+    #[test]
+    fn explosions_release_falling_zonk_and_infotron_sources() {
+        for actor in [
+            Actor::Zonk(Zonk::resting()),
+            Actor::Infotron(Infotron::resting()),
+        ] {
+            let source = Position::new(4, 2);
+            let destination = Position::new(4, 3);
+            let mut game = game_with(
+                &[
+                    (
+                        Position::new(1, 4),
+                        State::new(Actor::Murphy(Murphy::new())),
+                    ),
+                    (source, State::new(actor.clone())),
+                    (
+                        Position::new(4, 4),
+                        State::new(Actor::Hardware(Hardware::new(0))),
+                    ),
+                ],
+                0,
+            );
+
+            game.tick(Input::default());
+            game.tick(Input::default());
+            assert_eq!(
+                game.board()
+                    .state(destination)
+                    .expect("the falling owner should occupy its destination")
+                    .animation()
+                    .kind(),
+                AnimationKind::Moving(Direction::Down)
+            );
+            assert_eq!(
+                game.board()
+                    .state(source)
+                    .expect("the falling source should remain reserved")
+                    .animation()
+                    .kind(),
+                AnimationKind::Vacating(Direction::Down)
+            );
+
+            // This wave reaches the destination at its upper-left corner, but
+            // its old source one row higher is outside the blast footprint.
+            game.detonate_position(Position::new(5, 4));
+            assert!(matches!(actor_at(&game, 4, 3), Actor::Explosion(_)));
+            assert!(
+                game.board()
+                    .state(source)
+                    .expect("the released source remains addressable")
+                    .is_empty(),
+                "blast should release the source owned by {actor:?}"
+            );
+        }
+    }
+
+    /// Confirms both rounded phases release the side or diagonal marker when a
+    /// blast reaches the owner but not that reservation.
+    #[test]
+    fn explosions_release_rounded_zonk_and_infotron_reservations() {
+        for actor in [
+            Actor::Zonk(Zonk::resting()),
+            Actor::Infotron(Infotron::resting()),
+        ] {
+            for direction in [Direction::Left, Direction::Right] {
+                for rolling in [false, true] {
+                    let origin = Position::new(3, 2);
+                    let mut placements = vec![
+                        (
+                            Position::new(1, 4),
+                            State::new(Actor::Murphy(Murphy::new())),
+                        ),
+                        (origin, State::new(actor.clone())),
+                        (
+                            Position::new(3, 3),
+                            State::new(Actor::Zonk(Zonk::resting())),
+                        ),
+                        (
+                            Position::new(3, 4),
+                            State::new(Actor::Hardware(Hardware::new(0))),
+                        ),
+                    ];
+                    if direction == Direction::Right {
+                        placements.push((
+                            Position::new(2, 2),
+                            State::new(Actor::Hardware(Hardware::new(0))),
+                        ));
+                    }
+                    let mut game = game_with(&placements, 0);
+
+                    game.tick(Input::default());
+                    assert_eq!(
+                        game.board()
+                            .state(origin)
+                            .expect("the rounded owner should retain its source")
+                            .animation()
+                            .kind(),
+                        AnimationKind::RoundedPreRoll(direction)
+                    );
+
+                    let (owner, reservation, blast_center, expected_kind) = if rolling {
+                        game.tick(Input::default());
+                        match direction {
+                            Direction::Left => (
+                                Position::new(2, 2),
+                                Position::new(2, 3),
+                                Position::new(1, 1),
+                                AnimationKind::Rolling(Direction::Left),
+                            ),
+                            Direction::Right => (
+                                Position::new(4, 2),
+                                Position::new(4, 3),
+                                Position::new(5, 1),
+                                AnimationKind::Rolling(Direction::Right),
+                            ),
+                            _ => unreachable!("the fixture uses horizontal rolls only"),
+                        }
+                    } else {
+                        match direction {
+                            Direction::Left => (
+                                origin,
+                                Position::new(2, 2),
+                                Position::new(4, 1),
+                                AnimationKind::RoundedPreRoll(Direction::Left),
+                            ),
+                            Direction::Right => (
+                                origin,
+                                Position::new(4, 2),
+                                Position::new(2, 1),
+                                AnimationKind::RoundedPreRoll(Direction::Right),
+                            ),
+                            _ => unreachable!("the fixture uses horizontal rolls only"),
+                        }
+                    };
+                    assert_eq!(
+                        game.board()
+                            .state(owner)
+                            .expect("the rounded owner should occupy its phase cell")
+                            .animation()
+                            .kind(),
+                        expected_kind
+                    );
+                    assert!(
+                        !game
+                            .board()
+                            .state(reservation)
+                            .expect("the rounded reservation should exist")
+                            .is_empty()
+                    );
+
+                    game.detonate_position(blast_center);
+                    assert!(matches!(
+                        actor_at(&game, owner.x, owner.y),
+                        Actor::Explosion(_)
+                    ));
+                    assert!(
+                        game.board()
+                            .state(reservation)
+                            .expect("the released reservation remains addressable")
+                            .is_empty(),
+                        "actor {actor:?}, direction {direction:?}, rolling {rolling}"
+                    );
+                }
+            }
+        }
+    }
+
+    /// Confirms reservation cleanup yields to explosion writes, including a
+    /// marker already consumed by an earlier live-board wave.
+    #[test]
+    fn rounded_cleanup_never_erases_explosion_cells() {
+        let source = Position::new(3, 2);
+        let destination = Position::new(3, 3);
+        let mut falling = game_with(
+            &[
+                (
+                    Position::new(5, 4),
+                    State::new(Actor::Murphy(Murphy::new())),
+                ),
+                (source, State::new(Actor::Infotron(Infotron::resting()))),
+                (
+                    Position::new(3, 4),
+                    State::new(Actor::Hardware(Hardware::new(0))),
+                ),
+            ],
+            0,
+        );
+        falling.tick(Input::default());
+        falling.tick(Input::default());
+        falling.detonate_position(destination);
+        assert!(matches!(actor_at(&falling, 3, 2), Actor::Explosion(_)));
+
+        let owner = Position::new(3, 2);
+        let side = Position::new(2, 2);
+        let mut rounded = game_with(
+            &[
+                (
+                    Position::new(5, 4),
+                    State::new(Actor::Murphy(Murphy::new())),
+                ),
+                (owner, State::new(Actor::Infotron(Infotron::resting()))),
+                (
+                    Position::new(3, 3),
+                    State::new(Actor::Zonk(Zonk::resting())),
+                ),
+                (
+                    Position::new(3, 4),
+                    State::new(Actor::Hardware(Hardware::new(0))),
+                ),
+            ],
+            0,
+        );
+        rounded.tick(Input::default());
+        rounded.detonate_position(Position::new(1, 3));
+        assert!(matches!(
+            actor_at(&rounded, side.x, side.y),
+            Actor::Explosion(_)
+        ));
+        assert!(matches!(actor_at(&rounded, 3, 2), Actor::Infotron(_)));
+
+        rounded.detonate_position(Position::new(4, 1));
+        assert!(matches!(
+            actor_at(&rounded, side.x, side.y),
+            Actor::Explosion(_)
+        ));
     }
 
     /// Confirms an Infotron landing on any idle disk detonates immediately.
