@@ -110,10 +110,12 @@ becomes 512×8. Gameplay addresses the original fixed tiles and variably sized
 moving descriptors directly; the HUD uses the converted original font.
 
 The WAV files in `assets/audio/` are playback-ready renders of the supplied DOS
-sound data: Sound Blaster is used for effects and the matching AdLib arrangement
-for music. Effects retain the original one-channel priority rules, while music
-loops independently and pauses when the Exit sound is accepted. Both are
-embedded in the executable and require only SDL2, not SDL2_mixer.
+Sound Blaster effects. The music remains the original compact XM arrangement;
+the in-tree tracker player decodes its delta-compressed samples and sequences
+the four channels directly in SDL's callback. Effects retain the original
+one-channel priority rules, while music loops independently and pauses when the
+Exit sound is accepted. Both are embedded in the executable and require only
+SDL2, not SDL2_mixer.
 
 ## Verification
 
@@ -127,8 +129,8 @@ Tests cover the CLI range, complete record layout and metadata, row-major board
 indexing, every supplied level, actor movement and collection, gravity
 overrides, falling-object collision matrices, Red Disk planting, ordered and
 chained explosions, Bug timing/RNG, exit gating, planar and binary graphics
-decoding, PNG assets, audio event timing, effect priorities, WAV decoding, and
-fixed-strip bounds.
+decoding, PNG assets, audio event timing, effect priorities, WAV decoding, XM
+parsing and playback, and fixed-strip bounds.
 
 Format and mapping references:
 

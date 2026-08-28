@@ -3,7 +3,7 @@
 //! The DOS `.snd` files bundled in `data/` contain executable driver code, so
 //! they cannot be queued as PCM. This module embeds WAV renders of their seven
 //! gameplay effects, converts those short clips to the opened-device format,
-//! and mixes them with a compact mono render of the original tracker music in
+//! and mixes them with an in-tree player for the original XM arrangement in
 //! SDL's real-time callback.
 
 use sdl2::{
@@ -15,7 +15,7 @@ use sdl2::{
     rwops::RWops,
 };
 
-use crate::game::SoundEffect;
+use crate::{game::SoundEffect, xm::XmPlayer};
 
 /// Requested device frequency used by every decoded embedded clip.
 const OUTPUT_FREQUENCY: i32 = 44_100;
@@ -32,8 +32,8 @@ const PRIORITY_UNIT_MILLISECONDS: usize = 20;
 /// Background level used before effects are added to the callback buffer.
 const MUSIC_VOLUME: f32 = 0.38;
 
-/// Full AdLib soundtrack rendered from its original tracker arrangement.
-const EMBEDDED_MUSIC: &[u8] = include_bytes!("../assets/audio/music.wav");
+/// Original AdLib soundtrack preserved as its compact tracker arrangement.
+const EMBEDDED_MUSIC: &[u8] = include_bytes!("../assets/audio/music.xm");
 
 /// Sound Blaster renders of the seven effects in [`SoundEffect`] index order.
 const EMBEDDED_EFFECTS: [&[u8]; 7] = [
@@ -59,7 +59,8 @@ impl AudioPlayer {
         // a normal initialization error rather than panicking inside SDL's
         // callback-construction closure.
         let effects = EffectBank::decode(OUTPUT_FREQUENCY, OUTPUT_CHANNELS)?;
-        let music = MusicTrack::decode()?;
+        let music = XmPlayer::new(EMBEDDED_MUSIC, OUTPUT_FREQUENCY as u32)
+            .map_err(|error| format!("decode embedded music: {error}"))?;
         let desired = AudioSpecDesired {
             freq: Some(OUTPUT_FREQUENCY),
             channels: Some(OUTPUT_CHANNELS),
@@ -115,49 +116,6 @@ impl AudioPlayer {
         mixer.current_priority = 0;
         mixer.priority_frames_remaining = 0;
         mixer.music_playing = mixer.music_enabled;
-    }
-}
-
-/// Decoded mono samples and source rate for the looping AdLib soundtrack.
-struct MusicTrack {
-    /// Complete mono signed-PCM song produced by one tracker traversal.
-    samples: Box<[i16]>,
-    /// Source frames per second, resampled incrementally by the callback.
-    frequency: usize,
-}
-
-impl MusicTrack {
-    /// Expands the embedded IMA-ADPCM soundtrack to compact mono signed PCM.
-    fn decode() -> Result<Self, String> {
-        // Retaining the 22.05-kHz mono result uses roughly one eighth of the
-        // memory required by a five-minute 44.1-kHz stereo `f32` conversion.
-        // The callback performs the simple rate/channel expansion incrementally.
-        let mut source = RWops::from_bytes(EMBEDDED_MUSIC)
-            .map_err(|error| format!("open embedded music: {error}"))?;
-        let wav = AudioSpecWAV::load_wav_rw(&mut source)
-            .map_err(|error| format!("decode embedded music: {error}"))?;
-        if wav.channels != 1 || wav.format != AudioFormat::s16_sys() {
-            return Err(format!(
-                "embedded music decoded as {:?}/{} channels instead of native S16 mono",
-                wav.format, wav.channels
-            ));
-        }
-        if !wav.buffer().len().is_multiple_of(size_of::<i16>()) {
-            return Err("decoded music has a partial signed sample".to_owned());
-        }
-        let (sample_bytes, remainder) = wav.buffer().as_chunks::<{ size_of::<i16>() }>();
-        debug_assert!(remainder.is_empty(), "the length check rejects a remainder");
-        let samples = sample_bytes
-            .iter()
-            .map(|bytes| i16::from_ne_bytes(*bytes))
-            .collect::<Vec<_>>();
-        if samples.is_empty() {
-            return Err("decoded music contains no samples".to_owned());
-        }
-        Ok(Self {
-            samples: samples.into_boxed_slice(),
-            frequency: wav.freq.max(1).unsigned_abs() as usize,
-        })
     }
 }
 
@@ -221,12 +179,8 @@ struct Mixer {
     spec: AudioSpec,
     /// Decoded immutable effect samples shared by successive voices.
     effects: EffectBank,
-    /// Decoded immutable soundtrack samples traversed as a continuous loop.
-    music: MusicTrack,
-    /// Next mono soundtrack frame mixed by the callback.
-    music_frame_cursor: usize,
-    /// Fractional source-rate numerator retained between output frames.
-    music_rate_accumulator: usize,
+    /// Parsed tracker sequencer and decoded sample voices for the soundtrack.
+    music: XmPlayer,
     /// Persistent user preference controlled by the M key.
     music_enabled: bool,
     /// Session playback state paused independently when Exit is accepted.
@@ -243,15 +197,13 @@ struct Mixer {
 
 impl Mixer {
     /// Creates silent callback state around already converted effect samples.
-    fn new(spec: AudioSpec, effects: EffectBank, music: MusicTrack) -> Self {
+    fn new(spec: AudioSpec, effects: EffectBank, music: XmPlayer) -> Self {
         // The audio device owns this value for its full lifetime; no callback
         // path allocates, decodes, locks a Rust mutex, or touches simulation.
         Self {
             spec,
             effects,
             music,
-            music_frame_cursor: 0,
-            music_rate_accumulator: 0,
             music_enabled: true,
             music_playing: true,
             effect_voice: None,
@@ -287,33 +239,18 @@ impl Mixer {
         true
     }
 
-    /// Adds looping music to the cleared output and advances its retained cursor.
+    /// Adds looping tracker music to the cleared stereo output buffer.
     fn mix_music(&mut self, output: &mut [f32]) {
-        // Exit and M both silence the track without rewinding it. The callback
-        // can therefore resume continuously after a restart or explicit toggle.
-        if !self.music_enabled || !self.music_playing || self.music.samples.is_empty() {
+        // Exit and M both silence the player without advancing or rewinding it.
+        // A restart or explicit toggle therefore resumes at the retained tick.
+        if !self.music_enabled || !self.music_playing {
             return;
         }
-        let output_channels = usize::from(self.spec.channels.max(1));
-        let output_frequency = self.spec.freq.max(1).unsigned_abs() as usize;
-        for frame in output.chunks_exact_mut(output_channels) {
-            let sample =
-                f32::from(self.music.samples[self.music_frame_cursor]) / f32::from(i16::MAX);
-            for destination in frame {
-                *destination += sample * MUSIC_VOLUME;
-            }
-
-            // A rational accumulator avoids cumulative drift and handles any
-            // future exact device rate without pre-expanding the full song.
-            self.music_rate_accumulator += self.music.frequency;
-            while self.music_rate_accumulator >= output_frequency {
-                self.music_rate_accumulator -= output_frequency;
-                self.music_frame_cursor += 1;
-                if self.music_frame_cursor == self.music.samples.len() {
-                    self.music_frame_cursor = 0;
-                }
-            }
-        }
+        debug_assert_eq!(
+            self.spec.channels, OUTPUT_CHANNELS,
+            "the XM mixer is constructed for the requested stereo layout"
+        );
+        self.music.mix_stereo(output, MUSIC_VOLUME);
     }
 
     /// Copies the active effect over the already cleared output slice.
@@ -457,9 +394,11 @@ mod tests {
     //! Decoder and mixer checks that do not open a host audio device.
 
     use super::{
-        AudioCallback, AudioSpec, EffectBank, Mixer, MusicTrack, OUTPUT_CHANNELS, OUTPUT_FREQUENCY,
+        AudioCallback, AudioSpec, EMBEDDED_MUSIC, EffectBank, Mixer, OUTPUT_CHANNELS,
+        OUTPUT_FREQUENCY,
     };
     use crate::game::SoundEffect;
+    use crate::xm::XmPlayer;
 
     /// Builds a mixer with decoded production assets and a production layout.
     fn decoded_mixer() -> Mixer {
@@ -475,7 +414,8 @@ mod tests {
         };
         let effects = EffectBank::decode(spec.freq, spec.channels)
             .expect("embedded Sound Blaster effects should decode");
-        let music = MusicTrack::decode().expect("embedded AdLib music should decode");
+        let music = XmPlayer::new(EMBEDDED_MUSIC, OUTPUT_FREQUENCY as u32)
+            .expect("embedded AdLib music should decode");
         Mixer::new(spec, effects, music)
     }
 
@@ -527,19 +467,20 @@ mod tests {
         assert!(!mixer.play_effect(SoundEffect::Bug));
     }
 
-    /// Confirms music wraps inside a callback and Exit pauses only its voice.
+    /// Confirms tracker music advances in callbacks and Exit pauses only its voice.
     #[test]
-    fn music_loops_and_an_accepted_exit_pauses_it() {
+    fn music_advances_and_an_accepted_exit_pauses_it() {
         let mut mixer = decoded_mixer();
-        let mut output = [0.0; 16];
-        mixer.music_frame_cursor = mixer.music.samples.len() - 2;
+        let mut output = [0.0; 4_096];
+        let starting_frame = mixer.music.rendered_frames();
 
         mixer.callback(&mut output);
-        // Sixteen stereo output samples are eight frames; at 2:1 resampling
-        // they consume four source frames and wrap from len - 2 to frame two.
-        assert_eq!(mixer.music_frame_cursor, 2);
+        let paused_frame = mixer.music.rendered_frames();
+        assert_eq!(paused_frame - starting_frame, 2_048);
         assert!(output.iter().any(|sample| *sample != 0.0));
         assert!(mixer.play_effect(SoundEffect::Exit));
         assert!(!mixer.music_playing);
+        mixer.callback(&mut output);
+        assert_eq!(mixer.music.rendered_frames(), paused_frame);
     }
 }
