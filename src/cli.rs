@@ -1,4 +1,4 @@
-//! Minimal command-line parsing for choosing a level to play.
+//! Minimal command-line parsing for choosing a level and simulation rate.
 
 use std::{error::Error, fmt};
 
@@ -8,75 +8,156 @@ pub const FIRST_LEVEL: usize = 1;
 /// The final level number accepted by the original 111-level collection.
 pub const LAST_LEVEL: usize = 111;
 
+/// Slowest supported simulation rate in fixed updates per second.
+pub const FIRST_STEP_RATE: u32 = 5;
+
+/// Fastest supported simulation rate in fixed updates per second.
+pub const LAST_STEP_RATE: u32 = 60;
+
+/// Original Supaplex and SpeedFix simulation rate used when `--step` is omitted.
+pub const DEFAULT_STEP_RATE: u32 = 35;
+
 /// Validated options needed to start one play session.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct Options {
     /// One-based level number matching the numbering shown by Supaplex.
     level_number: usize,
+    /// Validated number of fixed simulation updates performed per second.
+    steps_per_second: u32,
 }
 
 impl Options {
-    /// Parses `--level <number>` from an iterator of command-line arguments.
+    /// Parses required `--level` and optional `--step` argument pairs.
     ///
-    /// Exactly one level selector is required. A deliberately small parser
-    /// keeps startup dependencies light and every rejection deterministic.
+    /// Exactly one level selector is required; `--step` defaults to the
+    /// original 35 updates per second. Pairs may appear in either order. A
+    /// deliberately small parser keeps startup dependencies light and every
+    /// rejection deterministic.
     pub fn parse<I, S>(arguments: I) -> Result<Self, OptionsError>
     where
         I: IntoIterator<Item = S>,
         S: Into<String>,
     {
-        // Materialize the arguments because the accepted grammar contains
-        // exactly two tokens and reporting extras is clearer with a slice.
-        let arguments: Vec<String> = arguments.into_iter().map(Into::into).collect();
-
-        if arguments.len() != 2 || arguments[0] != "--level" {
-            return Err(OptionsError::ExpectedLevelOption);
+        // Consume flag/value pairs without allocating an argument collection.
+        // Separate options remain order-independent, while duplicate flags are
+        // rejected instead of silently letting the final value win.
+        let mut arguments = arguments.into_iter().map(Into::into);
+        let mut level_number = None;
+        let mut steps_per_second = None;
+        while let Some(option) = arguments.next() {
+            let value = arguments
+                .next()
+                .ok_or_else(|| OptionsError::MissingValue(option.clone()))?;
+            match option.as_str() {
+                "--level" => {
+                    if level_number.is_some() {
+                        return Err(OptionsError::DuplicateOption("--level"));
+                    }
+                    level_number = Some(parse_level(value)?);
+                }
+                "--step" => {
+                    if steps_per_second.is_some() {
+                        return Err(OptionsError::DuplicateOption("--step"));
+                    }
+                    steps_per_second = Some(parse_step_rate(value)?);
+                }
+                _ => return Err(OptionsError::UnknownOption(option)),
+            }
         }
 
-        // Parse as `usize` first, then apply the game's one-based bounds. This
-        // rejects negative values and non-numeric text through the same error.
-        let level_number = arguments[1]
-            .parse::<usize>()
-            .map_err(|_| OptionsError::InvalidLevel(arguments[1].clone()))?;
-
-        if !(FIRST_LEVEL..=LAST_LEVEL).contains(&level_number) {
-            return Err(OptionsError::LevelOutOfRange(level_number));
-        }
-
-        Ok(Self { level_number })
+        // A level remains mandatory, whereas absence of `--step` deliberately
+        // reproduces the historical 35-Hz fixed update rate.
+        Ok(Self {
+            level_number: level_number.ok_or(OptionsError::ExpectedLevelOption)?,
+            steps_per_second: steps_per_second.unwrap_or(DEFAULT_STEP_RATE),
+        })
     }
 
     /// Returns the one-based number of the level selected by the player.
     pub fn level_number(self) -> usize {
+        // Copying the validated scalar cannot expose an invalid record index.
         self.level_number
+    }
+
+    /// Returns the selected number of fixed simulation updates per second.
+    pub fn steps_per_second(self) -> u32 {
+        // Parsing guarantees the inclusive 5..=60 contract before startup.
+        self.steps_per_second
     }
 
     /// Returns a concise invocation string suitable for startup errors.
     pub fn usage() -> &'static str {
-        "Usage: supaplex-clone --level <1-111>"
+        // Square brackets communicate that omitting the rate retains 35 Hz.
+        "Usage: supaplex-clone --level <1-111> [--step <5-60>]"
     }
+}
+
+/// Parses and bounds-checks one level option value.
+fn parse_level(value: String) -> Result<usize, OptionsError> {
+    // Parsing as `usize` rejects negative and non-numeric text before applying
+    // the original collection's one-based record bounds.
+    let level_number = value
+        .parse::<usize>()
+        .map_err(|_| OptionsError::InvalidLevel(value))?;
+    if !(FIRST_LEVEL..=LAST_LEVEL).contains(&level_number) {
+        return Err(OptionsError::LevelOutOfRange(level_number));
+    }
+    Ok(level_number)
+}
+
+/// Parses and bounds-checks one fixed-update frequency.
+fn parse_step_rate(value: String) -> Result<u32, OptionsError> {
+    // `u32` rejects signs and fractions while comfortably representing the
+    // small accepted interval used as a duration divisor by the SDL loop.
+    let steps_per_second = value
+        .parse::<u32>()
+        .map_err(|_| OptionsError::InvalidStepRate(value))?;
+    if !(FIRST_STEP_RATE..=LAST_STEP_RATE).contains(&steps_per_second) {
+        return Err(OptionsError::StepRateOutOfRange(steps_per_second));
+    }
+    Ok(steps_per_second)
 }
 
 /// Describes why command-line arguments could not select a playable level.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum OptionsError {
-    /// The required `--level <number>` pair was missing or had extras.
+    /// The required `--level <number>` pair was absent.
     ExpectedLevelOption,
+    /// A recognized or unknown flag was not followed by a value.
+    MissingValue(String),
+    /// A flag outside the supported `--level` and `--step` grammar was supplied.
+    UnknownOption(String),
+    /// One of the two supported options appeared more than once.
+    DuplicateOption(&'static str),
     /// The option value was not an unsigned integer.
     InvalidLevel(String),
     /// The value was numeric but outside the original level-set range.
     LevelOutOfRange(usize),
+    /// The step-rate value was not an unsigned integer.
+    InvalidStepRate(String),
+    /// The step rate was numeric but outside the supported frequency range.
+    StepRateOutOfRange(u32),
 }
 
 impl fmt::Display for OptionsError {
     /// Formats a short message that can be followed by [`Options::usage`].
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            Self::ExpectedLevelOption => write!(formatter, "expected exactly --level <number>"),
+            Self::ExpectedLevelOption => formatter.write_str("expected --level <number>"),
+            Self::MissingValue(option) => write!(formatter, "missing value after {option}"),
+            Self::UnknownOption(option) => write!(formatter, "unknown option {option:?}"),
+            Self::DuplicateOption(option) => write!(formatter, "duplicate option {option}"),
             Self::InvalidLevel(value) => write!(formatter, "invalid level number {value:?}"),
             Self::LevelOutOfRange(value) => write!(
                 formatter,
                 "level {value} is outside the supported range {FIRST_LEVEL}..={LAST_LEVEL}"
+            ),
+            Self::InvalidStepRate(value) => {
+                write!(formatter, "invalid step rate {value:?}")
+            }
+            Self::StepRateOutOfRange(value) => write!(
+                formatter,
+                "step rate {value} is outside the supported range {FIRST_STEP_RATE}..={LAST_STEP_RATE}"
             ),
         }
     }
@@ -88,7 +169,10 @@ impl Error for OptionsError {}
 mod tests {
     //! Unit tests for the complete public command-line grammar.
 
-    use super::{FIRST_LEVEL, LAST_LEVEL, Options, OptionsError};
+    use super::{
+        DEFAULT_STEP_RATE, FIRST_LEVEL, FIRST_STEP_RATE, LAST_LEVEL, LAST_STEP_RATE, Options,
+        OptionsError,
+    };
 
     /// Confirms that both inclusive endpoints produce usable options.
     #[test]
@@ -98,6 +182,20 @@ mod tests {
 
         assert_eq!(first.level_number(), FIRST_LEVEL);
         assert_eq!(last.level_number(), LAST_LEVEL);
+        assert_eq!(first.steps_per_second(), DEFAULT_STEP_RATE);
+        assert_eq!(last.steps_per_second(), DEFAULT_STEP_RATE);
+    }
+
+    /// Confirms both inclusive step endpoints parse in either pair order.
+    #[test]
+    fn accepts_step_rate_boundaries_in_either_order() {
+        let slow = Options::parse(["--step", "5", "--level", "1"])
+            .expect("minimum step rate should parse first");
+        let fast = Options::parse(["--level", "111", "--step", "60"])
+            .expect("maximum step rate should parse last");
+
+        assert_eq!(slow.steps_per_second(), FIRST_STEP_RATE);
+        assert_eq!(fast.steps_per_second(), LAST_STEP_RATE);
     }
 
     /// Confirms that zero cannot accidentally become a wrapping record offset.
@@ -109,16 +207,50 @@ mod tests {
         );
     }
 
-    /// Confirms malformed syntax does not silently select a default level.
+    /// Confirms a level remains required even when a valid rate is supplied.
     #[test]
     fn requires_the_explicit_level_pair() {
         assert_eq!(
-            Options::parse(["1"]),
+            Options::parse(["--step", "35"]),
             Err(OptionsError::ExpectedLevelOption)
         );
+    }
+
+    /// Confirms unknown, incomplete, and repeated pairs receive precise errors.
+    #[test]
+    fn rejects_malformed_or_duplicate_option_pairs() {
         assert_eq!(
             Options::parse(["--other", "1"]),
-            Err(OptionsError::ExpectedLevelOption)
+            Err(OptionsError::UnknownOption("--other".to_owned()))
+        );
+        assert_eq!(
+            Options::parse(["--level"]),
+            Err(OptionsError::MissingValue("--level".to_owned()))
+        );
+        assert_eq!(
+            Options::parse(["--level", "1", "--level", "2"]),
+            Err(OptionsError::DuplicateOption("--level"))
+        );
+        assert_eq!(
+            Options::parse(["--level", "1", "--step", "35", "--step", "36"]),
+            Err(OptionsError::DuplicateOption("--step"))
+        );
+    }
+
+    /// Confirms step values must be unsigned integers inside 5..=60.
+    #[test]
+    fn rejects_invalid_and_out_of_range_step_rates() {
+        assert_eq!(
+            Options::parse(["--level", "1", "--step", "fast"]),
+            Err(OptionsError::InvalidStepRate("fast".to_owned()))
+        );
+        assert_eq!(
+            Options::parse(["--level", "1", "--step", "4"]),
+            Err(OptionsError::StepRateOutOfRange(4))
+        );
+        assert_eq!(
+            Options::parse(["--level", "1", "--step", "61"]),
+            Err(OptionsError::StepRateOutOfRange(61))
         );
     }
 }
