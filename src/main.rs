@@ -208,6 +208,19 @@ fn run(level_bytes: &[u8], initial_level: usize, steps_per_second: u32) -> Resul
     // Nearest-neighbor scaling preserves the hard pixel edges of the original
     // 16×16 artwork after its 2× atlas repack and logical-window scaling.
     sdl2::hint::set("SDL_RENDER_SCALE_QUALITY", "0");
+
+    // SDL 2.30's PulseAudio backend can leave both its device and hotplug
+    // threads asleep in `pa_threaded_mainloop_wait` after an output failure.
+    // `SDL_CloseAudioDevice` then waits forever to join the device thread, as
+    // observed from both Escape and window-close paths. Modern Linux desktops
+    // already expose the same graph through native PipeWire, whose SDL backend
+    // does not share that shutdown deadlock. The comma-separated value asks SDL
+    // to try PipeWire first while retaining PulseAudio for older installations.
+    // `SDL_SetHint` uses normal priority, so an explicit `SDL_AUDIODRIVER`
+    // environment override still wins for users who require another backend.
+    #[cfg(target_os = "linux")]
+    sdl2::hint::set("SDL_AUDIODRIVER", "pipewire,pulseaudio");
+
     let sdl = sdl2::init().map_err(|error| format!("initialize SDL2: {error}"))?;
     let video = sdl
         .video()

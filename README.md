@@ -36,8 +36,7 @@ An unbundled build reads the following distribution tree at startup:
 assets/data/levels.dat
 assets/data/demo{0,1,2,3,4,5,6,7,8,9}.bin
 assets/gfx/{fixed,moving,chars8,chars6,title,menu,gfx,controls,back,panel}.png
-assets/audio/ADLIB.SND
-assets/audio/{explosion,infotron,push,fall,bug,base,exit}.wav
+assets/audio/{ADLIB,BLASTER}.SND
 ```
 
 Paths are relative to the working directory by default. Set
@@ -144,21 +143,23 @@ distribution root:
 
 - `assets/data/` contains the original level collection and demonstration inputs.
 - `assets/gfx/` contains playback-ready RGBA PNG sheets and screens.
-- `assets/audio/` contains the original `ADLIB.SND` driver/score and
-  playback-ready WAV effects.
+- `assets/audio/` contains the original `ADLIB.SND` and `BLASTER.SND` drivers.
 
-The one-time DOS graphics and sound conversion inputs are intentionally not
-shipped with the runtime tree. Gameplay still addresses the original fixed-tile
+The one-time DOS graphics conversion inputs are intentionally not shipped with
+the runtime tree. Gameplay still addresses the original fixed-tile
 layout and variably sized moving descriptors within the converted PNG sheets.
 The player reads the exact original 5,354-byte `ADLIB.SND` at runtime. A safe
 Rust port of its DOS music routines interprets the file's compact pattern
 bytecode, instrument definitions, frequency tables, tempo changes, transposes,
 and pattern loops at the original 50 Hz interrupt rate, sending each resulting
-register operation directly to a native Rust YM3812 emulator. Effects retain
-the original one-channel priority rules, while music loops independently and
-pauses when the Exit sound is accepted. The default build embeds the complete
-asset tree; `unbundle` reads the same files from disk. Playback requires only
-SDL2, not SDL2_mixer.
+register operation directly to a native Rust YM3812 emulator. The exact original
+39,195-byte `BLASTER.SND` remains the sole effect source: startup validates the
+complete driver, extracts its seven embedded Creative VOC records, and converts
+their unsigned 8-bit mono PCM from 8,333⅓ Hz directly to the callback layout.
+Effects retain the original one-channel priority rules, while music loops
+independently and pauses when the Exit sound is accepted. The default build
+embeds the complete asset tree; `unbundle` reads the same files from disk.
+Playback requires only SDL2, not SDL2_mixer.
 
 ## Verification
 
@@ -172,8 +173,8 @@ Tests cover the CLI range, complete record layout and metadata, row-major board
 indexing, every supplied level, actor movement and collection, gravity
 overrides, falling-object collision matrices, Red Disk planting, ordered and
 chained explosions, Bug timing/RNG, exit gating, PNG asset validation, audio
-event timing, effect priorities, WAV decoding, direct `ADLIB.SND` validation,
-sequencing and synthesis, and fixed-strip bounds.
+event timing, effect priorities, direct `BLASTER.SND` VOC extraction, direct
+`ADLIB.SND` validation, sequencing and synthesis, and fixed-strip bounds.
 
 Format and mapping references:
 

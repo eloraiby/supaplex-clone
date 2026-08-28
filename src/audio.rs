@@ -1,8 +1,9 @@
 //! SDL audio-device ownership, original AdLib music, and Sound Blaster effects.
 //!
-//! This module loads the seven playback-ready WAV effects from the configured
-//! asset source, converts those short clips to the opened-device format, and
-//! mixes them with native OPL2 synthesis in SDL's real-time callback.
+//! This module reads both original DOS driver images from the configured asset
+//! source. It interprets `ADLIB.SND` as live OPL2 music and extracts the seven
+//! embedded Creative VOC records from `BLASTER.SND` as Sound Blaster PCM. The
+//! compact original samples are converted once before the real-time callback.
 
 use std::sync::{
     Arc,
@@ -11,11 +12,7 @@ use std::sync::{
 
 use sdl2::{
     AudioSubsystem,
-    audio::{
-        AudioCVT, AudioCallback, AudioDevice, AudioFormat, AudioSpec, AudioSpecDesired,
-        AudioSpecWAV,
-    },
-    rwops::RWops,
+    audio::{AudioCallback, AudioDevice, AudioSpec, AudioSpecDesired},
 };
 
 use crate::{assets, game::SoundEffect, opl::OplPlayer};
@@ -34,6 +31,51 @@ const PRIORITY_UNIT_MILLISECONDS: usize = 20;
 
 /// Background level used before effects are added to the callback buffer.
 const MUSIC_VOLUME: f32 = 0.38;
+
+/// Exact byte length of the original Supaplex `BLASTER.SND` driver image.
+const BLASTER_DRIVER_LENGTH: usize = 39_195;
+
+/// CRC-32 of the exact original Sound Blaster driver accepted by this decoder.
+const BLASTER_DRIVER_CRC32: u32 = 0xf800_d380;
+
+/// Standard twenty-byte signature beginning every embedded Creative VOC file.
+const VOC_SIGNATURE: &[u8; 20] = b"Creative Voice File\x1a";
+
+/// Header size stored by each version-1.10 VOC record in the original driver.
+const VOC_HEADER_LENGTH: usize = 26;
+
+/// Little-endian version word identifying Creative Voice File revision 1.10.
+const VOC_VERSION: u16 = 0x010a;
+
+/// Revision complement stored beside [`VOC_VERSION`] by every embedded record.
+const VOC_VERSION_CHECKSUM: u16 = 0x1129;
+
+/// VOC block type containing the time constant, codec, and unsigned PCM bytes.
+const VOC_SOUND_DATA_BLOCK: u8 = 1;
+
+/// Original VOC time constant producing `1_000_000 / (256 - 0x88)` hertz.
+const VOC_TIME_CONSTANT: u8 = 0x88;
+
+/// Creative VOC codec zero denotes uncompressed unsigned eight-bit PCM.
+const VOC_PCM_CODEC: u8 = 0;
+
+/// VOC block type zero marks the end immediately following each PCM payload.
+const VOC_TERMINATOR_BLOCK: u8 = 0;
+
+/// Reduced numerator of the exact 8,333-and-one-third-hertz source rate.
+const BLASTER_SAMPLE_RATE_NUMERATOR: usize = 25_000;
+
+/// Reduced denominator of the exact 8,333-and-one-third-hertz source rate.
+const BLASTER_SAMPLE_RATE_DENOMINATOR: usize = 3;
+
+/// Linear gain matching the previous conversions' intentional -3.6 dB headroom.
+const BLASTER_EFFECT_GAIN: f32 = 0.660_693_47;
+
+/// Start offsets of Explosion through Exit VOC records inside `BLASTER.SND`.
+const BLASTER_VOC_OFFSETS: [usize; 7] = [0x028f, 0x2dd4, 0x3d1f, 0x4488, 0x4cdb, 0x549a, 0x5515];
+
+/// Exact unsigned PCM lengths corresponding to [`BLASTER_VOC_OFFSETS`].
+const BLASTER_PCM_LENGTHS: [usize; 7] = [11_044, 3_882, 1_864, 2_098, 1_950, 90, 14_960];
 
 /// Number of ordered operations retained between the game and audio callback.
 ///
@@ -77,8 +119,11 @@ impl AudioPlayer {
         // production data produces a normal initialization error rather than
         // panicking inside SDL's callback-construction closure.
         let asset_set = assets::load_audio().map_err(|error| error.to_string())?;
-        let effect_bytes = std::array::from_fn(|index| asset_set.effects[index].as_ref());
-        let effects = EffectBank::decode(effect_bytes, OUTPUT_FREQUENCY, OUTPUT_CHANNELS)?;
+        let effects = EffectBank::decode(
+            asset_set.effects.as_ref(),
+            OUTPUT_FREQUENCY,
+            OUTPUT_CHANNELS,
+        )?;
         let music = OplPlayer::new(asset_set.music.as_ref(), OUTPUT_FREQUENCY as u32)
             .map_err(|error| format!("decode production OPL music: {error}"))?;
         let (command_sender, command_receiver) = audio_command_channel();
@@ -415,14 +460,16 @@ struct EffectBank {
 }
 
 impl EffectBank {
-    /// Decodes every production WAV into one uniform callback format.
-    fn decode(encoded_effects: [&[u8]; 7], frequency: i32, channels: u8) -> Result<Self, String> {
-        // Preserve enum order explicitly so adding an effect cannot silently
-        // associate one trigger with a different clip.
+    /// Extracts and converts every original VOC into one callback sample layout.
+    fn decode(driver: &[u8], frequency: i32, channels: u8) -> Result<Self, String> {
+        // Parsing returns the exact semantic order used by `SoundEffect::index`.
+        // Conversion happens before opening the SDL device, leaving the callback
+        // with immutable device-rate samples and no format work or allocation.
+        let encoded_effects = parse_blaster_effects(driver)?;
         let mut clips = Vec::with_capacity(encoded_effects.len());
         for (index, encoded) in encoded_effects.into_iter().enumerate() {
             clips.push(
-                decode_wav(encoded, frequency, channels)
+                convert_blaster_pcm(encoded, frequency, channels)
                     .map_err(|error| format!("decode production effect {index}: {error}"))?
                     .into_boxed_slice(),
             );
@@ -701,40 +748,208 @@ impl EffectPolicy {
     }
 }
 
-/// Decodes one in-memory WAV and converts it to native-endian stereo `f32`.
-fn decode_wav(encoded: &[u8], frequency: i32, channels: u8) -> Result<Vec<f32>, String> {
-    // SDL_LoadWAV parses headers and expands supported compressed WAV payloads;
-    // AudioCVT then normalizes rate, layout, and sample representation once.
-    let mut source =
-        RWops::from_bytes(encoded).map_err(|error| format!("open memory WAV: {error}"))?;
-    let wav = AudioSpecWAV::load_wav_rw(&mut source)
-        .map_err(|error| format!("load WAV payload: {error}"))?;
-    let converter = AudioCVT::new(
-        wav.format,
-        wav.channels,
-        wav.freq,
-        AudioFormat::f32_sys(),
-        channels,
-        frequency,
-    )
-    .map_err(|error| format!("build WAV conversion: {error}"))?;
-    let converted = converter.convert(wav.buffer().to_vec());
-    if !converted.len().is_multiple_of(size_of::<f32>()) {
-        return Err("converted WAV has a partial floating-point sample".to_owned());
+/// Validates the original driver and returns its seven borrowed PCM payloads.
+fn parse_blaster_effects(driver: &[u8]) -> Result<[&[u8]; 7], String> {
+    // Fixed offsets are appropriate only for the one source revision whose
+    // complete identity is established first. This rejects repacks and damage
+    // before any driver-derived index reaches a slice operation.
+    if driver.len() != BLASTER_DRIVER_LENGTH {
+        return Err(format!(
+            "BLASTER.SND is {} bytes; expected {BLASTER_DRIVER_LENGTH}",
+            driver.len()
+        ));
+    }
+    let checksum = crc32(driver);
+    if checksum != BLASTER_DRIVER_CRC32 {
+        return Err(format!(
+            "BLASTER.SND CRC-32 is {checksum:08x}; expected {BLASTER_DRIVER_CRC32:08x}"
+        ));
     }
 
-    // AudioCVT writes native-endian samples because the requested callback
-    // channel is native `f32`; explicit chunks avoid alignment assumptions.
-    let (sample_bytes, remainder) = converted.as_chunks::<{ size_of::<f32>() }>();
-    debug_assert!(remainder.is_empty(), "the length check rejects a remainder");
-    let samples = sample_bytes
+    // Each record is parsed independently even though the complete checksum is
+    // known. These structural checks document the embedded VOC contract and
+    // make a future deliberately supported driver revision fail descriptively.
+    let mut effects = Vec::with_capacity(BLASTER_VOC_OFFSETS.len());
+    for (effect_index, (&offset, &expected_length)) in BLASTER_VOC_OFFSETS
         .iter()
-        .map(|bytes| f32::from_ne_bytes(*bytes))
-        .collect::<Vec<_>>();
-    if samples.is_empty() {
-        return Err("converted WAV contains no samples".to_owned());
+        .zip(&BLASTER_PCM_LENGTHS)
+        .enumerate()
+    {
+        effects.push(parse_voc_pcm(
+            driver,
+            offset,
+            expected_length,
+            effect_index,
+        )?);
+    }
+    effects
+        .try_into()
+        .map_err(|_| "BLASTER.SND effect table does not contain seven records".to_owned())
+}
+
+/// Parses one exact uncompressed Creative VOC record from the driver image.
+fn parse_voc_pcm(
+    driver: &[u8],
+    offset: usize,
+    expected_length: usize,
+    effect_index: usize,
+) -> Result<&[u8], String> {
+    // The full driver length and checksum make every fixed read safe. Checked
+    // range construction remains explicit so this parser also documents each
+    // boundary instead of relying on an opaque indexing panic.
+    let signature_end = offset
+        .checked_add(VOC_SIGNATURE.len())
+        .ok_or_else(|| format!("effect {effect_index} VOC signature offset overflow"))?;
+    if driver.get(offset..signature_end) != Some(VOC_SIGNATURE.as_slice()) {
+        return Err(format!(
+            "effect {effect_index} has no Creative VOC signature"
+        ));
+    }
+
+    let header_length = read_u16(driver, offset + 20, effect_index, "header length")?;
+    let version = read_u16(driver, offset + 22, effect_index, "version")?;
+    let version_checksum = read_u16(driver, offset + 24, effect_index, "version checksum")?;
+    if usize::from(header_length) != VOC_HEADER_LENGTH
+        || version != VOC_VERSION
+        || version_checksum != VOC_VERSION_CHECKSUM
+    {
+        return Err(format!(
+            "effect {effect_index} has unsupported VOC header {header_length}/{version:04x}/{version_checksum:04x}"
+        ));
+    }
+
+    let block_offset = offset + VOC_HEADER_LENGTH;
+    if driver.get(block_offset).copied() != Some(VOC_SOUND_DATA_BLOCK) {
+        return Err(format!(
+            "effect {effect_index} does not begin with a VOC sound-data block"
+        ));
+    }
+    let block_length = read_u24(driver, block_offset + 1, effect_index)?;
+    if block_length != expected_length + 2 {
+        return Err(format!(
+            "effect {effect_index} contains {} PCM bytes; expected {expected_length}",
+            block_length.saturating_sub(2)
+        ));
+    }
+
+    let payload_offset = block_offset + 4;
+    if driver.get(payload_offset).copied() != Some(VOC_TIME_CONSTANT)
+        || driver.get(payload_offset + 1).copied() != Some(VOC_PCM_CODEC)
+    {
+        return Err(format!(
+            "effect {effect_index} is not 8,333 Hz unsigned eight-bit VOC PCM"
+        ));
+    }
+    let samples_start = payload_offset + 2;
+    let samples_end = samples_start
+        .checked_add(expected_length)
+        .ok_or_else(|| format!("effect {effect_index} PCM range overflow"))?;
+    let samples = driver
+        .get(samples_start..samples_end)
+        .ok_or_else(|| format!("effect {effect_index} PCM extends past BLASTER.SND"))?;
+    if driver.get(samples_end).copied() != Some(VOC_TERMINATOR_BLOCK) {
+        return Err(format!("effect {effect_index} VOC has no terminator"));
     }
     Ok(samples)
+}
+
+/// Reads one little-endian VOC word with a field-specific corruption error.
+fn read_u16(bytes: &[u8], offset: usize, effect_index: usize, field: &str) -> Result<u16, String> {
+    // `get` keeps this helper total if another source revision is supported in
+    // the future without first extending every fixed record boundary.
+    let value = bytes
+        .get(offset..offset + 2)
+        .ok_or_else(|| format!("effect {effect_index} VOC {field} is truncated"))?;
+    Ok(u16::from_le_bytes([value[0], value[1]]))
+}
+
+/// Reads one little-endian 24-bit VOC block length into a native `usize`.
+fn read_u24(bytes: &[u8], offset: usize, effect_index: usize) -> Result<usize, String> {
+    // VOC uses three-byte block lengths, so reconstruct the value explicitly
+    // rather than borrowing a four-byte integer and accidentally crossing data.
+    let value = bytes
+        .get(offset..offset + 3)
+        .ok_or_else(|| format!("effect {effect_index} VOC block length is truncated"))?;
+    Ok(usize::from(value[0]) | (usize::from(value[1]) << 8) | (usize::from(value[2]) << 16))
+}
+
+/// Converts one original unsigned PCM clip to interleaved device-rate floats.
+fn convert_blaster_pcm(source: &[u8], frequency: i32, channels: u8) -> Result<Vec<f32>, String> {
+    // Both values originate in the requested and obtained SDL layout, but
+    // validate them here so arithmetic cannot silently accept an invalid host.
+    let output_frequency = usize::try_from(frequency)
+        .ok()
+        .filter(|value| *value > 0)
+        .ok_or_else(|| format!("invalid output frequency {frequency}"))?;
+    let output_channels = usize::from(channels);
+    if output_channels == 0 {
+        return Err("output channel count is zero".to_owned());
+    }
+    if source.is_empty() {
+        return Err("original Sound Blaster PCM is empty".to_owned());
+    }
+
+    // One source sample spans three 1/25,000-second units. Round the resulting
+    // device-frame count to the nearest frame without floating-point duration
+    // drift, then reserve the final interleaved storage exactly once.
+    let frame_numerator = source
+        .len()
+        .checked_mul(output_frequency)
+        .and_then(|value| value.checked_mul(BLASTER_SAMPLE_RATE_DENOMINATOR))
+        .ok_or_else(|| "Sound Blaster output frame count overflow".to_owned())?;
+    let output_frames = frame_numerator
+        .checked_add(BLASTER_SAMPLE_RATE_NUMERATOR / 2)
+        .ok_or_else(|| "Sound Blaster frame rounding overflow".to_owned())?
+        / BLASTER_SAMPLE_RATE_NUMERATOR;
+    let output_length = output_frames
+        .checked_mul(output_channels)
+        .ok_or_else(|| "Sound Blaster interleaved output length overflow".to_owned())?;
+    let mut output = Vec::with_capacity(output_length);
+    let position_denominator = output_frequency
+        .checked_mul(BLASTER_SAMPLE_RATE_DENOMINATOR)
+        .ok_or_else(|| "Sound Blaster resampling denominator overflow".to_owned())?;
+
+    for output_frame in 0..output_frames {
+        // Linear interpolation retains the original duration and endpoints while
+        // avoiding the harsh staircase of merely repeating each 8.3-kHz byte.
+        let position_numerator = output_frame
+            .checked_mul(BLASTER_SAMPLE_RATE_NUMERATOR)
+            .ok_or_else(|| "Sound Blaster resampling position overflow".to_owned())?;
+        let source_index = (position_numerator / position_denominator).min(source.len() - 1);
+        let next_index = (source_index + 1).min(source.len() - 1);
+        let fraction =
+            (position_numerator % position_denominator) as f32 / position_denominator as f32;
+        let current = normalize_blaster_sample(source[source_index]);
+        let next = normalize_blaster_sample(source[next_index]);
+        let sample = current + (next - current) * fraction;
+
+        // Original PCM is mono. Replicating the converted value into every
+        // obtained channel preserves centered output without another buffer.
+        output.extend(std::iter::repeat_n(sample, output_channels));
+    }
+    Ok(output)
+}
+
+/// Maps one unsigned DAC byte to normalized PCM with retained mixing headroom.
+fn normalize_blaster_sample(sample: u8) -> f32 {
+    // Creative PCM centers silence at 128. Dividing by 128 maps the asymmetric
+    // byte domain to [-1.0, 0.9921875] before applying the historical -3.6 dB.
+    (f32::from(sample) - 128.0) / 128.0 * BLASTER_EFFECT_GAIN
+}
+
+/// Calculates reflected IEEE CRC-32 for exact `BLASTER.SND` identification.
+fn crc32(bytes: &[u8]) -> u32 {
+    // The complemented accumulator and polynomial match standard CRC-32 while
+    // avoiding a dependency for one small startup-only integrity check.
+    let mut crc = u32::MAX;
+    for byte in bytes {
+        crc ^= u32::from(*byte);
+        for _ in 0..8 {
+            let mask = 0_u32.wrapping_sub(crc & 1);
+            crc = (crc >> 1) ^ (0xedb8_8320 & mask);
+        }
+    }
+    !crc
 }
 
 #[cfg(test)]
@@ -747,8 +962,9 @@ mod tests {
     };
 
     use super::{
-        AudioCallback, AudioCommand, AudioCommandSender, AudioSpec, COMMAND_QUEUE_CAPACITY,
-        EffectBank, Mixer, OUTPUT_CHANNELS, OUTPUT_FREQUENCY, audio_command_channel,
+        AudioCallback, AudioCommand, AudioCommandSender, AudioSpec, BLASTER_DRIVER_CRC32,
+        BLASTER_DRIVER_LENGTH, BLASTER_PCM_LENGTHS, COMMAND_QUEUE_CAPACITY, EffectBank, Mixer,
+        OUTPUT_CHANNELS, OUTPUT_FREQUENCY, audio_command_channel, crc32, parse_blaster_effects,
     };
     use crate::{assets, game::SoundEffect, opl::OplPlayer};
 
@@ -787,20 +1003,49 @@ mod tests {
         )
     }
 
-    /// Confirms each production WAV becomes non-empty interleaved stereo data.
+    /// Confirms the exact original driver exposes all seven embedded VOC clips.
     #[test]
-    fn production_effects_decode_for_the_callback_layout() {
+    fn production_blaster_driver_decodes_for_the_callback_layout() {
         let asset_set = assets::load_audio().expect("production audio should load");
-        let effect_bytes = std::array::from_fn(|index| asset_set.effects[index].as_ref());
-        let effects = EffectBank::decode(effect_bytes, OUTPUT_FREQUENCY, OUTPUT_CHANNELS)
+        let driver = asset_set.effects.as_ref();
+        let source_effects = parse_blaster_effects(driver)
+            .expect("production Sound Blaster VOC records should decode");
+        let effects = EffectBank::decode(driver, OUTPUT_FREQUENCY, OUTPUT_CHANNELS)
             .expect("production Sound Blaster effects should decode");
 
-        // Every clip must contain whole stereo frames and audible non-zero PCM.
+        // Source identity and lengths prevent a generated replacement from
+        // silently becoming the production asset. Converted clips must retain
+        // complete centered frames with at least one audible sample.
+        assert_eq!(driver.len(), BLASTER_DRIVER_LENGTH);
+        assert_eq!(crc32(driver), BLASTER_DRIVER_CRC32);
+        assert_eq!(source_effects.map(<[u8]>::len), BLASTER_PCM_LENGTHS);
         for clip in &effects.clips {
             assert!(!clip.is_empty());
             assert!(clip.len().is_multiple_of(usize::from(OUTPUT_CHANNELS)));
             assert!(clip.iter().any(|sample| *sample != 0.0));
         }
+    }
+
+    /// Confirms damaged or incomplete driver images fail before VOC indexing.
+    #[test]
+    fn rejects_modified_and_truncated_blaster_drivers() {
+        let asset_set = assets::load_audio().expect("production audio should load");
+        let driver = asset_set.effects.as_ref();
+        let mut modified = driver.to_vec();
+        modified[0x028f] ^= 1;
+
+        // A same-sized mutation reaches the checksum diagnostic, while removing
+        // one byte is rejected by the size contract before checksum traversal.
+        assert!(
+            parse_blaster_effects(&modified)
+                .expect_err("modified BLASTER.SND should fail")
+                .contains("CRC-32")
+        );
+        assert!(
+            parse_blaster_effects(&driver[..driver.len() - 1])
+                .expect_err("truncated BLASTER.SND should fail")
+                .contains("39194 bytes")
+        );
     }
 
     /// Confirms requests obey the original global priority comparisons.

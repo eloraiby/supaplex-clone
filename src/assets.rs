@@ -22,17 +22,9 @@ const LEVELS_PATH: &str = "assets/data/levels.dat";
 #[cfg(feature = "unbundle")]
 const MUSIC_PATH: &str = "assets/audio/ADLIB.SND";
 
-/// Relative Sound Blaster effect locations in semantic sound-effect order.
+/// Relative location of the original DOS Sound Blaster driver and PCM effects.
 #[cfg(feature = "unbundle")]
-const EFFECT_PATHS: [&str; 7] = [
-    "assets/audio/explosion.wav",
-    "assets/audio/infotron.wav",
-    "assets/audio/push.wav",
-    "assets/audio/fall.wav",
-    "assets/audio/bug.wav",
-    "assets/audio/base.wav",
-    "assets/audio/exit.wav",
-];
+const EFFECTS_PATH: &str = "assets/audio/BLASTER.SND";
 
 /// Relative locations of the ten original attract-mode input streams.
 #[cfg(feature = "unbundle")]
@@ -163,8 +155,8 @@ pub(crate) struct GraphicsAssets {
 pub(crate) struct AudioAssets {
     /// Original DOS AdLib driver containing the compact score and instruments.
     pub(crate) music: AssetBytes,
-    /// Sound Blaster WAV renders in the stable semantic effect order.
-    pub(crate) effects: [AssetBytes; 7],
+    /// Original DOS Sound Blaster driver containing seven embedded VOC records.
+    pub(crate) effects: AssetBytes,
 }
 
 /// Complete original attract-mode demo payload set in F1 through F10 order.
@@ -226,38 +218,22 @@ pub(crate) fn load_graphics() -> Result<GraphicsAssets, AssetError> {
     }
 }
 
-/// Loads music and all seven effects from the selected production source.
+/// Loads both original hardware drivers from the selected production source.
 pub(crate) fn load_audio() -> Result<AudioAssets, AssetError> {
-    // The fixed array preserves the contract with `SoundEffect::index`; a
-    // missing external clip fails initialization instead of shifting later clips.
+    // Runtime decoders validate each complete driver before interpreting its
+    // internal tables, so bundled and unbundled distributions share one format.
     #[cfg(not(feature = "unbundle"))]
     {
         Ok(AudioAssets {
             music: AssetBytes::embedded(include_bytes!("../assets/audio/ADLIB.SND")),
-            effects: [
-                AssetBytes::embedded(include_bytes!("../assets/audio/explosion.wav")),
-                AssetBytes::embedded(include_bytes!("../assets/audio/infotron.wav")),
-                AssetBytes::embedded(include_bytes!("../assets/audio/push.wav")),
-                AssetBytes::embedded(include_bytes!("../assets/audio/fall.wav")),
-                AssetBytes::embedded(include_bytes!("../assets/audio/bug.wav")),
-                AssetBytes::embedded(include_bytes!("../assets/audio/base.wav")),
-                AssetBytes::embedded(include_bytes!("../assets/audio/exit.wav")),
-            ],
+            effects: AssetBytes::embedded(include_bytes!("../assets/audio/BLASTER.SND")),
         })
     }
     #[cfg(feature = "unbundle")]
     {
         Ok(AudioAssets {
             music: load_external(MUSIC_PATH)?,
-            effects: [
-                load_external(EFFECT_PATHS[0])?,
-                load_external(EFFECT_PATHS[1])?,
-                load_external(EFFECT_PATHS[2])?,
-                load_external(EFFECT_PATHS[3])?,
-                load_external(EFFECT_PATHS[4])?,
-                load_external(EFFECT_PATHS[5])?,
-                load_external(EFFECT_PATHS[6])?,
-            ],
+            effects: load_external(EFFECTS_PATH)?,
         })
     }
 }
@@ -404,12 +380,11 @@ mod tests {
         }
         assert_eq!(audio.music.as_ref().len(), 5_354);
         assert_eq!(&audio.music.as_ref()[..4], b"\xfb\x53\x51\x52");
-        assert_eq!(audio.effects.len(), 7);
-        assert!(
-            audio
-                .effects
-                .iter()
-                .all(|effect| effect.as_ref().starts_with(b"RIFF"))
+        assert_eq!(audio.effects.as_ref().len(), 39_195);
+        assert_eq!(&audio.effects.as_ref()[..4], b"\xfb\x53\x51\x52");
+        assert_eq!(
+            &audio.effects.as_ref()[0x028f..0x02a3],
+            b"Creative Voice File\x1a"
         );
         assert_eq!(demos.demos.len(), 10);
         for (index, demo) in demos.demos.iter().enumerate() {
