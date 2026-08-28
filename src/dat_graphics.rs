@@ -43,8 +43,34 @@ pub const CHARS8_WIDTH: u32 = 512;
 /// Height in pixels of the original `CHARS8.DAT` font bitmap.
 pub const CHARS8_HEIGHT: u32 = 8;
 
+/// Width in pixels of the original `CHARS6.DAT` menu font bitmap.
+pub const CHARS6_WIDTH: u32 = 512;
+
+/// Height in pixels of the original `CHARS6.DAT` menu font bitmap.
+pub const CHARS6_HEIGHT: u32 = 8;
+
+/// Width in pixels of each original full-screen DOS bitmap.
+pub const SCREEN_WIDTH: u32 = 320;
+
+/// Height in pixels of each original full-screen DOS bitmap.
+pub const SCREEN_HEIGHT: u32 = 200;
+
+/// Width in pixels of the original in-game status panel.
+pub const PANEL_WIDTH: u32 = SCREEN_WIDTH;
+
+/// Height in pixels of the original in-game status panel.
+pub const PANEL_HEIGHT: u32 = 24;
+
 /// Zero-based `PALETTES.DAT` palette used by both gameplay sprite sheets.
 pub const GAME_PALETTE_INDEX: usize = 1;
+
+/// Original 16-entry title palette stored in the executable rather than a DAT.
+const TITLE_PALETTE_NIBBLES: [u8; PALETTES_DAT_SIZE / PALETTE_COUNT] = [
+    0x02, 0x03, 0x05, 0x00, 0x0d, 0x0a, 0x04, 0x0c, 0x02, 0x06, 0x06, 0x02, 0x03, 0x09, 0x09, 0x03,
+    0x0b, 0x08, 0x03, 0x06, 0x02, 0x07, 0x07, 0x0a, 0x08, 0x06, 0x0d, 0x09, 0x06, 0x04, 0x0b, 0x01,
+    0x09, 0x01, 0x00, 0x04, 0x0b, 0x01, 0x00, 0x04, 0x0d, 0x01, 0x00, 0x0c, 0x0f, 0x01, 0x00, 0x0c,
+    0x0f, 0x06, 0x04, 0x0c, 0x02, 0x05, 0x06, 0x08, 0x0f, 0x0c, 0x06, 0x0e, 0x0c, 0x0c, 0x0d, 0x0e,
+];
 
 /// Fully opaque RGBA colour used by decoded images and renderer uploads.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -109,6 +135,27 @@ pub struct Palette {
 }
 
 impl Palette {
+    /// Decodes the executable-resident palette representation used by title art.
+    fn from_nibbles(bytes: &[u8; COLORS_PER_PALETTE * BYTES_PER_PALETTE_ENTRY]) -> Self {
+        // The constant is trusted to contain nibbles. Retaining the fourth byte
+        // preserves the same EGA metadata exposed for palettes read from disk.
+        debug_assert!(bytes.iter().all(|value| *value <= 0x0f));
+        let mut entries = [EMPTY_PALETTE_ENTRY; COLORS_PER_PALETTE];
+        for (color_index, entry) in entries.iter_mut().enumerate() {
+            let offset = color_index * BYTES_PER_PALETTE_ENTRY;
+            *entry = PaletteEntry {
+                rgba: Rgba::new(
+                    expand_nibble(bytes[offset]),
+                    expand_nibble(bytes[offset + 1]),
+                    expand_nibble(bytes[offset + 2]),
+                    u8::MAX,
+                ),
+                ega_selector: bytes[offset + 3],
+            };
+        }
+        Self { entries }
+    }
+
     /// Returns the RGBA colour at `index`, or `None` outside `0..16`.
     pub fn rgba(&self, index: usize) -> Option<Rgba> {
         // The optional lookup lets tools inspect untrusted indices without a
@@ -222,6 +269,14 @@ pub enum DatAsset {
     Moving,
     /// Eight-pixel-high binary font glyphs arranged in a 512×8 strip.
     Chars8,
+    /// Six-pixel-advance menu font glyphs stored in a 512×8 binary strip.
+    Chars6,
+    /// Original 320×200 title picture with its executable-resident palette.
+    Title,
+    /// Original 320×200 main-menu background using gameplay palette 1.
+    Menu,
+    /// Original 320×24 in-game status panel using gameplay palette 1.
+    Panel,
 }
 
 impl DatAsset {
@@ -233,6 +288,10 @@ impl DatAsset {
             "fixed" | "fixed.dat" => Ok(Self::Fixed),
             "moving" | "moving.dat" => Ok(Self::Moving),
             "chars8" | "chars8.dat" => Ok(Self::Chars8),
+            "chars6" | "chars6.dat" => Ok(Self::Chars6),
+            "title" | "title.dat" => Ok(Self::Title),
+            "menu" | "menu.dat" => Ok(Self::Menu),
+            "panel" | "panel.dat" => Ok(Self::Panel),
             _ => Err(GraphicsError::UnknownAsset(name.to_owned())),
         }
     }
@@ -255,6 +314,10 @@ impl DatAsset {
             Self::Fixed => "fixed.dat",
             Self::Moving => "moving.dat",
             Self::Chars8 => "chars8.dat",
+            Self::Chars6 => "chars6.dat",
+            Self::Title => "title.dat",
+            Self::Menu => "menu.dat",
+            Self::Panel => "panel.dat",
         }
     }
 
@@ -265,6 +328,9 @@ impl DatAsset {
             Self::Fixed => FIXED_WIDTH,
             Self::Moving => MOVING_WIDTH,
             Self::Chars8 => CHARS8_WIDTH,
+            Self::Chars6 => CHARS6_WIDTH,
+            Self::Title | Self::Menu => SCREEN_WIDTH,
+            Self::Panel => PANEL_WIDTH,
         }
     }
 
@@ -275,6 +341,9 @@ impl DatAsset {
             Self::Fixed => FIXED_HEIGHT,
             Self::Moving => MOVING_HEIGHT,
             Self::Chars8 => CHARS8_HEIGHT,
+            Self::Chars6 => CHARS6_HEIGHT,
+            Self::Title | Self::Menu => SCREEN_HEIGHT,
+            Self::Panel => PANEL_HEIGHT,
         }
     }
 
@@ -282,8 +351,10 @@ impl DatAsset {
     pub const fn encoding(self) -> DatEncoding {
         // Sprite graphics are planar while the font is a one-bit mask.
         match self {
-            Self::Fixed | Self::Moving => DatEncoding::Planar4Bpp,
-            Self::Chars8 => DatEncoding::Binary1Bpp,
+            Self::Fixed | Self::Moving | Self::Title | Self::Menu | Self::Panel => {
+                DatEncoding::Planar4Bpp
+            }
+            Self::Chars8 | Self::Chars6 => DatEncoding::Binary1Bpp,
         }
     }
 
@@ -292,8 +363,8 @@ impl DatAsset {
         // Binary font bits use caller-selected monochrome colours and therefore
         // do not consume one of the four palettes stored in `PALETTES.DAT`.
         match self {
-            Self::Fixed | Self::Moving => Some(GAME_PALETTE_INDEX),
-            Self::Chars8 => None,
+            Self::Fixed | Self::Moving | Self::Menu | Self::Panel => Some(GAME_PALETTE_INDEX),
+            Self::Chars8 | Self::Chars6 | Self::Title => None,
         }
     }
 
@@ -306,7 +377,7 @@ impl DatAsset {
         // Known planar assets require palette 1.  The font deliberately uses
         // an opaque black/white mapping so its PNG remains easy to inspect.
         match self {
-            Self::Fixed | Self::Moving => {
+            Self::Fixed | Self::Moving | Self::Menu | Self::Panel => {
                 let palette_index = self.palette_index().expect("planar asset has a palette");
                 let palette = palettes
                     .and_then(|palettes| palettes.get(palette_index))
@@ -316,11 +387,33 @@ impl DatAsset {
                     })?;
                 decode_planar_rgba(bytes, self.width(), self.height(), palette)
             }
-            Self::Chars8 => {
+            Self::Chars8 | Self::Chars6 => {
                 decode_binary_rgba(bytes, self.width(), self.height(), Rgba::BLACK, Rgba::WHITE)
+            }
+            Self::Title => {
+                // Supaplex reads exactly one 160-byte planar row for each of the
+                // 200 scanlines and ignores the historical trailing byte found
+                // in some TITLE.DAT distributions. Accept only that known quirk.
+                let expected = planar_payload_size(self.width(), self.height());
+                let bitmap = match bytes.len() {
+                    length if length == expected => bytes,
+                    length if length == expected + 1 => &bytes[..expected],
+                    _ => bytes,
+                };
+                let palette = Palette::from_nibbles(&TITLE_PALETTE_NIBBLES);
+                decode_planar_rgba(bitmap, self.width(), self.height(), &palette)
             }
         }
     }
+}
+
+/// Returns the exact byte count of a byte-aligned four-plane bitmap.
+fn planar_payload_size(width: u32, height: u32) -> usize {
+    // Every eight pixels consume four bytes. All known asset constants are
+    // byte-aligned and small enough to convert and multiply without overflow.
+    usize::try_from(width / 8).expect("known width fits usize")
+        * 4
+        * usize::try_from(height).expect("known height fits usize")
 }
 
 impl fmt::Display for DatAsset {
@@ -656,7 +749,7 @@ impl fmt::Display for GraphicsError {
             ),
             Self::UnknownAsset(name) => write!(
                 formatter,
-                "unsupported DAT asset {name:?}; expected fixed.dat, moving.dat, or chars8.dat"
+                "unsupported DAT asset {name:?}; expected fixed.dat, moving.dat, chars8.dat, chars6.dat, title.dat, menu.dat, or panel.dat"
             ),
         }
     }
@@ -669,9 +762,10 @@ mod tests {
     //! Focused format tests plus smoke tests against the bundled DOS assets.
 
     use super::{
-        CHARS8_HEIGHT, CHARS8_WIDTH, COLORS_PER_PALETTE, DatAsset, DatEncoding, FIXED_HEIGHT,
-        FIXED_WIDTH, GAME_PALETTE_INDEX, GraphicsError, MOVING_HEIGHT, MOVING_WIDTH,
-        PALETTES_DAT_SIZE, Palettes, Rgba, decode_binary_rgba, decode_planar_rgba,
+        CHARS6_HEIGHT, CHARS6_WIDTH, CHARS8_HEIGHT, CHARS8_WIDTH, COLORS_PER_PALETTE, DatAsset,
+        DatEncoding, FIXED_HEIGHT, FIXED_WIDTH, GAME_PALETTE_INDEX, GraphicsError, MOVING_HEIGHT,
+        MOVING_WIDTH, PALETTES_DAT_SIZE, PANEL_HEIGHT, PANEL_WIDTH, Palettes, Rgba, SCREEN_HEIGHT,
+        SCREEN_WIDTH, decode_binary_rgba, decode_planar_rgba,
     };
 
     /// Builds palettes whose first record maps each index to a visible red.
@@ -786,13 +880,13 @@ mod tests {
         assert_eq!(DatAsset::from_name("FIXED.DAT"), Ok(DatAsset::Fixed));
         assert_eq!(DatAsset::from_name("moving"), Ok(DatAsset::Moving));
         assert_eq!(DatAsset::from_name("Chars8.dat"), Ok(DatAsset::Chars8));
-        assert!(matches!(
-            DatAsset::from_name("panel.dat"),
-            Err(GraphicsError::UnknownAsset(_))
-        ));
+        assert_eq!(DatAsset::from_name("chars6"), Ok(DatAsset::Chars6));
+        assert_eq!(DatAsset::from_name("TITLE.DAT"), Ok(DatAsset::Title));
+        assert_eq!(DatAsset::from_name("menu.dat"), Ok(DatAsset::Menu));
+        assert_eq!(DatAsset::from_name("panel.dat"), Ok(DatAsset::Panel));
     }
 
-    /// Decodes all three bundled files to verify their documented geometries.
+    /// Decodes every production source file to verify its documented geometry.
     #[test]
     fn decodes_bundled_gameplay_assets() {
         let palettes = Palettes::decode(include_bytes!("../data/palettes.dat"))
@@ -809,6 +903,22 @@ mod tests {
             (
                 DatAsset::Chars8,
                 include_bytes!("../data/chars8.dat").as_slice(),
+            ),
+            (
+                DatAsset::Chars6,
+                include_bytes!("../data/chars6.dat").as_slice(),
+            ),
+            (
+                DatAsset::Title,
+                include_bytes!("../data/title.dat").as_slice(),
+            ),
+            (
+                DatAsset::Menu,
+                include_bytes!("../data/menu.dat").as_slice(),
+            ),
+            (
+                DatAsset::Panel,
+                include_bytes!("../data/panel.dat").as_slice(),
             ),
         ];
 
@@ -829,6 +939,9 @@ mod tests {
         assert_eq!((FIXED_WIDTH, FIXED_HEIGHT), (640, 16));
         assert_eq!((MOVING_WIDTH, MOVING_HEIGHT), (320, 462));
         assert_eq!((CHARS8_WIDTH, CHARS8_HEIGHT), (512, 8));
+        assert_eq!((CHARS6_WIDTH, CHARS6_HEIGHT), (512, 8));
+        assert_eq!((SCREEN_WIDTH, SCREEN_HEIGHT), (320, 200));
+        assert_eq!((PANEL_WIDTH, PANEL_HEIGHT), (320, 24));
         assert_eq!(DatAsset::Fixed.palette_index(), Some(GAME_PALETTE_INDEX));
     }
 }

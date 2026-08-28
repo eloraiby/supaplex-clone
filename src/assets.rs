@@ -43,6 +43,18 @@ pub(crate) const MOVING_GRAPHICS_PATH: &str = "assets/gfx/moving.png";
 /// Relative location of the converted eight-pixel font.
 pub(crate) const FONT_GRAPHICS_PATH: &str = "assets/gfx/chars8.png";
 
+/// Relative location of the converted six-pixel-advance menu font.
+pub(crate) const MENU_FONT_GRAPHICS_PATH: &str = "assets/gfx/chars6.png";
+
+/// Relative location of the original title screen conversion.
+pub(crate) const TITLE_GRAPHICS_PATH: &str = "assets/gfx/title.png";
+
+/// Relative location of the original main-menu background conversion.
+pub(crate) const MENU_GRAPHICS_PATH: &str = "assets/gfx/menu.png";
+
+/// Relative location of the original in-game status-panel conversion.
+pub(crate) const PANEL_GRAPHICS_PATH: &str = "assets/gfx/panel.png";
+
 /// Bytes borrowed from the executable or owned after an unbundled file read.
 #[derive(Debug)]
 pub struct AssetBytes {
@@ -106,6 +118,14 @@ pub(crate) struct GraphicsAssets {
     pub(crate) moving: AssetBytes,
     /// Original eight-pixel font converted to an RGBA PNG.
     pub(crate) font: AssetBytes,
+    /// Original six-pixel-advance menu font converted to an RGBA PNG.
+    pub(crate) menu_font: AssetBytes,
+    /// Original title artwork converted with its executable-resident palette.
+    pub(crate) title: AssetBytes,
+    /// Original main-menu background converted with gameplay palette 1.
+    pub(crate) menu: AssetBytes,
+    /// Original bottom status-panel artwork converted with gameplay palette 1.
+    pub(crate) panel: AssetBytes,
 }
 
 /// Complete soundtrack and effect payload set loaded before opening SDL audio.
@@ -141,6 +161,10 @@ pub(crate) fn load_graphics() -> Result<GraphicsAssets, AssetError> {
             fixed: AssetBytes::embedded(include_bytes!("../assets/gfx/fixed.png")),
             moving: AssetBytes::embedded(include_bytes!("../assets/gfx/moving.png")),
             font: AssetBytes::embedded(include_bytes!("../assets/gfx/chars8.png")),
+            menu_font: AssetBytes::embedded(include_bytes!("../assets/gfx/chars6.png")),
+            title: AssetBytes::embedded(include_bytes!("../assets/gfx/title.png")),
+            menu: AssetBytes::embedded(include_bytes!("../assets/gfx/menu.png")),
+            panel: AssetBytes::embedded(include_bytes!("../assets/gfx/panel.png")),
         })
     }
     #[cfg(feature = "unbundle")]
@@ -149,6 +173,10 @@ pub(crate) fn load_graphics() -> Result<GraphicsAssets, AssetError> {
             fixed: load_external(FIXED_GRAPHICS_PATH)?,
             moving: load_external(MOVING_GRAPHICS_PATH)?,
             font: load_external(FONT_GRAPHICS_PATH)?,
+            menu_font: load_external(MENU_FONT_GRAPHICS_PATH)?,
+            title: load_external(TITLE_GRAPHICS_PATH)?,
+            menu: load_external(MENU_GRAPHICS_PATH)?,
+            panel: load_external(PANEL_GRAPHICS_PATH)?,
         })
     }
 }
@@ -274,7 +302,15 @@ mod tests {
         // Exact sizes and lightweight signatures detect misplaced files without
         // duplicating the format-specific validation performed by their consumers.
         assert_eq!(levels.as_ref().len(), 170_496);
-        for png in [&graphics.fixed, &graphics.moving, &graphics.font] {
+        for png in [
+            &graphics.fixed,
+            &graphics.moving,
+            &graphics.font,
+            &graphics.menu_font,
+            &graphics.title,
+            &graphics.menu,
+            &graphics.panel,
+        ] {
             assert!(png.as_ref().starts_with(b"\x89PNG\r\n\x1a\n"));
         }
         assert!(audio.music.as_ref().starts_with(b"Extended Module: "));

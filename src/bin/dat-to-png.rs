@@ -1,10 +1,10 @@
-//! Converts the headerless Supaplex gameplay graphics into ordinary RGBA PNGs.
+//! Converts known headerless Supaplex graphics into ordinary RGBA PNGs.
 //!
 //! The input filename selects one of the geometries known by
-//! [`DatAsset`].  `FIXED.DAT` and
-//! `MOVING.DAT` use palette 1 from `PALETTES.DAT`; if `--palettes` is omitted,
-//! the converter looks for lowercase `palettes.dat` beside the input image.
-//! `CHARS8.DAT` is converted as an opaque black-and-white font mask.
+//! [`DatAsset`]. Gameplay, menu, and panel artwork use palette 1 from
+//! `PALETTES.DAT`; if `--palettes` is omitted, the converter looks for lowercase
+//! `palettes.dat` beside the input image. `TITLE.DAT` uses the palette stored by
+//! the original executable, while both font files become black-and-white masks.
 
 use std::{
     error::Error,
@@ -25,6 +25,10 @@ Supported input basenames and their raw formats:
   fixed.dat   640x16,  planar 4bpp, PALETTES.DAT palette 1
   moving.dat  320x462, planar 4bpp, PALETTES.DAT palette 1
   chars8.dat  512x8,   binary 1bpp, opaque black and white
+  chars6.dat  512x8,   binary 1bpp, opaque black and white
+  title.dat   320x200, planar 4bpp, original executable title palette
+  menu.dat    320x200, planar 4bpp, PALETTES.DAT palette 1
+  panel.dat   320x24,  planar 4bpp, PALETTES.DAT palette 1
 
 When --palettes is omitted for a planar image, palettes.dat is read from the
 input file's directory.
@@ -32,7 +36,11 @@ input file's directory.
 Examples:
   dat-to-png data/fixed.dat fixed.png
   dat-to-png data/moving.dat moving.png --palettes data/palettes.dat
-  dat-to-png data/chars8.dat chars8.png";
+  dat-to-png data/chars8.dat chars8.png
+  dat-to-png data/chars6.dat chars6.png
+  dat-to-png data/title.dat title.png
+  dat-to-png data/menu.dat menu.png
+  dat-to-png data/panel.dat panel.png";
 
 /// Files selected by one validated converter invocation.
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -103,8 +111,8 @@ fn convert(options: &Options) -> Result<(), CliError> {
     let asset = DatAsset::from_path(&options.input).map_err(CliError::Graphics)?;
     let input_bytes = read_file(&options.input, "read input bitmap")?;
 
-    // Only planar sprite sheets need PALETTES.DAT.  Avoiding the palette read
-    // for `CHARS8.DAT` lets the standalone font conversion remain self-contained.
+    // Only assets with an external palette need PALETTES.DAT. Avoiding that
+    // read for fonts and TITLE.DAT keeps their conversions self-contained.
     let palettes = if asset.palette_index().is_some() {
         let palette_path = options
             .palettes

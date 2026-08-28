@@ -33,7 +33,7 @@ An unbundled build reads the following distribution tree at startup:
 
 ```text
 data/levels.dat
-assets/gfx/{fixed,moving,chars8}.png
+assets/gfx/{fixed,moving,chars8,chars6,title,menu,panel}.png
 assets/audio/music.xm
 assets/audio/{explosion,infotron,push,fall,bug,base,exit}.wav
 ```
@@ -126,11 +126,17 @@ The committed files in `assets/gfx/` can be reproduced with:
 cargo run --bin dat-to-png -- data/fixed.dat assets/gfx/fixed.png
 cargo run --bin dat-to-png -- data/moving.dat assets/gfx/moving.png
 cargo run --bin dat-to-png -- data/chars8.dat assets/gfx/chars8.png
+cargo run --bin dat-to-png -- data/chars6.dat assets/gfx/chars6.png
+cargo run --bin dat-to-png -- data/title.dat assets/gfx/title.png
+cargo run --bin dat-to-png -- data/menu.dat assets/gfx/menu.png
+cargo run --bin dat-to-png -- data/panel.dat assets/gfx/panel.png
 ```
 
-`FIXED.DAT` becomes 640×16, `MOVING.DAT` becomes 320×462, and `CHARS8.DAT`
-becomes 512×8. Gameplay addresses the original fixed tiles and variably sized
-moving descriptors directly; the HUD uses the converted original font.
+`FIXED.DAT` becomes 640×16, `MOVING.DAT` becomes 320×462, both font strips
+become 512×8, the two full-screen pictures become 320×200, and `PANEL.DAT`
+becomes 320×24. Gameplay addresses the original fixed tiles and variably sized
+moving descriptors directly. The title conversion uses the special palette
+stored in the original executable; the menu and panel use gameplay palette 1.
 
 The WAV files in `assets/audio/` are playback-ready renders of the supplied DOS
 Sound Blaster effects. The music remains the original compact XM arrangement;
