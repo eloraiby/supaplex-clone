@@ -15,8 +15,9 @@ use crate::{
         State,
     },
     assets::{
-        self, AssetError, FIXED_GRAPHICS_PATH, FONT_GRAPHICS_PATH, MENU_FONT_GRAPHICS_PATH,
-        MENU_GRAPHICS_PATH, MOVING_GRAPHICS_PATH, PANEL_GRAPHICS_PATH, TITLE_GRAPHICS_PATH,
+        self, AssetError, BACK_GRAPHICS_PATH, CONTROLS_GRAPHICS_PATH, FIXED_GRAPHICS_PATH,
+        FONT_GRAPHICS_PATH, GFX_TUTOR_GRAPHICS_PATH, MENU_FONT_GRAPHICS_PATH, MENU_GRAPHICS_PATH,
+        MOVING_GRAPHICS_PATH, PANEL_GRAPHICS_PATH, TITLE_GRAPHICS_PATH,
     },
     game::{Game, GameStatus},
     murphy_animation::{SourcePoint, SpritePart, sprite_parts},
@@ -119,6 +120,12 @@ pub struct Renderer<'textures> {
     title: Texture<'textures>,
     /// Original 320×200 main-menu frame decoded with gameplay palette 1.
     menu: Texture<'textures>,
+    /// Original 320×200 GFX tutorial decoded with gameplay palette 1.
+    gfx_tutor: Texture<'textures>,
+    /// Original 320×200 controls/options artwork decoded with palette 2.
+    controls: Texture<'textures>,
+    /// Original 320×200 information backdrop decoded with palette 0.
+    back: Texture<'textures>,
     /// Original CHARS6 mask whose glyphs advance six source pixels in menus.
     menu_font: Texture<'textures>,
     /// Most recent camera centered on a live Murphy.
@@ -184,6 +191,30 @@ impl<'textures> Renderer<'textures> {
             MENU_GRAPHICS_PATH,
             BlackPixelPolicy::Opaque,
         )?;
+        let gfx_tutor = load_texture(
+            texture_creator,
+            graphics.gfx_tutor.as_ref(),
+            320,
+            200,
+            GFX_TUTOR_GRAPHICS_PATH,
+            BlackPixelPolicy::Opaque,
+        )?;
+        let controls = load_texture(
+            texture_creator,
+            graphics.controls.as_ref(),
+            320,
+            200,
+            CONTROLS_GRAPHICS_PATH,
+            BlackPixelPolicy::Opaque,
+        )?;
+        let back = load_texture(
+            texture_creator,
+            graphics.back.as_ref(),
+            320,
+            200,
+            BACK_GRAPHICS_PATH,
+            BlackPixelPolicy::Opaque,
+        )?;
         let menu_font = load_texture(
             texture_creator,
             graphics.menu_font.as_ref(),
@@ -200,6 +231,9 @@ impl<'textures> Renderer<'textures> {
             panel,
             title,
             menu,
+            gfx_tutor,
+            controls,
+            back,
             menu_font,
             camera: Camera::default(),
         })
@@ -284,6 +318,35 @@ impl<'textures> Renderer<'textures> {
                 173,
                 ORIGINAL_BLUE_TEXT,
             )?;
+        }
+        Ok(())
+    }
+
+    /// Draws the original illustrated actor and hardware GFX tutorial.
+    pub fn draw_gfx_tutor(&mut self, canvas: &mut Canvas<Window>) -> Result<(), RenderError> {
+        // The tutorial is a complete opaque screen, so the same centered DOS
+        // screen blit used by the title and menu needs no additional overlays.
+        draw_original_screen(canvas, &self.gfx_tutor)
+    }
+
+    /// Draws the original controls/options circuit-board background.
+    pub fn draw_controls(&mut self, canvas: &mut Canvas<Window>) -> Result<(), RenderError> {
+        // Interactive highlights are drawn by the caller after this immutable
+        // background, allowing audio state to change without editing the asset.
+        draw_original_screen(canvas, &self.controls)
+    }
+
+    /// Draws the original information backdrop and caller-supplied white text.
+    pub fn draw_information(
+        &mut self,
+        canvas: &mut Canvas<Window>,
+        lines: &[(&str, i32, i32)],
+    ) -> Result<(), RenderError> {
+        // BACK.DAT supplies the textured lower field used by Statistics and
+        // Credits. Text coordinates remain in the original 320×200 space.
+        draw_original_screen(canvas, &self.back)?;
+        for &(text, x, y) in lines {
+            self.draw_menu_text(canvas, text, x, y, Color::RGB(0xf0, 0xf0, 0xf0))?;
         }
         Ok(())
     }
@@ -851,6 +914,24 @@ impl<'textures> Renderer<'textures> {
 
         Ok(())
     }
+}
+
+/// Copies one opaque 320×200 DOS screen into the centered logical viewport.
+fn draw_original_screen(
+    canvas: &mut Canvas<Window>,
+    texture: &Texture<'_>,
+) -> Result<(), RenderError> {
+    // Clear the twenty-pixel logical bars above and below the three-times
+    // enlarged artwork before copying the full texture without source cropping.
+    canvas.set_draw_color(Color::RGB(0, 0, 0));
+    canvas.clear();
+    canvas
+        .copy(
+            texture,
+            None,
+            Rect::new(0, ORIGINAL_SCREEN_Y, LOGICAL_WIDTH, ORIGINAL_SCREEN_HEIGHT),
+        )
+        .map_err(RenderError::Sdl)
 }
 
 /// Formats one original level-list row without exceeding its 29-character field.

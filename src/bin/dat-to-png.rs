@@ -1,8 +1,8 @@
 //! Converts known headerless Supaplex graphics into ordinary RGBA PNGs.
 //!
 //! The input filename selects one of the geometries known by
-//! [`DatAsset`]. Gameplay, menu, and panel artwork use palette 1 from
-//! `PALETTES.DAT`; if `--palettes` is omitted, the converter looks for lowercase
+//! [`DatAsset`]. Each planar resource selects its original `PALETTES.DAT`
+//! palette; if `--palettes` is omitted, the converter looks for lowercase
 //! `palettes.dat` beside the input image. `TITLE.DAT` uses the palette stored by
 //! the original executable, while both font files become black-and-white masks.
 
@@ -28,6 +28,9 @@ Supported input basenames and their raw formats:
   chars6.dat  512x8,   binary 1bpp, opaque black and white
   title.dat   320x200, planar 4bpp, original executable title palette
   menu.dat    320x200, planar 4bpp, PALETTES.DAT palette 1
+  gfx.dat     320x200, planar 4bpp, PALETTES.DAT palette 1
+  controls.dat 320x200, planar 4bpp, PALETTES.DAT palette 2
+  back.dat    320x200, planar 4bpp, PALETTES.DAT palette 0
   panel.dat   320x24,  planar 4bpp, PALETTES.DAT palette 1
 
 When --palettes is omitted for a planar image, palettes.dat is read from the
@@ -40,6 +43,9 @@ Examples:
   dat-to-png data/chars6.dat chars6.png
   dat-to-png data/title.dat title.png
   dat-to-png data/menu.dat menu.png
+  dat-to-png data/gfx.dat gfx.png
+  dat-to-png data/controls.dat controls.png
+  dat-to-png data/back.dat back.png
   dat-to-png data/panel.dat panel.png";
 
 /// Files selected by one validated converter invocation.

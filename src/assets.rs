@@ -52,6 +52,15 @@ pub(crate) const TITLE_GRAPHICS_PATH: &str = "assets/gfx/title.png";
 /// Relative location of the original main-menu background conversion.
 pub(crate) const MENU_GRAPHICS_PATH: &str = "assets/gfx/menu.png";
 
+/// Relative location of the original GFX tutorial screen conversion.
+pub(crate) const GFX_TUTOR_GRAPHICS_PATH: &str = "assets/gfx/gfx.png";
+
+/// Relative location of the original controls/options screen conversion.
+pub(crate) const CONTROLS_GRAPHICS_PATH: &str = "assets/gfx/controls.png";
+
+/// Relative location of the original information-screen background conversion.
+pub(crate) const BACK_GRAPHICS_PATH: &str = "assets/gfx/back.png";
+
 /// Relative location of the original in-game status-panel conversion.
 pub(crate) const PANEL_GRAPHICS_PATH: &str = "assets/gfx/panel.png";
 
@@ -124,6 +133,12 @@ pub(crate) struct GraphicsAssets {
     pub(crate) title: AssetBytes,
     /// Original main-menu background converted with gameplay palette 1.
     pub(crate) menu: AssetBytes,
+    /// Original GFX tutorial converted with gameplay palette 1.
+    pub(crate) gfx_tutor: AssetBytes,
+    /// Original controls/options screen converted with palette 2.
+    pub(crate) controls: AssetBytes,
+    /// Original information-screen background converted with palette 0.
+    pub(crate) back: AssetBytes,
     /// Original bottom status-panel artwork converted with gameplay palette 1.
     pub(crate) panel: AssetBytes,
 }
@@ -164,6 +179,9 @@ pub(crate) fn load_graphics() -> Result<GraphicsAssets, AssetError> {
             menu_font: AssetBytes::embedded(include_bytes!("../assets/gfx/chars6.png")),
             title: AssetBytes::embedded(include_bytes!("../assets/gfx/title.png")),
             menu: AssetBytes::embedded(include_bytes!("../assets/gfx/menu.png")),
+            gfx_tutor: AssetBytes::embedded(include_bytes!("../assets/gfx/gfx.png")),
+            controls: AssetBytes::embedded(include_bytes!("../assets/gfx/controls.png")),
+            back: AssetBytes::embedded(include_bytes!("../assets/gfx/back.png")),
             panel: AssetBytes::embedded(include_bytes!("../assets/gfx/panel.png")),
         })
     }
@@ -176,6 +194,9 @@ pub(crate) fn load_graphics() -> Result<GraphicsAssets, AssetError> {
             menu_font: load_external(MENU_FONT_GRAPHICS_PATH)?,
             title: load_external(TITLE_GRAPHICS_PATH)?,
             menu: load_external(MENU_GRAPHICS_PATH)?,
+            gfx_tutor: load_external(GFX_TUTOR_GRAPHICS_PATH)?,
+            controls: load_external(CONTROLS_GRAPHICS_PATH)?,
+            back: load_external(BACK_GRAPHICS_PATH)?,
             panel: load_external(PANEL_GRAPHICS_PATH)?,
         })
     }

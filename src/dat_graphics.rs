@@ -64,6 +64,12 @@ pub const PANEL_HEIGHT: u32 = 24;
 /// Zero-based `PALETTES.DAT` palette used by both gameplay sprite sheets.
 pub const GAME_PALETTE_INDEX: usize = 1;
 
+/// Zero-based palette used by `BACK.DAT` and its white information text.
+pub const INFORMATION_PALETTE_INDEX: usize = 0;
+
+/// Zero-based palette used by the original controls/options screen.
+pub const CONTROLS_PALETTE_INDEX: usize = 2;
+
 /// Original 16-entry title palette stored in the executable rather than a DAT.
 const TITLE_PALETTE_NIBBLES: [u8; PALETTES_DAT_SIZE / PALETTE_COUNT] = [
     0x02, 0x03, 0x05, 0x00, 0x0d, 0x0a, 0x04, 0x0c, 0x02, 0x06, 0x06, 0x02, 0x03, 0x09, 0x09, 0x03,
@@ -275,6 +281,12 @@ pub enum DatAsset {
     Title,
     /// Original 320×200 main-menu background using gameplay palette 1.
     Menu,
+    /// Original 320×200 GFX tutorial using gameplay palette 1.
+    Gfx,
+    /// Original 320×200 controls/options background using palette 2.
+    Controls,
+    /// Original 320×200 information background using palette 0.
+    Back,
     /// Original 320×24 in-game status panel using gameplay palette 1.
     Panel,
 }
@@ -291,6 +303,9 @@ impl DatAsset {
             "chars6" | "chars6.dat" => Ok(Self::Chars6),
             "title" | "title.dat" => Ok(Self::Title),
             "menu" | "menu.dat" => Ok(Self::Menu),
+            "gfx" | "gfx.dat" => Ok(Self::Gfx),
+            "controls" | "controls.dat" => Ok(Self::Controls),
+            "back" | "back.dat" => Ok(Self::Back),
             "panel" | "panel.dat" => Ok(Self::Panel),
             _ => Err(GraphicsError::UnknownAsset(name.to_owned())),
         }
@@ -317,6 +332,9 @@ impl DatAsset {
             Self::Chars6 => "chars6.dat",
             Self::Title => "title.dat",
             Self::Menu => "menu.dat",
+            Self::Gfx => "gfx.dat",
+            Self::Controls => "controls.dat",
+            Self::Back => "back.dat",
             Self::Panel => "panel.dat",
         }
     }
@@ -329,7 +347,7 @@ impl DatAsset {
             Self::Moving => MOVING_WIDTH,
             Self::Chars8 => CHARS8_WIDTH,
             Self::Chars6 => CHARS6_WIDTH,
-            Self::Title | Self::Menu => SCREEN_WIDTH,
+            Self::Title | Self::Menu | Self::Gfx | Self::Controls | Self::Back => SCREEN_WIDTH,
             Self::Panel => PANEL_WIDTH,
         }
     }
@@ -342,7 +360,7 @@ impl DatAsset {
             Self::Moving => MOVING_HEIGHT,
             Self::Chars8 => CHARS8_HEIGHT,
             Self::Chars6 => CHARS6_HEIGHT,
-            Self::Title | Self::Menu => SCREEN_HEIGHT,
+            Self::Title | Self::Menu | Self::Gfx | Self::Controls | Self::Back => SCREEN_HEIGHT,
             Self::Panel => PANEL_HEIGHT,
         }
     }
@@ -351,9 +369,14 @@ impl DatAsset {
     pub const fn encoding(self) -> DatEncoding {
         // Sprite graphics are planar while the font is a one-bit mask.
         match self {
-            Self::Fixed | Self::Moving | Self::Title | Self::Menu | Self::Panel => {
-                DatEncoding::Planar4Bpp
-            }
+            Self::Fixed
+            | Self::Moving
+            | Self::Title
+            | Self::Menu
+            | Self::Gfx
+            | Self::Controls
+            | Self::Back
+            | Self::Panel => DatEncoding::Planar4Bpp,
             Self::Chars8 | Self::Chars6 => DatEncoding::Binary1Bpp,
         }
     }
@@ -363,7 +386,11 @@ impl DatAsset {
         // Binary font bits use caller-selected monochrome colours and therefore
         // do not consume one of the four palettes stored in `PALETTES.DAT`.
         match self {
-            Self::Fixed | Self::Moving | Self::Menu | Self::Panel => Some(GAME_PALETTE_INDEX),
+            Self::Fixed | Self::Moving | Self::Menu | Self::Gfx | Self::Panel => {
+                Some(GAME_PALETTE_INDEX)
+            }
+            Self::Controls => Some(CONTROLS_PALETTE_INDEX),
+            Self::Back => Some(INFORMATION_PALETTE_INDEX),
             Self::Chars8 | Self::Chars6 | Self::Title => None,
         }
     }
@@ -386,6 +413,22 @@ impl DatAsset {
                         palette_index,
                     })?;
                 decode_planar_rgba(bytes, self.width(), self.height(), palette)
+            }
+            Self::Gfx | Self::Controls | Self::Back => {
+                // The DOS loaders copy exactly one 32,000-byte screen even
+                // though the distributed files retain trailing data. Cropping
+                // here reproduces that bounded read without accepting a short
+                // image that the original would reject.
+                let expected = planar_payload_size(self.width(), self.height());
+                let bitmap = bytes.get(..expected).unwrap_or(bytes);
+                let palette_index = self.palette_index().expect("planar asset has a palette");
+                let palette = palettes
+                    .and_then(|palettes| palettes.get(palette_index))
+                    .ok_or(GraphicsError::MissingPalette {
+                        asset: self,
+                        palette_index,
+                    })?;
+                decode_planar_rgba(bitmap, self.width(), self.height(), palette)
             }
             Self::Chars8 | Self::Chars6 => {
                 decode_binary_rgba(bytes, self.width(), self.height(), Rgba::BLACK, Rgba::WHITE)
@@ -883,6 +926,9 @@ mod tests {
         assert_eq!(DatAsset::from_name("chars6"), Ok(DatAsset::Chars6));
         assert_eq!(DatAsset::from_name("TITLE.DAT"), Ok(DatAsset::Title));
         assert_eq!(DatAsset::from_name("menu.dat"), Ok(DatAsset::Menu));
+        assert_eq!(DatAsset::from_name("gfx.dat"), Ok(DatAsset::Gfx));
+        assert_eq!(DatAsset::from_name("controls.dat"), Ok(DatAsset::Controls));
+        assert_eq!(DatAsset::from_name("back.dat"), Ok(DatAsset::Back));
         assert_eq!(DatAsset::from_name("panel.dat"), Ok(DatAsset::Panel));
     }
 
@@ -915,6 +961,15 @@ mod tests {
             (
                 DatAsset::Menu,
                 include_bytes!("../data/menu.dat").as_slice(),
+            ),
+            (DatAsset::Gfx, include_bytes!("../data/gfx.dat").as_slice()),
+            (
+                DatAsset::Controls,
+                include_bytes!("../data/controls.dat").as_slice(),
+            ),
+            (
+                DatAsset::Back,
+                include_bytes!("../data/back.dat").as_slice(),
             ),
             (
                 DatAsset::Panel,
