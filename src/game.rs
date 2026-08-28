@@ -500,6 +500,28 @@ impl Game {
             })
     }
 
+    /// Destroys a living Murphy through the ordinary gameplay explosion path.
+    pub fn destroy_murphy(&mut self) {
+        // Escape is a play-session command, not a shortcut around terminal
+        // states. Ignore repeated requests after death and requests made while
+        // the successful Exit sequence is already controlling the session.
+        if self.status != GameStatus::Playing {
+            return;
+        }
+
+        // Murphy can be logically stored at a movement destination while his
+        // sprite is still interpolating toward it. The original kill request
+        // likewise explodes that current logical location on the next update.
+        let Some(position) = self.murphy_position() else {
+            return;
+        };
+
+        // Reuse the normal bounded 3x3 wave so destructible neighbors, chain
+        // timers, the explosion sound, death status, and exit delay all follow
+        // exactly the same rules as an enemy or falling-object collision.
+        self.detonate_position(position);
+    }
+
     /// Applies one Murphy-first, row-major simulation step to the live board.
     pub fn tick(&mut self, input: Input) {
         // A terminal status becomes final only after the original countdown.
@@ -3173,6 +3195,45 @@ mod tests {
             open.tick(Input::default());
         }
         assert!(open.terminal_transition_ready());
+    }
+
+    /// Confirms a player-requested death uses the complete normal explosion lifecycle.
+    #[test]
+    fn destroying_murphy_uses_the_collision_explosion_path() {
+        let murphy_position = Position::new(3, 2);
+        let neighbor_position = Position::new(4, 2);
+        let mut game = game_with(
+            &[
+                (murphy_position, State::new(Actor::Murphy(Murphy::new()))),
+                (neighbor_position, State::new(Actor::Base(Base))),
+            ],
+            0,
+        );
+
+        game.destroy_murphy();
+
+        // Direct destruction creates the blast immediately but leaves the
+        // complete sixty-four-update terminal delay for subsequent ticks.
+        assert_eq!(game.status(), GameStatus::Dead);
+        assert_eq!(game.quit_countdown, 0x40);
+        assert_eq!(game.take_sound_effects(), vec![SoundEffect::Explosion]);
+        assert!(matches!(
+            actor_at(&game, murphy_position.x, murphy_position.y),
+            Actor::Explosion(_)
+        ));
+        assert!(matches!(
+            actor_at(&game, neighbor_position.x, neighbor_position.y),
+            Actor::Explosion(_)
+        ));
+
+        // Repeated Escape requests during the death sequence must neither
+        // restart its countdown nor enqueue duplicate explosion sounds.
+        game.destroy_murphy();
+        assert_eq!(game.quit_countdown, 0x40);
+        assert!(game.take_sound_effects().is_empty());
+
+        game.tick(Input::default());
+        assert_eq!(game.quit_countdown, 0x3f);
     }
 
     /// Confirms Murphy cannot enter an enemy cell without being destroyed.

@@ -68,7 +68,7 @@ Controls:
 - `R`: restart the selected level from its original record.
 - `M`: mute or resume music.
 - `S`: mute or enable sound effects.
-- `Escape`: return from gameplay to the menu, or quit from the menu.
+- `Escape`: explode Murphy during gameplay, or quit from the menu.
 
 The original bottom status panel shows the player, level number and title, game
 time, remaining Infotrons, and Red Disk inventory. The camera follows Murphy

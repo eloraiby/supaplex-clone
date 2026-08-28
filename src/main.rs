@@ -393,7 +393,9 @@ fn play_level(
             .duration_since(previous)
             .min(Duration::from_millis(250));
         previous = frame_started;
-        let mut return_to_menu = false;
+        // Escape requests the same in-world death as a lethal actor rather
+        // than bypassing the explosion animation with an immediate menu fade.
+        let mut destroy_murphy = false;
 
         for event in event_pump.poll_iter() {
             match event {
@@ -402,7 +404,7 @@ fn play_level(
                     scancode: Some(Scancode::Escape),
                     repeat: false,
                     ..
-                } => return_to_menu = true,
+                } => destroy_murphy = true,
                 Event::KeyDown {
                     scancode: Some(Scancode::R),
                     repeat: false,
@@ -449,26 +451,10 @@ fn play_level(
             }
         }
 
-        if return_to_menu {
-            if !fade_game(
-                canvas,
-                renderer,
-                event_pump,
-                &game,
-                session,
-                FadeDirection::Out,
-            )? {
-                return Ok(GameOutcome::Quit);
-            }
-            if let Some(audio) = audio.as_mut() {
-                // Clear any partially playing effect before menu navigation and
-                // resume soundtrack playback if it remains user-enabled.
-                audio.restart_level();
-            }
-            return Ok(GameOutcome::Menu {
-                next_selection: session.level_number,
-                completed_seconds: None,
-            });
+        if destroy_murphy {
+            // The simulation owns blast construction and terminal timing. A
+            // repeated Escape during the death sequence is an intentional no-op.
+            game.destroy_murphy();
         }
 
         let mut processed_steps = 0;
@@ -737,7 +723,7 @@ fn fade_game(
     direction: FadeDirection,
 ) -> Result<bool, String> {
     // Gameplay remains paused during both directions. This preserves the first
-    // board state on entry and the final terminal or Escape state on departure.
+    // board state on entry and the final terminal state on departure.
     let started = Instant::now();
     loop {
         let frame_started = Instant::now();
