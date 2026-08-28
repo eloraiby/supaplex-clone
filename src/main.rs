@@ -250,6 +250,7 @@ fn run(level_bytes: &[u8], initial_level: usize, steps_per_second: u32) -> Resul
     if !show_splash(&mut canvas, &mut renderer, &mut event_pump)? {
         // Closing the window during startup is an ordinary successful exit,
         // exactly like closing it from gameplay rather than a loading failure.
+        shutdown_audio(&mut audio);
         return Ok(());
     }
     let level_set = LevelSet::new(level_bytes);
@@ -289,7 +290,12 @@ fn run(level_bytes: &[u8], initial_level: usize, steps_per_second: u32) -> Resul
             },
         )? {
             MenuOutcome::Play(level_number) => level_number,
-            MenuOutcome::Quit => return Ok(()),
+            MenuOutcome::Quit => {
+                // Stop the callback before video and SDL begin dropping. Some
+                // audio backends otherwise wait indefinitely during device close.
+                shutdown_audio(&mut audio);
+                return Ok(());
+            }
         };
         let level = level_set
             .load(level_number)
@@ -320,8 +326,22 @@ fn run(level_bytes: &[u8], initial_level: usize, steps_per_second: u32) -> Resul
                 }
                 menu_level = next_selection;
             }
-            GameOutcome::Quit => return Ok(()),
+            GameOutcome::Quit => {
+                // Window-manager exits share the same deterministic teardown as
+                // menu Escape instead of relying on implicit local drop order.
+                shutdown_audio(&mut audio);
+                return Ok(());
+            }
         }
+    }
+}
+
+/// Removes and synchronously shuts down the optional SDL audio player.
+fn shutdown_audio(audio: &mut Option<AudioPlayer>) {
+    // Taking the value first prevents a later scope exit from attempting a
+    // second close. Headless sessions deliberately have nothing to stop.
+    if let Some(audio) = audio.take() {
+        audio.shutdown();
     }
 }
 

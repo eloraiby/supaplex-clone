@@ -141,6 +141,15 @@ impl AudioPlayer {
         mixer.priority_frames_remaining = 0;
         mixer.music_playing = mixer.music_enabled;
     }
+
+    /// Stops the callback thread and closes its SDL device in a defined order.
+    pub fn shutdown(self) {
+        // Some platform backends do not reliably wake a running callback when
+        // the surrounding SDL resources begin implicit reverse-order teardown.
+        // Pausing first synchronizes with any in-flight mix, after which this
+        // consumed player's normal field drop closes an already-idle device.
+        self.device.pause();
+    }
 }
 
 /// Device-format sample arrays indexed by [`SoundEffect::index`].
