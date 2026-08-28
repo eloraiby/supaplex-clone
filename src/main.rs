@@ -1,4 +1,4 @@
-//! SDL2 entry point for selecting and playing one original Supaplex level.
+//! SDL2 entry point for the original front end and fixed-step Supaplex play.
 
 use std::{
     process::ExitCode,
@@ -11,14 +11,43 @@ use supaplex_clone::{
     assets,
     audio::AudioPlayer,
     cli::{FIRST_STEP_RATE, LAST_STEP_RATE, Options},
-    frontend::splash_frame,
+    frontend::{MenuSelection, fade_in_opacity, splash_frame},
     game::{Game, GameStatus, Input},
-    level::{Level, LevelSet},
+    level::LevelSet,
     render::{LOGICAL_HEIGHT, LOGICAL_WIDTH, Renderer},
 };
 
 /// Maximum display rate used when vsync is unavailable or ignored.
 const RENDER_INTERVAL: Duration = Duration::from_nanos(1_000_000_000 / 60);
+
+/// One decoded level-list row retained between main-menu frames.
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct MenuLevelRow {
+    /// One-based number rendered before the level title.
+    number: usize,
+    /// Trimmed original level title owned independently of its decoded record.
+    title: String,
+}
+
+/// Previous, selected, and next rows shown in the original level-list frame.
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct MenuLevelRows {
+    /// Row above the selection, absent when level one is selected.
+    previous: Option<MenuLevelRow>,
+    /// Always-present highlighted row chosen by [`MenuSelection`].
+    current: MenuLevelRow,
+    /// Row below the selection, absent when the final level is selected.
+    next: Option<MenuLevelRow>,
+}
+
+/// Terminal result of the blocking main-menu event loop.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum MenuOutcome {
+    /// Start the contained one-based level number.
+    Play(usize),
+    /// Close the application without starting a level.
+    Quit,
+}
 
 /// Parses the command line, loads one record, and runs its SDL2 session.
 fn main() -> ExitCode {
@@ -43,17 +72,18 @@ fn main() -> ExitCode {
         }
     };
 
-    // Decode the chosen record only after acquisition succeeds so corrupt data
-    // remains distinguishable from a missing unbundled asset.
-    let level = match LevelSet::new(level_bytes.as_ref()).load(options.level_number()) {
-        Ok(level) => level,
-        Err(error) => {
-            eprintln!("could not load level {}: {error}", options.level_number());
-            return ExitCode::FAILURE;
-        }
-    };
+    // Validate the initial menu record before SDL startup so malformed level
+    // data remains distinguishable from a later platform initialization error.
+    if let Err(error) = LevelSet::new(level_bytes.as_ref()).load(options.level_number()) {
+        eprintln!("could not load level {}: {error}", options.level_number());
+        return ExitCode::FAILURE;
+    }
 
-    match run(&level, options.level_number(), options.steps_per_second()) {
+    match run(
+        level_bytes.as_ref(),
+        options.level_number(),
+        options.steps_per_second(),
+    ) {
         Ok(()) => ExitCode::SUCCESS,
         Err(error) => {
             eprintln!("could not run level {}: {error}", options.level_number());
@@ -62,8 +92,8 @@ fn main() -> ExitCode {
     }
 }
 
-/// Initializes SDL2 and owns every resource for one fixed-rate play loop.
-fn run(level: &Level, level_number: usize, steps_per_second: u32) -> Result<(), String> {
+/// Initializes SDL2 and owns the front-end plus one selected fixed-rate play loop.
+fn run(level_bytes: &[u8], initial_level: usize, steps_per_second: u32) -> Result<(), String> {
     // Nearest-neighbor scaling preserves the hard pixel edges of the original
     // 16×16 artwork after its 2× atlas repack and logical-window scaling.
     sdl2::hint::set("SDL_RENDER_SCALE_QUALITY", "0");
@@ -93,12 +123,6 @@ fn run(level: &Level, level_number: usize, steps_per_second: u32) -> Result<(), 
     let mut event_pump = sdl
         .event_pump()
         .map_err(|error| format!("create SDL2 event pump: {error}"))?;
-    if !show_splash(&mut canvas, &mut renderer, &mut event_pump)? {
-        // Closing the window during startup is an ordinary successful exit,
-        // exactly like closing it from gameplay rather than a loading failure.
-        return Ok(());
-    }
-    let mut game = Game::new(level).map_err(|error| error.to_string())?;
     let mut audio = match sdl
         .audio()
         .map_err(|error| format!("initialize SDL2 audio: {error}"))
@@ -106,12 +130,37 @@ fn run(level: &Level, level_number: usize, steps_per_second: u32) -> Result<(), 
     {
         Ok(audio) => Some(audio),
         Err(error) => {
-            // Missing devices are common over remote sessions. Gameplay stays
-            // available, while stderr still explains why audio was disabled.
+            // Missing devices are common over remote sessions. The complete
+            // visual front end and gameplay remain available without audio.
             eprintln!("audio disabled: {error}");
             None
         }
     };
+    if !show_splash(&mut canvas, &mut renderer, &mut event_pump)? {
+        // Closing the window during startup is an ordinary successful exit,
+        // exactly like closing it from gameplay rather than a loading failure.
+        return Ok(());
+    }
+    let level_set = LevelSet::new(level_bytes);
+    let level_count = level_set
+        .level_count()
+        .map_err(|error| format!("validate level collection: {error}"))?;
+    let level_number = match show_main_menu(
+        &mut canvas,
+        &mut renderer,
+        &mut event_pump,
+        &mut audio,
+        level_set,
+        initial_level,
+        level_count,
+    )? {
+        MenuOutcome::Play(level_number) => level_number,
+        MenuOutcome::Quit => return Ok(()),
+    };
+    let level = level_set
+        .load(level_number)
+        .map_err(|error| format!("load selected level {level_number}: {error}"))?;
+    let mut game = Game::new(&level).map_err(|error| error.to_string())?;
 
     // Convert the validated CLI frequency once. Integer nanoseconds lose less
     // than one nanosecond per update instead of rounding through milliseconds;
@@ -150,7 +199,7 @@ fn run(level: &Level, level_number: usize, steps_per_second: u32) -> Result<(), 
                 } => {
                     // Restarting reconstructs actors and level toggles while
                     // retaining the process RNG stream, as original play does.
-                    game.restart(level).map_err(|error| error.to_string())?;
+                    game.restart(&level).map_err(|error| error.to_string())?;
                     if let Some(audio) = audio.as_mut() {
                         audio.restart_level();
                     }
@@ -247,6 +296,175 @@ fn run(level: &Level, level_number: usize, steps_per_second: u32) -> Result<(), 
     }
 
     Ok(())
+}
+
+/// Runs the keyboard-driven original main menu until play or quit is selected.
+fn show_main_menu(
+    canvas: &mut sdl2::render::Canvas<sdl2::video::Window>,
+    renderer: &mut Renderer<'_>,
+    event_pump: &mut sdl2::EventPump,
+    audio: &mut Option<AudioPlayer>,
+    level_set: LevelSet<'_>,
+    initial_level: usize,
+    level_count: usize,
+) -> Result<MenuOutcome, String> {
+    // Construction can fail only for an empty validated collection. Keeping the
+    // guard here makes the menu safe for custom LEVELS.DAT distributions too.
+    let mut selection = MenuSelection::new(initial_level, level_count)
+        .ok_or_else(|| "level collection contains no playable records".to_owned())?;
+    let mut rows = load_menu_level_rows(level_set, selection)?;
+    let started = Instant::now();
+    let mut window_title = String::new();
+
+    loop {
+        let frame_started = Instant::now();
+        let selection_before_events = selection;
+        for event in event_pump.poll_iter() {
+            match event {
+                Event::Quit { .. }
+                | Event::KeyDown {
+                    scancode: Some(Scancode::Escape),
+                    repeat: false,
+                    ..
+                } => return Ok(MenuOutcome::Quit),
+                Event::KeyDown {
+                    scancode: Some(Scancode::Up | Scancode::Left),
+                    ..
+                } => selection.move_by(-1),
+                Event::KeyDown {
+                    scancode: Some(Scancode::Down | Scancode::Right),
+                    ..
+                } => selection.move_by(1),
+                Event::KeyDown {
+                    scancode: Some(Scancode::PageUp),
+                    ..
+                } => selection.move_by(-10),
+                Event::KeyDown {
+                    scancode: Some(Scancode::PageDown),
+                    ..
+                } => selection.move_by(10),
+                Event::KeyDown {
+                    scancode: Some(Scancode::Home),
+                    repeat: false,
+                    ..
+                } => selection.select_first(),
+                Event::KeyDown {
+                    scancode: Some(Scancode::End),
+                    repeat: false,
+                    ..
+                } => selection.select_last(),
+                Event::KeyDown {
+                    scancode: Some(Scancode::Return | Scancode::KpEnter | Scancode::Space),
+                    repeat: false,
+                    ..
+                } => return Ok(MenuOutcome::Play(selection.selected_level())),
+                Event::KeyDown {
+                    scancode: Some(Scancode::M),
+                    repeat: false,
+                    ..
+                } => {
+                    // Music remains independently controllable before a level
+                    // starts, matching the same key available during gameplay.
+                    if let Some(audio) = audio.as_mut() {
+                        let enabled = audio.toggle_music();
+                        eprintln!("music {}", if enabled { "enabled" } else { "muted" });
+                    }
+                }
+                Event::KeyDown {
+                    scancode: Some(Scancode::S),
+                    repeat: false,
+                    ..
+                } => {
+                    // Effect muting is retained across the selected level because
+                    // the same player instance owns both front-end and gameplay.
+                    if let Some(audio) = audio.as_mut() {
+                        let enabled = audio.toggle_effects();
+                        eprintln!(
+                            "sound effects {}",
+                            if enabled { "enabled" } else { "muted" }
+                        );
+                    }
+                }
+                _ => {}
+            }
+        }
+
+        if selection != selection_before_events {
+            // Decode only after the selection changes; stable menu frames reuse
+            // their three owned title strings without touching LEVELS.DAT.
+            rows = load_menu_level_rows(level_set, selection)?;
+        }
+        let title = format!(
+            "Supaplex - Main Menu - Level {:03}: {}",
+            rows.current.number, rows.current.title
+        );
+        if title != window_title {
+            canvas
+                .window_mut()
+                .set_title(&title)
+                .map_err(|error| format!("update main-menu window title: {error}"))?;
+            window_title = title;
+        }
+
+        renderer
+            .draw_menu(
+                canvas,
+                rows.previous
+                    .as_ref()
+                    .map(|row| (row.number, row.title.as_str())),
+                (rows.current.number, rows.current.title.as_str()),
+                rows.next
+                    .as_ref()
+                    .map(|row| (row.number, row.title.as_str())),
+            )
+            .map_err(|error| error.to_string())?;
+        renderer
+            .draw_black_overlay(canvas, fade_in_opacity(started.elapsed()))
+            .map_err(|error| error.to_string())?;
+        canvas.present();
+
+        // Menu animation is limited separately from simulation because no game
+        // updates should accumulate while the user browses the level list.
+        if let Some(remaining) = RENDER_INTERVAL.checked_sub(frame_started.elapsed()) {
+            std::thread::sleep(remaining);
+        }
+    }
+}
+
+/// Decodes the at-most-three original titles visible around one menu selection.
+fn load_menu_level_rows(
+    level_set: LevelSet<'_>,
+    selection: MenuSelection,
+) -> Result<MenuLevelRows, String> {
+    // Optional neighbor numbers map directly to optional rows, while the current
+    // selection is guaranteed valid by `MenuSelection` and must always decode.
+    let previous = selection
+        .previous_level()
+        .map(|number| load_menu_level_row(level_set, number))
+        .transpose()?;
+    let current = load_menu_level_row(level_set, selection.selected_level())?;
+    let next = selection
+        .next_level()
+        .map(|number| load_menu_level_row(level_set, number))
+        .transpose()?;
+    Ok(MenuLevelRows {
+        previous,
+        current,
+        next,
+    })
+}
+
+/// Decodes one level record into the owned subset required by the menu renderer.
+fn load_menu_level_row(level_set: LevelSet<'_>, number: usize) -> Result<MenuLevelRow, String> {
+    // Dropping tiles and metadata immediately keeps the long-lived menu state
+    // small while preserving the parser's validation for every displayed title.
+    let level = level_set
+        .load(number)
+        .map_err(|error| format!("load menu level {number}: {error}"))?;
+    Ok(MenuLevelRow {
+        number,
+        title: level.title().to_owned(),
+    })
 }
 
 /// Displays the timed original title sequence and reports whether startup continues.

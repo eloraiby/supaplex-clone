@@ -21,6 +21,87 @@ pub struct SplashFrame {
     pub finished: bool,
 }
 
+/// Valid one-based level selection maintained by the main-menu input loop.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct MenuSelection {
+    /// Currently highlighted one-based level number.
+    selected_level: usize,
+    /// Inclusive upper bound obtained from the validated level collection.
+    level_count: usize,
+}
+
+impl MenuSelection {
+    /// Creates a selection clamped to a non-empty level collection.
+    pub fn new(initial_level: usize, level_count: usize) -> Option<Self> {
+        // A zero-sized collection has no valid one-based selection. Otherwise,
+        // clamping makes this state safe for callers other than the validated CLI.
+        if level_count == 0 {
+            return None;
+        }
+        Some(Self {
+            selected_level: initial_level.clamp(1, level_count),
+            level_count,
+        })
+    }
+
+    /// Returns the currently highlighted one-based level number.
+    pub const fn selected_level(self) -> usize {
+        // The private fields and mutation methods maintain `1..=level_count`.
+        self.selected_level
+    }
+
+    /// Returns the preceding level number when the selection is not first.
+    pub fn previous_level(self) -> Option<usize> {
+        // `checked_sub` expresses the absence of a row above level one without
+        // introducing a synthetic level zero into rendering code.
+        self.selected_level
+            .checked_sub(1)
+            .filter(|level| *level >= 1)
+    }
+
+    /// Returns the following level number when the selection is not last.
+    pub fn next_level(self) -> Option<usize> {
+        // The explicit bound prevents the menu from asking `LevelSet` for the
+        // sentinel record after the final playable level.
+        (self.selected_level < self.level_count).then_some(self.selected_level + 1)
+    }
+
+    /// Moves by a signed number of rows while clamping at both ends.
+    pub fn move_by(&mut self, offset: isize) {
+        // Saturating arithmetic handles Page Up at the first level and avoids
+        // converting a negative value to an enormous unsigned index.
+        self.selected_level = if offset.is_negative() {
+            self.selected_level
+                .saturating_sub(offset.unsigned_abs())
+                .max(1)
+        } else {
+            self.selected_level
+                .saturating_add(offset as usize)
+                .min(self.level_count)
+        };
+    }
+
+    /// Selects the first playable level directly.
+    pub fn select_first(&mut self) {
+        // One is always valid because construction rejects an empty collection.
+        self.selected_level = 1;
+    }
+
+    /// Selects the final playable level directly.
+    pub fn select_last(&mut self) {
+        // Retaining the validated count avoids duplicating knowledge of the
+        // original 111-level collection in the event adapter.
+        self.selected_level = self.level_count;
+    }
+}
+
+/// Returns black opacity for a screen fading in over the original duration.
+pub fn fade_in_opacity(elapsed: Duration) -> u8 {
+    // Once elapsed time reaches the duration, the subtraction yields zero and
+    // subsequent frames remain fully visible without special state handling.
+    u8::MAX - fade_component(elapsed, ORIGINAL_FADE_DURATION)
+}
+
 /// Calculates the title frame corresponding to an elapsed wall-clock duration.
 pub fn splash_frame(elapsed: Duration) -> SplashFrame {
     // The opening half fades black away, the middle preserves the decoded title
@@ -70,7 +151,10 @@ fn fade_component(elapsed: Duration, duration: Duration) -> u8 {
 mod tests {
     //! Boundary checks for the title sequence's three timing phases.
 
-    use super::{ORIGINAL_FADE_DURATION, SPLASH_HOLD_DURATION, SplashFrame, splash_frame};
+    use super::{
+        MenuSelection, ORIGINAL_FADE_DURATION, SPLASH_HOLD_DURATION, SplashFrame, fade_in_opacity,
+        splash_frame,
+    };
     use std::time::Duration;
 
     /// Confirms the title starts and ends behind an opaque black palette state.
@@ -115,5 +199,47 @@ mod tests {
 
         assert!(opening_early > opening_late);
         assert!(closing_early < closing_late);
+    }
+
+    /// Confirms menu movement clamps and never exposes non-level sentinel rows.
+    #[test]
+    fn menu_selection_clamps_navigation_to_the_collection() {
+        let mut selection = MenuSelection::new(1, 111).expect("collection is non-empty");
+
+        selection.move_by(-10);
+        assert_eq!(selection.selected_level(), 1);
+        assert_eq!(selection.previous_level(), None);
+        assert_eq!(selection.next_level(), Some(2));
+
+        selection.select_last();
+        selection.move_by(10);
+        assert_eq!(selection.selected_level(), 111);
+        assert_eq!(selection.previous_level(), Some(110));
+        assert_eq!(selection.next_level(), None);
+
+        selection.select_first();
+        assert_eq!(selection.selected_level(), 1);
+    }
+
+    /// Confirms initial selections are clamped and empty collections are rejected.
+    #[test]
+    fn menu_selection_validates_construction() {
+        assert_eq!(
+            MenuSelection::new(0, 111).map(MenuSelection::selected_level),
+            Some(1)
+        );
+        assert_eq!(
+            MenuSelection::new(999, 111).map(MenuSelection::selected_level),
+            Some(111)
+        );
+        assert_eq!(MenuSelection::new(1, 0), None);
+    }
+
+    /// Confirms reusable fade-in opacity reaches transparent black at completion.
+    #[test]
+    fn fade_in_reaches_fully_visible() {
+        assert_eq!(fade_in_opacity(Duration::ZERO), u8::MAX);
+        assert_eq!(fade_in_opacity(ORIGINAL_FADE_DURATION), 0);
+        assert_eq!(fade_in_opacity(ORIGINAL_FADE_DURATION * 2), 0);
     }
 }

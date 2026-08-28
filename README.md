@@ -1,9 +1,9 @@
 # Supaplex clone
 
-This project plays the 111 original Supaplex levels in SDL2. It loads the
-bundled DOS `LEVELS.DAT`, simulates actor-owned animation and behavior, and
-renders pixel-perfect conversions of the original `FIXED.DAT`, `MOVING.DAT`,
-and `CHARS8.DAT` assets with nearest-neighbor scaling. The original AdLib music
+This project plays the 111 original Supaplex levels in SDL2. It opens with the
+original title and main-menu artwork, loads the DOS `LEVELS.DAT`, simulates
+actor-owned animation and behavior, and renders pixel-perfect conversions of
+the original graphics with nearest-neighbor scaling. The original AdLib music
 and Sound Blaster gameplay effects play through a self-contained SDL mixer.
 
 ## Run a level
@@ -44,6 +44,10 @@ launching the executable from elsewhere.
 
 Controls:
 
+- Any key: advance past the title splash.
+- Menu arrows: select a level; `Page Up`/`Page Down` move ten levels, and
+  `Home`/`End` select the first or last level.
+- `Enter` or `Space`: start the highlighted menu level.
 - Arrow keys: move Murphy.
 - Space + arrow: eat Base or collect an adjacent Infotron/Red Disk without
   moving.
@@ -109,8 +113,8 @@ multi-way ports, special-port toggles, Bug timing, Snik Snaks, Electrons,
 Terminal/Yellow Disk detonation, single-fuse planted Red Disks, merged and
 chained 3×3 explosions, Electron-to-Infotron residue, synchronized initial Bug
 cycles with randomized per-Bug cooldowns, animated player death,
-completion, and restart. The current scope intentionally omits menus, profiles,
-demos, and progression between levels.
+completion, and restart. The current scope intentionally omits persistent
+profiles, demos, and progression between levels.
 
 ## Original data and PNG conversion
 

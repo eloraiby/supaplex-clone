@@ -1,4 +1,4 @@
-//! SDL2 rendering from the original fixed, moving, and font bitmap conversions.
+//! SDL2 rendering from the original gameplay and front-end bitmap conversions.
 
 use std::{error::Error, fmt, io::Cursor};
 
@@ -15,8 +15,8 @@ use crate::{
         State,
     },
     assets::{
-        self, AssetError, FIXED_GRAPHICS_PATH, FONT_GRAPHICS_PATH, MOVING_GRAPHICS_PATH,
-        PANEL_GRAPHICS_PATH, TITLE_GRAPHICS_PATH,
+        self, AssetError, FIXED_GRAPHICS_PATH, FONT_GRAPHICS_PATH, MENU_FONT_GRAPHICS_PATH,
+        MENU_GRAPHICS_PATH, MOVING_GRAPHICS_PATH, PANEL_GRAPHICS_PATH, TITLE_GRAPHICS_PATH,
     },
     game::{Game, GameStatus},
     murphy_animation::{SourcePoint, SpritePart, sprite_parts},
@@ -52,8 +52,23 @@ const FONT_SCALE: u32 = 2;
 /// Integer enlargement used for original 320-pixel-wide screen coordinates.
 const ORIGINAL_SCREEN_SCALE: u32 = LOGICAL_WIDTH / 320;
 
+/// Three-times-scaled height of an original 320×200 front-end screen.
+const ORIGINAL_SCREEN_HEIGHT: u32 = 200 * ORIGINAL_SCREEN_SCALE;
+
+/// Centered top edge of a front-end screen inside the gameplay logical height.
+const ORIGINAL_SCREEN_Y: i32 = ((LOGICAL_HEIGHT - ORIGINAL_SCREEN_HEIGHT) / 2) as i32;
+
 /// Number of glyphs placed horizontally in `CHARS8.DAT`.
 const FONT_GLYPHS: u8 = 64;
+
+/// Palette-1 color index 4 used for the main menu's informational message.
+const ORIGINAL_GREEN_TEXT: Color = Color::RGB(0x00, 0xb0, 0x60);
+
+/// Palette-1 color index 6 used for active rows and zeroed panel counters.
+const ORIGINAL_RED_TEXT: Color = Color::RGB(0xe0, 0x10, 0x10);
+
+/// Palette-1 color index 8 used for inactive rows and ordinary panel values.
+const ORIGINAL_BLUE_TEXT: Color = Color::RGB(0x70, 0x90, 0xe0);
 
 /// Integer enlargement from original 16-pixel tiles to the 32-pixel board.
 const MOVING_SCALE: u32 = 2;
@@ -102,6 +117,10 @@ pub struct Renderer<'textures> {
     panel: Texture<'textures>,
     /// Original 320×200 title artwork decoded with its dedicated palette.
     title: Texture<'textures>,
+    /// Original 320×200 main-menu frame decoded with gameplay palette 1.
+    menu: Texture<'textures>,
+    /// Original CHARS6 mask whose glyphs advance six source pixels in menus.
+    menu_font: Texture<'textures>,
     /// Most recent camera centered on a live Murphy.
     ///
     /// A death transition replaces Murphy with an Explosion immediately. The
@@ -157,6 +176,22 @@ impl<'textures> Renderer<'textures> {
             TITLE_GRAPHICS_PATH,
             BlackPixelPolicy::Opaque,
         )?;
+        let menu = load_texture(
+            texture_creator,
+            graphics.menu.as_ref(),
+            320,
+            200,
+            MENU_GRAPHICS_PATH,
+            BlackPixelPolicy::Opaque,
+        )?;
+        let menu_font = load_texture(
+            texture_creator,
+            graphics.menu_font.as_ref(),
+            512,
+            8,
+            MENU_FONT_GRAPHICS_PATH,
+            BlackPixelPolicy::Transparent,
+        )?;
 
         Ok(Self {
             fixed,
@@ -164,6 +199,8 @@ impl<'textures> Renderer<'textures> {
             font,
             panel,
             title,
+            menu,
+            menu_font,
             camera: Camera::default(),
         })
     }
@@ -174,15 +211,81 @@ impl<'textures> Renderer<'textures> {
         // pixels preserves its aspect ratio inside the taller gameplay window.
         canvas.set_draw_color(Color::RGB(0, 0, 0));
         canvas.clear();
-        let destination_height = 200 * ORIGINAL_SCREEN_SCALE;
-        let destination_y = (LOGICAL_HEIGHT - destination_height) / 2;
         canvas
             .copy(
                 &self.title,
                 None,
-                Rect::new(0, destination_y as i32, LOGICAL_WIDTH, destination_height),
+                Rect::new(0, ORIGINAL_SCREEN_Y, LOGICAL_WIDTH, ORIGINAL_SCREEN_HEIGHT),
             )
             .map_err(RenderError::Sdl)
+    }
+
+    /// Draws the original main menu with a current player and three level rows.
+    pub fn draw_menu(
+        &mut self,
+        canvas: &mut Canvas<Window>,
+        previous_level: Option<(usize, &str)>,
+        current_level: (usize, &str),
+        next_level: Option<(usize, &str)>,
+    ) -> Result<(), RenderError> {
+        // MENU.DAT supplies all borders, labels, arrows, and decorative controls.
+        // Repainting it first also clears text left by the previous selection.
+        canvas.set_draw_color(Color::RGB(0, 0, 0));
+        canvas.clear();
+        canvas
+            .copy(
+                &self.menu,
+                None,
+                Rect::new(0, ORIGINAL_SCREEN_Y, LOGICAL_WIDTH, ORIGINAL_SCREEN_HEIGHT),
+            )
+            .map_err(RenderError::Sdl)?;
+
+        // This clone has one local player profile. The coordinates mirror the
+        // original player list, current-player summary, and message-line fields.
+        self.draw_menu_text(canvas, "MURPHY", 16, 164, ORIGINAL_RED_TEXT)?;
+        self.draw_menu_text(canvas, "MURPHY", 168, 93, ORIGINAL_BLUE_TEXT)?;
+        self.draw_menu_text(canvas, "000:00:00", 224, 93, ORIGINAL_BLUE_TEXT)?;
+        self.draw_menu_text(
+            canvas,
+            &format!("{:03}", current_level.0),
+            288,
+            93,
+            ORIGINAL_BLUE_TEXT,
+        )?;
+        self.draw_menu_text(
+            canvas,
+            "ARROWS SELECT ENTER PLAY",
+            168,
+            127,
+            ORIGINAL_GREEN_TEXT,
+        )?;
+
+        if let Some((number, title)) = previous_level {
+            self.draw_menu_text(
+                canvas,
+                &format_menu_level(number, title),
+                144,
+                155,
+                ORIGINAL_BLUE_TEXT,
+            )?;
+        }
+        self.draw_menu_text(
+            canvas,
+            &format_menu_level(current_level.0, current_level.1),
+            144,
+            164,
+            ORIGINAL_RED_TEXT,
+        )?;
+        if let Some((number, title)) = next_level {
+            self.draw_menu_text(
+                canvas,
+                &format_menu_level(number, title),
+                144,
+                173,
+                ORIGINAL_BLUE_TEXT,
+            )?;
+        }
+        Ok(())
     }
 
     /// Covers the current logical frame with a blendable black fade layer.
@@ -572,14 +675,22 @@ impl<'textures> Renderer<'textures> {
         // Palette indices 6 and 8 are the original red highlight and blue
         // informational colors. The PNG font is a mask, so SDL color modulation
         // recreates those indexed writes over the preserved panel background.
-        const RED_TEXT: Color = Color::RGB(0xe0, 0x10, 0x10);
-        const BLUE_TEXT: Color = Color::RGB(0x70, 0x90, 0xe0);
-        self.draw_panel_text(canvas, "MURPHY", 72, 3, RED_TEXT)?;
-        self.draw_panel_text(canvas, &format!("{level_number:03}"), 16, 14, BLUE_TEXT)?;
-        self.draw_panel_text(canvas, game.title(), 64, 14, BLUE_TEXT)?;
+        self.draw_panel_text(canvas, "MURPHY", 72, 3, ORIGINAL_RED_TEXT)?;
+        self.draw_panel_text(
+            canvas,
+            &format!("{level_number:03}"),
+            16,
+            14,
+            ORIGINAL_BLUE_TEXT,
+        )?;
+        self.draw_panel_text(canvas, game.title(), 64, 14, ORIGINAL_BLUE_TEXT)?;
 
         let infotrons = game.remaining_infotrons().min(999);
-        let infotron_color = if infotrons == 0 { RED_TEXT } else { BLUE_TEXT };
+        let infotron_color = if infotrons == 0 {
+            ORIGINAL_RED_TEXT
+        } else {
+            ORIGINAL_BLUE_TEXT
+        };
         self.draw_panel_text(canvas, &format!("{infotrons:03}"), 272, 14, infotron_color)?;
 
         // The original panel shows only the last two digits for each time field
@@ -589,12 +700,16 @@ impl<'textures> Renderer<'textures> {
         let seconds = total_seconds % 60;
         let minutes = total_seconds / 60 % 60;
         let hours = total_seconds / 3_600 % 100;
-        self.draw_panel_text(canvas, &format!("{hours:02}"), 160, 3, RED_TEXT)?;
-        self.draw_panel_text(canvas, &format!("{minutes:02}"), 184, 3, RED_TEXT)?;
-        self.draw_panel_text(canvas, &format!("{seconds:02}"), 208, 3, RED_TEXT)?;
+        self.draw_panel_text(canvas, &format!("{hours:02}"), 160, 3, ORIGINAL_RED_TEXT)?;
+        self.draw_panel_text(canvas, &format!("{minutes:02}"), 184, 3, ORIGINAL_RED_TEXT)?;
+        self.draw_panel_text(canvas, &format!("{seconds:02}"), 208, 3, ORIGINAL_RED_TEXT)?;
 
         let red_disks = game.red_disks() % 100;
-        let red_disk_color = if red_disks == 0 { BLUE_TEXT } else { RED_TEXT };
+        let red_disk_color = if red_disks == 0 {
+            ORIGINAL_BLUE_TEXT
+        } else {
+            ORIGINAL_RED_TEXT
+        };
         self.draw_panel_text(canvas, &format!("{red_disks:02}"), 304, 14, red_disk_color)
     }
 
@@ -617,6 +732,43 @@ impl<'textures> Renderer<'textures> {
             color,
             ORIGINAL_SCREEN_SCALE,
         )
+    }
+
+    /// Draws CHARS6 text at an original 320×200 menu coordinate.
+    fn draw_menu_text(
+        &mut self,
+        canvas: &mut Canvas<Window>,
+        text: &str,
+        original_x: i32,
+        original_y: i32,
+        color: Color,
+    ) -> Result<(), RenderError> {
+        // CHARS6 stores each glyph in an eight-bit slot but the original loop
+        // copies and advances only six pixels. Cropping the source rectangle
+        // preserves that compact spacing rather than overlapping eight-pixel cells.
+        self.menu_font.set_color_mod(color.r, color.g, color.b);
+        let scale = ORIGINAL_SCREEN_SCALE;
+        let glyph_advance = 6 * scale;
+        for (character_index, character) in text.chars().enumerate() {
+            let character = character.to_ascii_uppercase();
+            let ascii = u32::from(character);
+            let glyph = if (32..32 + u32::from(FONT_GLYPHS)).contains(&ascii) {
+                ascii - 32
+            } else {
+                u32::from(b'?' - b' ')
+            };
+            let source = Rect::new((glyph * FONT_CELL_SIZE) as i32, 0, 6, FONT_CELL_SIZE);
+            let destination = Rect::new(
+                original_x * scale as i32 + character_index as i32 * glyph_advance as i32,
+                ORIGINAL_SCREEN_Y + original_y * scale as i32,
+                6 * scale,
+                FONT_CELL_SIZE * scale,
+            );
+            canvas
+                .copy(&self.menu_font, source, destination)
+                .map_err(RenderError::Sdl)?;
+        }
+        Ok(())
     }
 
     /// Draws a centered terminal-state banner while keeping the board visible.
@@ -699,6 +851,13 @@ impl<'textures> Renderer<'textures> {
 
         Ok(())
     }
+}
+
+/// Formats one original level-list row without exceeding its 29-character field.
+fn format_menu_level(number: usize, title: &str) -> String {
+    // Original titles are ASCII and at most 23 characters, but the truncation
+    // also keeps custom level data inside the right-hand menu frame.
+    format!("{number:03} {title}").chars().take(29).collect()
 }
 
 /// Selects one unscaled original source rectangle for a gravity-driven actor.
