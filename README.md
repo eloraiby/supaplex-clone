@@ -8,17 +8,18 @@ and Sound Blaster gameplay effects play through a self-contained SDL mixer.
 
 ## Run a level
 
-Install Rust and an SDL2 development library discoverable through
-`pkg-config`, then select a one-based level number:
+Install Rust and an SDL2 development library discoverable through `pkg-config`,
+then launch the front end:
 
 ```bash
-cargo run --release -- --level 1
+cargo run --release
 ```
 
-Valid numbers are `1..=111`. The default executable embeds every runtime asset,
-so it does not depend on the process working directory after it is built.
-The optional `--step <5-60>` argument selects fixed simulation updates per
-second; omitting it preserves the original rate of 35 updates per second.
+The optional `--level <1-111>` argument chooses the initially highlighted menu
+row; omitting it starts at level 1. The default executable embeds every runtime
+asset, so it does not depend on the process working directory after it is built.
+The optional `--step <5-60>` argument selects fixed simulation updates per second;
+omitting it preserves the original rate of 35 updates per second.
 
 ### Unbundled build
 
@@ -26,7 +27,7 @@ Enable the `unbundle` feature to keep levels, graphics, music, and effects out
 of the executable:
 
 ```bash
-cargo run --release --features unbundle -- --level 1
+cargo run --release --features unbundle
 ```
 
 An unbundled build reads the following distribution tree at startup:

@@ -1,4 +1,4 @@
-//! Minimal command-line parsing for choosing a level and simulation rate.
+//! Minimal command-line parsing for initial menu selection and simulation rate.
 
 use std::{error::Error, fmt};
 
@@ -7,6 +7,9 @@ pub const FIRST_LEVEL: usize = 1;
 
 /// The final level number accepted by the original 111-level collection.
 pub const LAST_LEVEL: usize = 111;
+
+/// Initial main-menu level used when `--level` is omitted.
+pub const DEFAULT_LEVEL: usize = FIRST_LEVEL;
 
 /// Slowest supported simulation rate in fixed updates per second.
 pub const FIRST_STEP_RATE: u32 = 5;
@@ -17,7 +20,7 @@ pub const LAST_STEP_RATE: u32 = 60;
 /// Original Supaplex and SpeedFix simulation rate used when `--step` is omitted.
 pub const DEFAULT_STEP_RATE: u32 = 35;
 
-/// Validated options needed to start one play session.
+/// Validated options needed to initialize the front end.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct Options {
     /// One-based level number matching the numbering shown by Supaplex.
@@ -27,10 +30,11 @@ pub struct Options {
 }
 
 impl Options {
-    /// Parses required `--level` and optional `--step` argument pairs.
+    /// Parses optional `--level` and `--step` argument pairs.
     ///
-    /// Exactly one level selector is required; `--step` defaults to the
-    /// original 35 updates per second. Pairs may appear in either order. A
+    /// The level selector defaults to level one and merely chooses the initial
+    /// main-menu row; `--step` defaults to the original 35 updates per second.
+    /// Pairs may appear in either order. A
     /// deliberately small parser keeps startup dependencies light and every
     /// rejection deterministic.
     pub fn parse<I, S>(arguments: I) -> Result<Self, OptionsError>
@@ -65,15 +69,15 @@ impl Options {
             }
         }
 
-        // A level remains mandatory, whereas absence of `--step` deliberately
-        // reproduces the historical 35-Hz fixed update rate.
+        // Both defaults describe front-end startup rather than bypassing it:
+        // level one is highlighted and the historical fixed rate is retained.
         Ok(Self {
-            level_number: level_number.ok_or(OptionsError::ExpectedLevelOption)?,
+            level_number: level_number.unwrap_or(DEFAULT_LEVEL),
             steps_per_second: steps_per_second.unwrap_or(DEFAULT_STEP_RATE),
         })
     }
 
-    /// Returns the one-based number of the level selected by the player.
+    /// Returns the one-based level initially highlighted in the main menu.
     pub fn level_number(self) -> usize {
         // Copying the validated scalar cannot expose an invalid record index.
         self.level_number
@@ -87,8 +91,8 @@ impl Options {
 
     /// Returns a concise invocation string suitable for startup errors.
     pub fn usage() -> &'static str {
-        // Square brackets communicate that omitting the rate retains 35 Hz.
-        "Usage: supaplex-clone --level <1-111> [--step <5-60>]"
+        // Both pairs are optional because ordinary startup begins at the menu.
+        "Usage: supaplex-clone [--level <1-111>] [--step <5-60>]"
     }
 }
 
@@ -121,8 +125,6 @@ fn parse_step_rate(value: String) -> Result<u32, OptionsError> {
 /// Describes why command-line arguments could not select a playable level.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum OptionsError {
-    /// The required `--level <number>` pair was absent.
-    ExpectedLevelOption,
     /// A recognized or unknown flag was not followed by a value.
     MissingValue(String),
     /// A flag outside the supported `--level` and `--step` grammar was supplied.
@@ -143,7 +145,6 @@ impl fmt::Display for OptionsError {
     /// Formats a short message that can be followed by [`Options::usage`].
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            Self::ExpectedLevelOption => formatter.write_str("expected --level <number>"),
             Self::MissingValue(option) => write!(formatter, "missing value after {option}"),
             Self::UnknownOption(option) => write!(formatter, "unknown option {option:?}"),
             Self::DuplicateOption(option) => write!(formatter, "duplicate option {option}"),
@@ -170,8 +171,8 @@ mod tests {
     //! Unit tests for the complete public command-line grammar.
 
     use super::{
-        DEFAULT_STEP_RATE, FIRST_LEVEL, FIRST_STEP_RATE, LAST_LEVEL, LAST_STEP_RATE, Options,
-        OptionsError,
+        DEFAULT_LEVEL, DEFAULT_STEP_RATE, FIRST_LEVEL, FIRST_STEP_RATE, LAST_LEVEL, LAST_STEP_RATE,
+        Options, OptionsError,
     };
 
     /// Confirms that both inclusive endpoints produce usable options.
@@ -207,13 +208,15 @@ mod tests {
         );
     }
 
-    /// Confirms a level remains required even when a valid rate is supplied.
+    /// Confirms ordinary startup and a rate-only override default to level one.
     #[test]
-    fn requires_the_explicit_level_pair() {
-        assert_eq!(
-            Options::parse(["--step", "35"]),
-            Err(OptionsError::ExpectedLevelOption)
-        );
+    fn defaults_the_initial_menu_level_when_omitted() {
+        let defaults = Options::parse(Vec::<&str>::new()).expect("empty arguments should parse");
+        let rate_only = Options::parse(["--step", "35"]).expect("rate-only form should parse");
+
+        assert_eq!(defaults.level_number(), DEFAULT_LEVEL);
+        assert_eq!(defaults.steps_per_second(), DEFAULT_STEP_RATE);
+        assert_eq!(rate_only.level_number(), DEFAULT_LEVEL);
     }
 
     /// Confirms unknown, incomplete, and repeated pairs receive precise errors.
