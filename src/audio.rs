@@ -2,8 +2,16 @@
 //!
 //! This module loads the seven playback-ready WAV effects from the configured
 //! asset source, converts those short clips to the opened-device format, and
-//! mixes them with an in-tree player for the original XM arrangement in SDL's
-//! real-time callback.
+//! mixes them with either native OPL2 synthesis or the optional XM conversion
+//! in SDL's real-time callback.
+
+use std::{
+    sync::{
+        Arc, Mutex,
+        atomic::{AtomicBool, Ordering},
+    },
+    time::Duration,
+};
 
 use sdl2::{
     AudioSubsystem,
@@ -14,7 +22,7 @@ use sdl2::{
     rwops::RWops,
 };
 
-use crate::{assets, game::SoundEffect, xm::XmPlayer};
+use crate::{assets, cli::MusicPlayer, game::SoundEffect, opl::OplPlayer, xm::XmPlayer};
 
 /// Requested device frequency used by every decoded production clip.
 const OUTPUT_FREQUENCY: i32 = 44_100;
@@ -31,124 +39,236 @@ const PRIORITY_UNIT_MILLISECONDS: usize = 20;
 /// Background level used before effects are added to the callback buffer.
 const MUSIC_VOLUME: f32 = 0.38;
 
+/// Bounded grace period in which the callback observes a shutdown request.
+///
+/// Two 512-frame buffers at 44.1 kHz take less than 24 milliseconds. Waiting
+/// 25 milliseconds therefore lets an in-flight mix finish and the following
+/// callback return silence before SDL synchronously pauses the device.
+const SHUTDOWN_QUIESCE_TIME: Duration = Duration::from_millis(25);
+
 /// Owns the live SDL playback device and its callback mixer.
 pub struct AudioPlayer {
-    /// SDL serializes callback access while this handle mutates mixer state.
+    /// Live SDL callback device, mutated only during final shutdown.
     device: AudioDevice<Mixer>,
+    /// Short commands transferred without taking SDL's device-wide audio lock.
+    pending_commands: Arc<Mutex<Vec<AudioCommand>>>,
+    /// Lock-free request that makes subsequent callbacks return immediate silence.
+    stop_requested: Arc<AtomicBool>,
+    /// Main-thread copy of the user's persistent music preference.
+    music_enabled: bool,
+    /// Main-thread copy of the user's persistent effect preference.
+    effects_enabled: bool,
 }
 
 impl AudioPlayer {
-    /// Opens the default 44.1-kHz stereo device and starts music playback.
-    pub fn new(subsystem: &AudioSubsystem) -> Result<Self, String> {
+    /// Opens the default stereo device and starts the selected music backend.
+    pub fn new(subsystem: &AudioSubsystem, music_player: MusicPlayer) -> Result<Self, String> {
         // Load and decode before opening the device so missing or malformed
         // production data produces a normal initialization error rather than
         // panicking inside SDL's callback-construction closure.
         let asset_set = assets::load_audio().map_err(|error| error.to_string())?;
         let effect_bytes = std::array::from_fn(|index| asset_set.effects[index].as_ref());
         let effects = EffectBank::decode(effect_bytes, OUTPUT_FREQUENCY, OUTPUT_CHANNELS)?;
-        let music = XmPlayer::new(asset_set.music.as_ref(), OUTPUT_FREQUENCY as u32)
-            .map_err(|error| format!("decode production music: {error}"))?;
+        let music = MusicVoice::new(music_player, &asset_set, OUTPUT_FREQUENCY as u32)?;
+        let pending_commands = Arc::new(Mutex::new(Vec::with_capacity(16)));
+        let mixer_commands = Arc::clone(&pending_commands);
+        let stop_requested = Arc::new(AtomicBool::new(false));
+        let mixer_stop_requested = Arc::clone(&stop_requested);
         let desired = AudioSpecDesired {
             freq: Some(OUTPUT_FREQUENCY),
             channels: Some(OUTPUT_CHANNELS),
             samples: Some(OUTPUT_BUFFER_SAMPLES),
         };
         let device = subsystem
-            .open_playback(None, &desired, move |spec| Mixer::new(spec, effects, music))
+            .open_playback(None, &desired, move |spec| {
+                Mixer::new(spec, effects, music, mixer_commands, mixer_stop_requested)
+            })
             .map_err(|error| format!("open playback device: {error}"))?;
 
         // SDL devices begin paused so construction cannot race the caller.
         // Resume only after the fully initialized handle is ready to return.
         device.resume();
-        Ok(Self { device })
+        Ok(Self {
+            device,
+            pending_commands,
+            stop_requested,
+            music_enabled: true,
+            effects_enabled: true,
+        })
     }
 
     /// Offers one simulation-selected effect to the original priority gate.
     pub fn play(&mut self, effect: SoundEffect) {
-        // Locking is brief: clips were decoded at startup, so this only swaps a
-        // small cursor and policy state while SDL pauses its callback thread.
-        self.device.lock().play_effect(effect);
+        // A muted request is discarded immediately, matching the callback's
+        // policy while avoiding an obsolete effect after a later re-enable.
+        if self.effects_enabled {
+            self.queue_command(AudioCommand::PlayEffect { effect });
+        }
     }
 
     /// Toggles gameplay effects and returns their new enabled state.
     pub fn toggle_effects(&mut self) -> bool {
         // Disabling immediately clears the active voice and its priority. A
         // later re-enable therefore cannot resume half of an obsolete effect.
-        let mut mixer = self.device.lock();
-        mixer.effects_enabled = !mixer.effects_enabled;
-        if !mixer.effects_enabled {
-            mixer.effect_voice = None;
-            mixer.current_priority = 0;
-            mixer.priority_frames_remaining = 0;
-        }
-        mixer.effects_enabled
+        self.effects_enabled = !self.effects_enabled;
+        self.queue_command(AudioCommand::SetEffectsEnabled {
+            enabled: self.effects_enabled,
+        });
+        self.effects_enabled
     }
 
     /// Sets gameplay-effect playback explicitly and returns the retained state.
     pub fn set_effects_enabled(&mut self, enabled: bool) -> bool {
         // Explicit setters let the original hardware buttons choose coherent
         // music/effect combinations without depending on a previous toggle.
-        let mut mixer = self.device.lock();
-        mixer.effects_enabled = enabled;
-        if !enabled {
-            mixer.effect_voice = None;
-            mixer.current_priority = 0;
-            mixer.priority_frames_remaining = 0;
-        }
-        mixer.effects_enabled
+        self.effects_enabled = enabled;
+        self.queue_command(AudioCommand::SetEffectsEnabled { enabled });
+        self.effects_enabled
     }
 
     /// Returns whether gameplay effects currently accept new requests.
-    pub fn effects_enabled(&mut self) -> bool {
-        // SDL serializes this short read with its callback so the controls
-        // screen never displays a stale value during live playback.
-        self.device.lock().effects_enabled
+    pub fn effects_enabled(&self) -> bool {
+        // This main-thread preference changes synchronously when controls are
+        // activated; callback application may follow by at most one buffer.
+        self.effects_enabled
     }
 
     /// Toggles soundtrack playback and returns its new enabled state.
     pub fn toggle_music(&mut self) -> bool {
         // User muting and Exit pausing are distinct: toggling back on is an
         // explicit request to resume from the retained loop cursor.
-        let mut mixer = self.device.lock();
-        mixer.music_enabled = !mixer.music_enabled;
-        mixer.music_playing = mixer.music_enabled;
-        mixer.music_enabled
+        self.music_enabled = !self.music_enabled;
+        self.queue_command(AudioCommand::SetMusicEnabled {
+            enabled: self.music_enabled,
+        });
+        self.music_enabled
     }
 
     /// Sets soundtrack playback explicitly and returns the retained state.
     pub fn set_music_enabled(&mut self, enabled: bool) -> bool {
         // The user-selected enabled flag and active playback flag change
         // together here; only protected Exit playback may pause them separately.
-        let mut mixer = self.device.lock();
-        mixer.music_enabled = enabled;
-        mixer.music_playing = enabled;
-        mixer.music_enabled
+        self.music_enabled = enabled;
+        self.queue_command(AudioCommand::SetMusicEnabled { enabled });
+        self.music_enabled
     }
 
     /// Returns whether the soundtrack is enabled by the user.
-    pub fn music_enabled(&mut self) -> bool {
-        // Locking produces a callback-consistent snapshot of the mixer flag.
-        self.device.lock().music_enabled
+    pub fn music_enabled(&self) -> bool {
+        // Returning local control state avoids waiting on a platform callback
+        // merely to draw the controls screen.
+        self.music_enabled
     }
 
     /// Clears transient effects and resumes enabled music for a restarted level.
     pub fn restart_level(&mut self) {
         // Exit protects its effect for five seconds and pauses music. A manual
         // level restart is a new session, so neither terminal state may leak.
-        let mut mixer = self.device.lock();
-        mixer.effect_voice = None;
-        mixer.current_priority = 0;
-        mixer.priority_frames_remaining = 0;
-        mixer.music_playing = mixer.music_enabled;
+        self.queue_command(AudioCommand::RestartLevel);
     }
 
     /// Stops the callback thread and closes its SDL device in a defined order.
     pub fn shutdown(self) {
-        // Some platform backends do not reliably wake a running callback when
-        // the surrounding SDL resources begin implicit reverse-order teardown.
-        // Pausing first synchronizes with any in-flight mix, after which this
-        // consumed player's normal field drop closes an already-idle device.
+        // Do not take SDL's callback lock while exiting: a backend that has
+        // stopped servicing audio could otherwise hold the main thread forever.
+        // The atomic is visible even when no callback command can be drained.
+        self.stop_requested.store(true, Ordering::Release);
+        std::thread::sleep(SHUTDOWN_QUIESCE_TIME);
+
+        // The callback is now either idle or producing immediate silence.
+        // Pausing preserves the explicit close order required by SDL backends;
+        // normal field drop then closes an already-quiescent device.
         self.device.pause();
+    }
+
+    /// Appends one main-thread request for the beginning of the next callback.
+    fn queue_command(&self, command: AudioCommand) {
+        // This mutex protects only a tiny command vector; the callback releases
+        // it before OPL/XM rendering, so game input never waits for synthesis or
+        // for SDL's potentially backend-dependent device lock.
+        let mut pending = self
+            .pending_commands
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        pending.push(command);
+    }
+}
+
+/// Main-thread audio operation applied in order by the next SDL callback.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum AudioCommand {
+    /// Offer one gameplay effect to the original single-channel priority gate.
+    PlayEffect {
+        /// Semantic clip and policy selected by the simulation.
+        effect: SoundEffect,
+    },
+    /// Replace the persistent user preference for gameplay effects.
+    SetEffectsEnabled {
+        /// Whether new effects may play after this command is applied.
+        enabled: bool,
+    },
+    /// Replace the persistent user preference for soundtrack playback.
+    SetMusicEnabled {
+        /// Whether music should actively advance after this command.
+        enabled: bool,
+    },
+    /// Clear terminal audio state before a new level or menu session.
+    RestartLevel,
+}
+
+/// Callback-owned implementation behind the command-line soundtrack choice.
+enum MusicVoice {
+    /// Boxed register-level synthesis of the original DOS score and patches.
+    Opl {
+        /// Heap-indirected chip and scheduler, keeping the enum compact.
+        player: Box<OplPlayer>,
+    },
+    /// Sample mixing and sequencing of the later four-channel XM conversion.
+    Xm {
+        /// Parsed tracker module and its mutable channel sequencer.
+        player: XmPlayer,
+    },
+}
+
+impl MusicVoice {
+    /// Decodes exactly the backend selected by the validated command line.
+    fn new(
+        selection: MusicPlayer,
+        assets: &assets::AudioAssets,
+        sample_rate: u32,
+    ) -> Result<Self, String> {
+        // Keeping selection outside the callback avoids format parsing and heap
+        // allocation on SDL's real-time audio thread.
+        match selection {
+            MusicPlayer::Opl => OplPlayer::new(assets.opl_music.as_ref(), sample_rate)
+                .map(Box::new)
+                .map(|player| Self::Opl { player })
+                .map_err(|error| format!("decode production OPL music: {error}")),
+            MusicPlayer::Xm => XmPlayer::new(assets.xm_music.as_ref(), sample_rate)
+                .map(|player| Self::Xm { player })
+                .map_err(|error| format!("decode production XM music: {error}")),
+        }
+    }
+
+    /// Adds the selected backend's next stereo frames to one callback buffer.
+    fn mix_stereo(&mut self, output: &mut [f32], gain: f32) {
+        // Both concrete players share interleaved stereo and normalized gain
+        // semantics, so the callback needs no backend-specific branches.
+        match self {
+            Self::Opl { player } => player.mix_stereo(output, gain),
+            Self::Xm { player } => player.mix_stereo(output, gain),
+        }
+    }
+
+    /// Returns the common rendered-frame clock used by audio timing tests.
+    #[cfg(test)]
+    fn rendered_frames(&self) -> u64 {
+        // Each backend increments once per stereo frame, making their pause and
+        // callback behavior directly comparable despite different synthesis.
+        match self {
+            Self::Opl { player } => player.rendered_frames(),
+            Self::Xm { player } => player.rendered_frames(),
+        }
     }
 }
 
@@ -212,8 +332,8 @@ struct Mixer {
     spec: AudioSpec,
     /// Decoded immutable effect samples shared by successive voices.
     effects: EffectBank,
-    /// Parsed tracker sequencer and decoded sample voices for the soundtrack.
-    music: XmPlayer,
+    /// Selected native OPL or converted XM soundtrack implementation.
+    music: MusicVoice,
     /// Persistent user preference controlled by the M key.
     music_enabled: bool,
     /// Session playback state paused independently when Exit is accepted.
@@ -226,13 +346,23 @@ struct Mixer {
     priority_frames_remaining: usize,
     /// User-controlled effect switch toggled by the S key.
     effects_enabled: bool,
+    /// Ordered main-thread operations waiting for a callback boundary.
+    pending_commands: Arc<Mutex<Vec<AudioCommand>>>,
+    /// Lock-free terminal request checked before any synthesis work.
+    stop_requested: Arc<AtomicBool>,
 }
 
 impl Mixer {
     /// Creates silent callback state around already converted effect samples.
-    fn new(spec: AudioSpec, effects: EffectBank, music: XmPlayer) -> Self {
+    fn new(
+        spec: AudioSpec,
+        effects: EffectBank,
+        music: MusicVoice,
+        pending_commands: Arc<Mutex<Vec<AudioCommand>>>,
+        stop_requested: Arc<AtomicBool>,
+    ) -> Self {
         // The audio device owns this value for its full lifetime; no callback
-        // path allocates, decodes, locks a Rust mutex, or touches simulation.
+        // path allocates, decodes assets, or touches simulation state.
         Self {
             spec,
             effects,
@@ -243,6 +373,51 @@ impl Mixer {
             current_priority: 0,
             priority_frames_remaining: 0,
             effects_enabled: true,
+            pending_commands,
+            stop_requested,
+        }
+    }
+
+    /// Applies every main-thread operation queued since the previous callback.
+    fn apply_pending_commands(&mut self) {
+        // Clone the lightweight Arc so the guard borrows a local owner instead
+        // of borrowing `self`; command application can then mutate mixer state.
+        // The guard remains held only across small scalar/cursor operations and
+        // is released before either music backend synthesizes a single frame.
+        let queue = Arc::clone(&self.pending_commands);
+        let mut pending = queue
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        for command in pending.drain(..) {
+            match command {
+                AudioCommand::PlayEffect { effect } => {
+                    self.play_effect(effect);
+                }
+                AudioCommand::SetEffectsEnabled { enabled } => {
+                    self.effects_enabled = enabled;
+                    if !enabled {
+                        // Muting discards the active cursor and protection, so
+                        // re-enabling cannot resume an obsolete partial clip.
+                        self.effect_voice = None;
+                        self.current_priority = 0;
+                        self.priority_frames_remaining = 0;
+                    }
+                }
+                AudioCommand::SetMusicEnabled { enabled } => {
+                    // Explicit user control resumes or pauses the retained song
+                    // cursor independently of a previous accepted Exit effect.
+                    self.music_enabled = enabled;
+                    self.music_playing = enabled;
+                }
+                AudioCommand::RestartLevel => {
+                    // New sessions discard protected effects while respecting
+                    // the user's persistent music-enabled preference.
+                    self.effect_voice = None;
+                    self.current_priority = 0;
+                    self.priority_frames_remaining = 0;
+                    self.music_playing = self.music_enabled;
+                }
+            }
         }
     }
 
@@ -272,7 +447,7 @@ impl Mixer {
         true
     }
 
-    /// Adds looping tracker music to the cleared stereo output buffer.
+    /// Adds looping selected music to the cleared stereo output buffer.
     fn mix_music(&mut self, output: &mut [f32]) {
         // Exit and M both silence the player without advancing or rewinding it.
         // A restart or explicit toggle therefore resumes at the retained tick.
@@ -281,7 +456,7 @@ impl Mixer {
         }
         debug_assert_eq!(
             self.spec.channels, OUTPUT_CHANNELS,
-            "the XM mixer is constructed for the requested stereo layout"
+            "both music backends are constructed for the requested stereo layout"
         );
         self.music.mix_stereo(output, MUSIC_VOLUME);
     }
@@ -328,6 +503,12 @@ impl AudioCallback for Mixer {
         // SDL may recycle buffers, so every callback must establish silence
         // before selectively adding active voices.
         output.fill(0.0);
+        if self.stop_requested.load(Ordering::Acquire) {
+            // Shutdown must never enter either synthesizer after the main
+            // thread requests quiescence; returning silence is immediate.
+            return;
+        }
+        self.apply_pending_commands();
         self.mix_music(output);
         self.mix_effect(output);
         self.advance_priority(output.len());
@@ -426,11 +607,19 @@ fn decode_wav(encoded: &[u8], frequency: i32, channels: u8) -> Result<Vec<f32>, 
 mod tests {
     //! Decoder and mixer checks that do not open a host audio device.
 
-    use super::{AudioCallback, AudioSpec, EffectBank, Mixer, OUTPUT_CHANNELS, OUTPUT_FREQUENCY};
-    use crate::{assets, game::SoundEffect, xm::XmPlayer};
+    use std::sync::{
+        Arc, Mutex,
+        atomic::{AtomicBool, Ordering},
+    };
+
+    use super::{
+        AudioCallback, AudioCommand, AudioSpec, EffectBank, Mixer, MusicVoice, OUTPUT_CHANNELS,
+        OUTPUT_FREQUENCY,
+    };
+    use crate::{assets, cli::MusicPlayer, game::SoundEffect};
 
     /// Builds a mixer with decoded production assets and a production layout.
-    fn decoded_mixer() -> Mixer {
+    fn decoded_mixer(selection: MusicPlayer) -> Mixer {
         // AudioSpec fields are public precisely so callback code can retain the
         // obtained layout; the tests construct the desired layout directly.
         let spec = AudioSpec {
@@ -445,15 +634,21 @@ mod tests {
         let effect_bytes = std::array::from_fn(|index| asset_set.effects[index].as_ref());
         let effects = EffectBank::decode(effect_bytes, spec.freq, spec.channels)
             .expect("production Sound Blaster effects should decode");
-        let music = XmPlayer::new(asset_set.music.as_ref(), OUTPUT_FREQUENCY as u32)
-            .expect("production AdLib music should decode");
-        Mixer::new(spec, effects, music)
+        let music = MusicVoice::new(selection, &asset_set, OUTPUT_FREQUENCY as u32)
+            .expect("selected production music should decode");
+        Mixer::new(
+            spec,
+            effects,
+            music,
+            Arc::new(Mutex::new(Vec::new())),
+            Arc::new(AtomicBool::new(false)),
+        )
     }
 
     /// Confirms each production WAV becomes non-empty interleaved stereo data.
     #[test]
     fn production_effects_decode_for_the_callback_layout() {
-        let mixer = decoded_mixer();
+        let mixer = decoded_mixer(MusicPlayer::Opl);
 
         // Every clip must contain whole stereo frames and audible non-zero PCM.
         for clip in &mixer.effects.clips {
@@ -466,7 +661,7 @@ mod tests {
     /// Confirms requests obey the original global priority comparisons.
     #[test]
     fn effect_priority_rejects_and_interrupts_the_original_pairs() {
-        let mut mixer = decoded_mixer();
+        let mut mixer = decoded_mixer(MusicPlayer::Opl);
 
         assert!(mixer.play_effect(SoundEffect::Base));
         assert!(!mixer.play_effect(SoundEffect::Base));
@@ -482,7 +677,7 @@ mod tests {
     /// Confirms the callback emits samples and disabling clears current state.
     #[test]
     fn callback_mixes_one_effect_and_muting_discards_it() {
-        let mut mixer = decoded_mixer();
+        let mut mixer = decoded_mixer(MusicPlayer::Opl);
         assert!(mixer.play_effect(SoundEffect::Base));
         let mut output = [0.0; 128];
 
@@ -498,20 +693,68 @@ mod tests {
         assert!(!mixer.play_effect(SoundEffect::Bug));
     }
 
-    /// Confirms tracker music advances in callbacks and Exit pauses only its voice.
+    /// Confirms main-thread commands take effect without SDL's callback lock.
+    #[test]
+    fn callback_applies_shared_commands_before_mixing() {
+        let mut mixer = decoded_mixer(MusicPlayer::Opl);
+        let queue = Arc::clone(&mixer.pending_commands);
+        let mut output = [0.0; 128];
+
+        // Queue an effect exactly as the Escape explosion path does. The main
+        // thread releases the small command mutex before the callback begins.
+        queue
+            .lock()
+            .expect("test command queue should not be poisoned")
+            .push(AudioCommand::PlayEffect {
+                effect: SoundEffect::Explosion,
+            });
+        mixer.music_enabled = false;
+        mixer.music_playing = false;
+        mixer.callback(&mut output);
+        assert!(mixer.effect_voice.is_some());
+        assert!(output.iter().any(|sample| *sample != 0.0));
+
+        queue
+            .lock()
+            .expect("test command queue should not be poisoned")
+            .push(AudioCommand::SetEffectsEnabled { enabled: false });
+        mixer.callback(&mut output);
+        assert!(!mixer.effects_enabled);
+        assert!(mixer.effect_voice.is_none());
+    }
+
+    /// Confirms shutdown quiescence bypasses synthesis and returns only silence.
+    #[test]
+    fn callback_honors_the_lock_free_stop_request() {
+        let mut mixer = decoded_mixer(MusicPlayer::Opl);
+        let starting_frame = mixer.music.rendered_frames();
+        let mut output = [1.0; 128];
+
+        mixer.stop_requested.store(true, Ordering::Release);
+        mixer.callback(&mut output);
+
+        assert!(output.iter().all(|sample| *sample == 0.0));
+        assert_eq!(mixer.music.rendered_frames(), starting_frame);
+    }
+
+    /// Confirms both music backends advance and Exit pauses only their voice.
     #[test]
     fn music_advances_and_an_accepted_exit_pauses_it() {
-        let mut mixer = decoded_mixer();
-        let mut output = [0.0; 4_096];
-        let starting_frame = mixer.music.rendered_frames();
+        for selection in [MusicPlayer::Opl, MusicPlayer::Xm] {
+            let mut mixer = decoded_mixer(selection);
+            let mut output = [0.0; 4_096];
+            let starting_frame = mixer.music.rendered_frames();
 
-        mixer.callback(&mut output);
-        let paused_frame = mixer.music.rendered_frames();
-        assert_eq!(paused_frame - starting_frame, 2_048);
-        assert!(output.iter().any(|sample| *sample != 0.0));
-        assert!(mixer.play_effect(SoundEffect::Exit));
-        assert!(!mixer.music_playing);
-        mixer.callback(&mut output);
-        assert_eq!(mixer.music.rendered_frames(), paused_frame);
+            // OPL deliberately waits one original 20 ms timer interval before
+            // its first note, while this 46 ms buffer is long enough for both.
+            mixer.callback(&mut output);
+            let paused_frame = mixer.music.rendered_frames();
+            assert_eq!(paused_frame - starting_frame, 2_048);
+            assert!(output.iter().any(|sample| *sample != 0.0));
+            assert!(mixer.play_effect(SoundEffect::Exit));
+            assert!(!mixer.music_playing);
+            mixer.callback(&mut output);
+            assert_eq!(mixer.music.rendered_frames(), paused_frame);
+        }
     }
 }

@@ -18,9 +18,13 @@ pub const ASSET_ROOT_ENVIRONMENT_VARIABLE: &str = "SUPAPLEX_ASSET_ROOT";
 #[cfg(feature = "unbundle")]
 const LEVELS_PATH: &str = "assets/data/levels.dat";
 
-/// Relative location of the original tracker arrangement.
+/// Relative location of the captured original AdLib register program.
 #[cfg(feature = "unbundle")]
-const MUSIC_PATH: &str = "assets/audio/music.xm";
+const OPL_MUSIC_PATH: &str = "assets/audio/music.opl";
+
+/// Relative location of the sampled tracker conversion.
+#[cfg(feature = "unbundle")]
+const XM_MUSIC_PATH: &str = "assets/audio/music.xm";
 
 /// Relative Sound Blaster effect locations in semantic sound-effect order.
 #[cfg(feature = "unbundle")]
@@ -161,8 +165,10 @@ pub(crate) struct GraphicsAssets {
 /// Complete soundtrack and effect payload set loaded before opening SDL audio.
 #[derive(Debug)]
 pub(crate) struct AudioAssets {
-    /// Original AdLib arrangement retained as a FastTracker XM module.
-    pub(crate) music: AssetBytes,
+    /// Register writes captured from the original DOS AdLib driver and score.
+    pub(crate) opl_music: AssetBytes,
+    /// Later FastTracker conversion retained as an optional playback backend.
+    pub(crate) xm_music: AssetBytes,
     /// Sound Blaster WAV renders in the stable semantic effect order.
     pub(crate) effects: [AssetBytes; 7],
 }
@@ -233,7 +239,8 @@ pub(crate) fn load_audio() -> Result<AudioAssets, AssetError> {
     #[cfg(not(feature = "unbundle"))]
     {
         Ok(AudioAssets {
-            music: AssetBytes::embedded(include_bytes!("../assets/audio/music.xm")),
+            opl_music: AssetBytes::embedded(include_bytes!("../assets/audio/music.opl")),
+            xm_music: AssetBytes::embedded(include_bytes!("../assets/audio/music.xm")),
             effects: [
                 AssetBytes::embedded(include_bytes!("../assets/audio/explosion.wav")),
                 AssetBytes::embedded(include_bytes!("../assets/audio/infotron.wav")),
@@ -248,7 +255,8 @@ pub(crate) fn load_audio() -> Result<AudioAssets, AssetError> {
     #[cfg(feature = "unbundle")]
     {
         Ok(AudioAssets {
-            music: load_external(MUSIC_PATH)?,
+            opl_music: load_external(OPL_MUSIC_PATH)?,
+            xm_music: load_external(XM_MUSIC_PATH)?,
             effects: [
                 load_external(EFFECT_PATHS[0])?,
                 load_external(EFFECT_PATHS[1])?,
@@ -402,7 +410,8 @@ mod tests {
         ] {
             assert!(png.as_ref().starts_with(b"\x89PNG\r\n\x1a\n"));
         }
-        assert!(audio.music.as_ref().starts_with(b"Extended Module: "));
+        assert!(audio.opl_music.as_ref().starts_with(b"SPOPL\x1a\x01\0"));
+        assert!(audio.xm_music.as_ref().starts_with(b"Extended Module: "));
         assert_eq!(audio.effects.len(), 7);
         assert!(
             audio

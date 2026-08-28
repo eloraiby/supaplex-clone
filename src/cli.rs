@@ -1,4 +1,4 @@
-//! Minimal command-line parsing for initial menu selection and simulation rate.
+//! Minimal parsing for initial menu selection, simulation rate, and music player.
 
 use std::{error::Error, fmt};
 
@@ -20,6 +20,20 @@ pub const LAST_STEP_RATE: u32 = 60;
 /// Original Supaplex and SpeedFix simulation rate used when `--step` is omitted.
 pub const DEFAULT_STEP_RATE: u32 = 35;
 
+/// Soundtrack implementation selected before the SDL audio device is opened.
+///
+/// Both players reproduce the same composition, but [`Self::Opl`] programs an
+/// emulated Yamaha chip from the original DOS register stream while [`Self::Xm`]
+/// plays the later sampled tracker conversion retained for comparison.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub enum MusicPlayer {
+    /// Native OPL2 synthesis using the original AdLib register writes.
+    #[default]
+    Opl,
+    /// Four-channel sampled playback of the FastTracker XM conversion.
+    Xm,
+}
+
 /// Validated options needed to initialize the front end.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct Options {
@@ -27,16 +41,18 @@ pub struct Options {
     level_number: usize,
     /// Validated number of fixed simulation updates performed per second.
     steps_per_second: u32,
+    /// Soundtrack backend selected by `--player`, defaulting to native OPL2.
+    music_player: MusicPlayer,
 }
 
 impl Options {
-    /// Parses optional `--level` and `--step` argument pairs.
+    /// Parses optional `--level`, `--step`, and `--player` argument pairs.
     ///
     /// The level selector defaults to level one and merely chooses the initial
-    /// main-menu row; `--step` defaults to the original 35 updates per second.
-    /// Pairs may appear in either order. A
-    /// deliberately small parser keeps startup dependencies light and every
-    /// rejection deterministic.
+    /// main-menu row; `--step` defaults to the original 35 updates per second;
+    /// and `--player` accepts `opl` or `xm`, with OPL selected by default. Pairs
+    /// may appear in any order. A deliberately small parser keeps startup
+    /// dependencies light and every rejection deterministic.
     pub fn parse<I, S>(arguments: I) -> Result<Self, OptionsError>
     where
         I: IntoIterator<Item = S>,
@@ -48,6 +64,7 @@ impl Options {
         let mut arguments = arguments.into_iter().map(Into::into);
         let mut level_number = None;
         let mut steps_per_second = None;
+        let mut music_player = None;
         while let Some(option) = arguments.next() {
             let value = arguments
                 .next()
@@ -65,6 +82,12 @@ impl Options {
                     }
                     steps_per_second = Some(parse_step_rate(value)?);
                 }
+                "--player" => {
+                    if music_player.is_some() {
+                        return Err(OptionsError::DuplicateOption("--player"));
+                    }
+                    music_player = Some(parse_music_player(value)?);
+                }
                 _ => return Err(OptionsError::UnknownOption(option)),
             }
         }
@@ -74,6 +97,7 @@ impl Options {
         Ok(Self {
             level_number: level_number.unwrap_or(DEFAULT_LEVEL),
             steps_per_second: steps_per_second.unwrap_or(DEFAULT_STEP_RATE),
+            music_player: music_player.unwrap_or_default(),
         })
     }
 
@@ -89,10 +113,18 @@ impl Options {
         self.steps_per_second
     }
 
+    /// Returns the validated soundtrack backend chosen for this process.
+    pub fn music_player(self) -> MusicPlayer {
+        // The closed enum prevents arbitrary user text from reaching the audio
+        // constructor or selecting a partially initialized callback backend.
+        self.music_player
+    }
+
     /// Returns a concise invocation string suitable for startup errors.
     pub fn usage() -> &'static str {
-        // Both pairs are optional because ordinary startup begins at the menu.
-        "Usage: supaplex-clone [--level <1-111>] [--step <5-60>]"
+        // Every pair is optional because ordinary startup uses the original
+        // menu defaults and the new native OPL soundtrack implementation.
+        "Usage: supaplex-clone [--level <1-111>] [--step <5-60>] [--player <opl|xm>]"
     }
 }
 
@@ -122,14 +154,25 @@ fn parse_step_rate(value: String) -> Result<u32, OptionsError> {
     Ok(steps_per_second)
 }
 
+/// Converts the two deliberately lowercase player names into a closed enum.
+fn parse_music_player(value: String) -> Result<MusicPlayer, OptionsError> {
+    // Exact matching keeps the public command line stable across platforms and
+    // makes misspellings visible instead of silently falling back to OPL.
+    match value.as_str() {
+        "opl" => Ok(MusicPlayer::Opl),
+        "xm" => Ok(MusicPlayer::Xm),
+        _ => Err(OptionsError::InvalidMusicPlayer { value }),
+    }
+}
+
 /// Describes why command-line arguments could not select a playable level.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum OptionsError {
     /// A recognized or unknown flag was not followed by a value.
     MissingValue(String),
-    /// A flag outside the supported `--level` and `--step` grammar was supplied.
+    /// A flag outside the supported option grammar was supplied.
     UnknownOption(String),
-    /// One of the two supported options appeared more than once.
+    /// One of the three supported options appeared more than once.
     DuplicateOption(&'static str),
     /// The option value was not an unsigned integer.
     InvalidLevel(String),
@@ -139,6 +182,11 @@ pub enum OptionsError {
     InvalidStepRate(String),
     /// The step rate was numeric but outside the supported frequency range.
     StepRateOutOfRange(u32),
+    /// The player name was neither the native `opl` nor converted `xm` backend.
+    InvalidMusicPlayer {
+        /// Unrecognized value supplied immediately after `--player`.
+        value: String,
+    },
 }
 
 impl fmt::Display for OptionsError {
@@ -160,6 +208,10 @@ impl fmt::Display for OptionsError {
                 formatter,
                 "step rate {value} is outside the supported range {FIRST_STEP_RATE}..={LAST_STEP_RATE}"
             ),
+            Self::InvalidMusicPlayer { value } => write!(
+                formatter,
+                "invalid music player {value:?}; expected \"opl\" or \"xm\""
+            ),
         }
     }
 }
@@ -172,7 +224,7 @@ mod tests {
 
     use super::{
         DEFAULT_LEVEL, DEFAULT_STEP_RATE, FIRST_LEVEL, FIRST_STEP_RATE, LAST_LEVEL, LAST_STEP_RATE,
-        Options, OptionsError,
+        MusicPlayer, Options, OptionsError,
     };
 
     /// Confirms that both inclusive endpoints produce usable options.
@@ -185,6 +237,8 @@ mod tests {
         assert_eq!(last.level_number(), LAST_LEVEL);
         assert_eq!(first.steps_per_second(), DEFAULT_STEP_RATE);
         assert_eq!(last.steps_per_second(), DEFAULT_STEP_RATE);
+        assert_eq!(first.music_player(), MusicPlayer::Opl);
+        assert_eq!(last.music_player(), MusicPlayer::Opl);
     }
 
     /// Confirms both inclusive step endpoints parse in either pair order.
@@ -217,6 +271,7 @@ mod tests {
         assert_eq!(defaults.level_number(), DEFAULT_LEVEL);
         assert_eq!(defaults.steps_per_second(), DEFAULT_STEP_RATE);
         assert_eq!(rate_only.level_number(), DEFAULT_LEVEL);
+        assert_eq!(defaults.music_player(), MusicPlayer::Opl);
     }
 
     /// Confirms unknown, incomplete, and repeated pairs receive precise errors.
@@ -238,6 +293,10 @@ mod tests {
             Options::parse(["--level", "1", "--step", "35", "--step", "36"]),
             Err(OptionsError::DuplicateOption("--step"))
         );
+        assert_eq!(
+            Options::parse(["--player", "opl", "--player", "xm"]),
+            Err(OptionsError::DuplicateOption("--player"))
+        );
     }
 
     /// Confirms step values must be unsigned integers inside 5..=60.
@@ -254,6 +313,22 @@ mod tests {
         assert_eq!(
             Options::parse(["--level", "1", "--step", "61"]),
             Err(OptionsError::StepRateOutOfRange(61))
+        );
+    }
+
+    /// Confirms both named music backends parse and all other names are rejected.
+    #[test]
+    fn selects_only_the_documented_music_players() {
+        let opl = Options::parse(["--player", "opl"]).expect("OPL should parse");
+        let xm = Options::parse(["--player", "xm"]).expect("XM should parse");
+
+        assert_eq!(opl.music_player(), MusicPlayer::Opl);
+        assert_eq!(xm.music_player(), MusicPlayer::Xm);
+        assert_eq!(
+            Options::parse(["--player", "midi"]),
+            Err(OptionsError::InvalidMusicPlayer {
+                value: "midi".to_owned()
+            })
         );
     }
 }

@@ -9,6 +9,7 @@ default = []
 unbundle = []
 
 [dependencies]
+oplon = "1.0.0"
 png = "0.18.1"
 sdl2 = "0.38.0"
 
