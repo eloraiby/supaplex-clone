@@ -1161,10 +1161,10 @@ mod tests {
     use crate::level::{LEVEL_RECORD_SIZE, LEVEL_WIDTH, LevelSet, SpecialPort};
 
     /// Original level-set bytes used for end-to-end initialization checks.
-    const ORIGINAL_LEVELS: &[u8] = include_bytes!("../data/levels.dat");
+    const ORIGINAL_LEVELS: &[u8] = include_bytes!("../assets/data/levels.dat");
 
     /// First legacy attract-mode stream, verified as successful by OpenSupaplex.
-    const ORIGINAL_DEMO_ZERO: &[u8] = include_bytes!("../data/demo0.bin");
+    const ORIGINAL_DEMO_ZERO: &[u8] = include_bytes!("../assets/data/demo0.bin");
 
     /// Creates a compact bordered game with mutable private fields for tests.
     fn game_with(placements: &[(Position, State)], required_infotrons: u16) -> Game {

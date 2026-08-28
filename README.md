@@ -33,16 +33,16 @@ cargo run --release --features unbundle
 An unbundled build reads the following distribution tree at startup:
 
 ```text
-data/levels.dat
-data/demo{0,1,2,3,4,5,6,7,8,9}.bin
+assets/data/levels.dat
+assets/data/demo{0,1,2,3,4,5,6,7,8,9}.bin
 assets/gfx/{fixed,moving,chars8,chars6,title,menu,gfx,controls,back,panel}.png
 assets/audio/music.xm
 assets/audio/{explosion,infotron,push,fall,bug,base,exit}.wav
 ```
 
 Paths are relative to the working directory by default. Set
-`SUPAPLEX_ASSET_ROOT` to the directory containing `data/` and `assets/` when
-launching the executable from elsewhere.
+`SUPAPLEX_ASSET_ROOT` to the directory containing `assets/` when launching the
+executable from elsewhere.
 
 Player names, completion time, level results, and the selected profile are saved
 under SDL's per-user preference directory. Set `SUPAPLEX_PROFILE_PATH` to an

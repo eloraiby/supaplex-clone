@@ -3,8 +3,8 @@
 //! Normal builds retain the self-contained executable behavior by borrowing
 //! bytes emitted by `include_bytes!`. Enabling the `unbundle` Cargo feature
 //! removes those payloads from production code and reads the identical paths
-//! from disk. `SUPAPLEX_ASSET_ROOT` may name the directory containing `data/`
-//! and `assets/`; without it, relative paths resolve from the working directory.
+//! from disk. `SUPAPLEX_ASSET_ROOT` may name the directory containing `assets/`;
+//! without it, relative paths resolve from the working directory.
 
 use std::{error::Error, fmt};
 
@@ -16,7 +16,7 @@ pub const ASSET_ROOT_ENVIRONMENT_VARIABLE: &str = "SUPAPLEX_ASSET_ROOT";
 
 /// Relative location of the original level collection.
 #[cfg(feature = "unbundle")]
-const LEVELS_PATH: &str = "data/levels.dat";
+const LEVELS_PATH: &str = "assets/data/levels.dat";
 
 /// Relative location of the original tracker arrangement.
 #[cfg(feature = "unbundle")]
@@ -37,16 +37,16 @@ const EFFECT_PATHS: [&str; 7] = [
 /// Relative locations of the ten original attract-mode input streams.
 #[cfg(feature = "unbundle")]
 const DEMO_PATHS: [&str; 10] = [
-    "data/demo0.bin",
-    "data/demo1.bin",
-    "data/demo2.bin",
-    "data/demo3.bin",
-    "data/demo4.bin",
-    "data/demo5.bin",
-    "data/demo6.bin",
-    "data/demo7.bin",
-    "data/demo8.bin",
-    "data/demo9.bin",
+    "assets/data/demo0.bin",
+    "assets/data/demo1.bin",
+    "assets/data/demo2.bin",
+    "assets/data/demo3.bin",
+    "assets/data/demo4.bin",
+    "assets/data/demo5.bin",
+    "assets/data/demo6.bin",
+    "assets/data/demo7.bin",
+    "assets/data/demo8.bin",
+    "assets/data/demo9.bin",
 ];
 
 /// Relative location of the converted fixed-tile strip.
@@ -180,7 +180,9 @@ pub fn load_levels() -> Result<AssetBytes, AssetError> {
     // needs separate lifetime or ownership logic for the two distribution modes.
     #[cfg(not(feature = "unbundle"))]
     {
-        Ok(AssetBytes::embedded(include_bytes!("../data/levels.dat")))
+        Ok(AssetBytes::embedded(include_bytes!(
+            "../assets/data/levels.dat"
+        )))
     }
     #[cfg(feature = "unbundle")]
     {
@@ -268,16 +270,16 @@ pub fn load_demos() -> Result<DemoAssets, AssetError> {
     {
         Ok(DemoAssets {
             demos: [
-                AssetBytes::embedded(include_bytes!("../data/demo0.bin")),
-                AssetBytes::embedded(include_bytes!("../data/demo1.bin")),
-                AssetBytes::embedded(include_bytes!("../data/demo2.bin")),
-                AssetBytes::embedded(include_bytes!("../data/demo3.bin")),
-                AssetBytes::embedded(include_bytes!("../data/demo4.bin")),
-                AssetBytes::embedded(include_bytes!("../data/demo5.bin")),
-                AssetBytes::embedded(include_bytes!("../data/demo6.bin")),
-                AssetBytes::embedded(include_bytes!("../data/demo7.bin")),
-                AssetBytes::embedded(include_bytes!("../data/demo8.bin")),
-                AssetBytes::embedded(include_bytes!("../data/demo9.bin")),
+                AssetBytes::embedded(include_bytes!("../assets/data/demo0.bin")),
+                AssetBytes::embedded(include_bytes!("../assets/data/demo1.bin")),
+                AssetBytes::embedded(include_bytes!("../assets/data/demo2.bin")),
+                AssetBytes::embedded(include_bytes!("../assets/data/demo3.bin")),
+                AssetBytes::embedded(include_bytes!("../assets/data/demo4.bin")),
+                AssetBytes::embedded(include_bytes!("../assets/data/demo5.bin")),
+                AssetBytes::embedded(include_bytes!("../assets/data/demo6.bin")),
+                AssetBytes::embedded(include_bytes!("../assets/data/demo7.bin")),
+                AssetBytes::embedded(include_bytes!("../assets/data/demo8.bin")),
+                AssetBytes::embedded(include_bytes!("../assets/data/demo9.bin")),
             ],
         })
     }
