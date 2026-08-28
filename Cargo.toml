@@ -11,3 +11,10 @@ unbundle = []
 [dependencies]
 png = "0.18.1"
 sdl2 = "0.38.0"
+
+[profile.release]
+opt-level = "z"   # Optimize for size
+lto = true        # Enable link-time optimization (aggressive dead code elimination)
+codegen-units = 1 # Maximize optimization scope across the whole binary
+panic = "abort"   # Required baseline strategy for removing unwinding mechanics
+strip = true      # Strip all debuginfo and symbols automatically
