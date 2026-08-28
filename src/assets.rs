@@ -34,6 +34,21 @@ const EFFECT_PATHS: [&str; 7] = [
     "assets/audio/exit.wav",
 ];
 
+/// Relative locations of the ten original attract-mode input streams.
+#[cfg(feature = "unbundle")]
+const DEMO_PATHS: [&str; 10] = [
+    "data/demo0.bin",
+    "data/demo1.bin",
+    "data/demo2.bin",
+    "data/demo3.bin",
+    "data/demo4.bin",
+    "data/demo5.bin",
+    "data/demo6.bin",
+    "data/demo7.bin",
+    "data/demo8.bin",
+    "data/demo9.bin",
+];
+
 /// Relative location of the converted fixed-tile strip.
 pub(crate) const FIXED_GRAPHICS_PATH: &str = "assets/gfx/fixed.png";
 
@@ -152,6 +167,13 @@ pub(crate) struct AudioAssets {
     pub(crate) effects: [AssetBytes; 7],
 }
 
+/// Complete original attract-mode demo payload set in F1 through F10 order.
+#[derive(Debug)]
+pub struct DemoAssets {
+    /// Ten legacy level-number and run-length-encoded input streams.
+    pub demos: [AssetBytes; 10],
+}
+
 /// Loads the original level set from the selected bundled or external source.
 pub fn load_levels() -> Result<AssetBytes, AssetError> {
     // Keep the compile-time branches inside the access layer so gameplay never
@@ -238,6 +260,46 @@ pub(crate) fn load_audio() -> Result<AudioAssets, AssetError> {
     }
 }
 
+/// Loads all ten original demonstrations from the selected production source.
+pub fn load_demos() -> Result<DemoAssets, AssetError> {
+    // Keeping positional order fixed preserves the original F1 through F10
+    // mapping and avoids deriving asset paths from unchecked runtime indices.
+    #[cfg(not(feature = "unbundle"))]
+    {
+        Ok(DemoAssets {
+            demos: [
+                AssetBytes::embedded(include_bytes!("../data/demo0.bin")),
+                AssetBytes::embedded(include_bytes!("../data/demo1.bin")),
+                AssetBytes::embedded(include_bytes!("../data/demo2.bin")),
+                AssetBytes::embedded(include_bytes!("../data/demo3.bin")),
+                AssetBytes::embedded(include_bytes!("../data/demo4.bin")),
+                AssetBytes::embedded(include_bytes!("../data/demo5.bin")),
+                AssetBytes::embedded(include_bytes!("../data/demo6.bin")),
+                AssetBytes::embedded(include_bytes!("../data/demo7.bin")),
+                AssetBytes::embedded(include_bytes!("../data/demo8.bin")),
+                AssetBytes::embedded(include_bytes!("../data/demo9.bin")),
+            ],
+        })
+    }
+    #[cfg(feature = "unbundle")]
+    {
+        Ok(DemoAssets {
+            demos: [
+                load_external(DEMO_PATHS[0])?,
+                load_external(DEMO_PATHS[1])?,
+                load_external(DEMO_PATHS[2])?,
+                load_external(DEMO_PATHS[3])?,
+                load_external(DEMO_PATHS[4])?,
+                load_external(DEMO_PATHS[5])?,
+                load_external(DEMO_PATHS[6])?,
+                load_external(DEMO_PATHS[7])?,
+                load_external(DEMO_PATHS[8])?,
+                load_external(DEMO_PATHS[9])?,
+            ],
+        })
+    }
+}
+
 /// Resolves and reads one file from an unbundled asset tree.
 #[cfg(feature = "unbundle")]
 fn load_external(relative_path: &'static str) -> Result<AssetBytes, AssetError> {
@@ -311,7 +373,7 @@ impl Error for AssetError {
 mod tests {
     //! Asset-set checks shared by bundled and unbundled feature configurations.
 
-    use super::{load_audio, load_graphics, load_levels};
+    use super::{load_audio, load_demos, load_graphics, load_levels};
 
     /// Confirms every production payload is available through the selected mode.
     #[test]
@@ -319,6 +381,7 @@ mod tests {
         let levels = load_levels().expect("production levels should load");
         let graphics = load_graphics().expect("production graphics should load");
         let audio = load_audio().expect("production audio should load");
+        let demos = load_demos().expect("production demos should load");
 
         // Exact sizes and lightweight signatures detect misplaced files without
         // duplicating the format-specific validation performed by their consumers.
@@ -330,6 +393,9 @@ mod tests {
             &graphics.menu_font,
             &graphics.title,
             &graphics.menu,
+            &graphics.gfx_tutor,
+            &graphics.controls,
+            &graphics.back,
             &graphics.panel,
         ] {
             assert!(png.as_ref().starts_with(b"\x89PNG\r\n\x1a\n"));
@@ -342,5 +408,11 @@ mod tests {
                 .iter()
                 .all(|effect| effect.as_ref().starts_with(b"RIFF"))
         );
+        assert_eq!(demos.demos.len(), 10);
+        for (index, demo) in demos.demos.iter().enumerate() {
+            assert_eq!(demo.as_ref().last(), Some(&0xff));
+            assert!((1..=111).contains(&usize::from(demo.as_ref()[0])));
+            assert!(demo.as_ref().len() > index);
+        }
     }
 }

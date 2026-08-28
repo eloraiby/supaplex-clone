@@ -4,7 +4,7 @@ use std::{
     env,
     path::{Path, PathBuf},
     process::ExitCode,
-    time::{Duration, Instant},
+    time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 
 use sdl2::{
@@ -17,6 +17,7 @@ use supaplex_clone::{
     assets,
     audio::AudioPlayer,
     cli::{FIRST_STEP_RATE, LAST_STEP_RATE, Options},
+    demo::Demo,
     frontend::{
         ControlsTarget, MainMenuTarget, MenuSelection, ORIGINAL_FADE_DURATION, controls_target_at,
         fade_in_opacity, fade_out_opacity, main_menu_player_row_at, main_menu_target_at,
@@ -77,6 +78,15 @@ enum GameOutcome {
     Quit,
 }
 
+/// Terminal result of one original attract-mode demonstration.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum DemoOutcome {
+    /// Return to the menu and report the simulation state reached by the stream.
+    Menu(GameStatus),
+    /// Close the application without revisiting the menu.
+    Quit,
+}
+
 /// Menu operation awaiting text entry or confirmation through the OK button.
 #[derive(Clone, Debug, Eq, PartialEq)]
 enum PendingMenuAction {
@@ -102,6 +112,10 @@ struct MainMenuResources<'resource> {
     level_set: LevelSet<'resource>,
     /// Number of playable records used to clamp selection state.
     level_count: usize,
+    /// Ten validated original demonstrations in F1 through F10 order.
+    demos: &'resource [Demo],
+    /// Validated fixed simulation frequency used during demo playback.
+    steps_per_second: u32,
     /// Mutable player list updated by menu actions and gameplay progression.
     players: &'resource mut PlayerBook,
     /// Writable platform preference file receiving immediate player updates.
@@ -242,6 +256,16 @@ fn run(level_bytes: &[u8], initial_level: usize, steps_per_second: u32) -> Resul
     let level_count = level_set
         .level_count()
         .map_err(|error| format!("validate level collection: {error}"))?;
+    let demo_assets = assets::load_demos().map_err(|error| format!("load demos: {error}"))?;
+    let demos: Vec<Demo> = demo_assets
+        .demos
+        .iter()
+        .enumerate()
+        .map(|(index, bytes)| {
+            Demo::decode(bytes.as_ref(), level_count)
+                .map_err(|error| format!("decode demo {}: {error}", index + 1))
+        })
+        .collect::<Result<_, _>>()?;
     let profile_path = player_profile_path()?;
     let mut players = PlayerBook::load(&profile_path, level_count)
         .map_err(|error| format!("load player profiles: {error}"))?;
@@ -257,6 +281,8 @@ fn run(level_bytes: &[u8], initial_level: usize, steps_per_second: u32) -> Resul
             MainMenuResources {
                 level_set,
                 level_count,
+                demos: &demos,
+                steps_per_second,
                 players: &mut players,
                 profile_path: &profile_path,
                 text_input: &text_input,
@@ -547,6 +573,160 @@ fn play_level(
     }
 }
 
+/// Replays one original input stream without accepting live gameplay commands.
+fn play_demo(
+    canvas: &mut sdl2::render::Canvas<sdl2::video::Window>,
+    renderer: &mut Renderer<'_>,
+    event_pump: &mut sdl2::EventPump,
+    audio: &mut Option<AudioPlayer>,
+    demo: &Demo,
+    session: LevelSession<'_>,
+) -> Result<DemoOutcome, String> {
+    // Legacy standalone demos do not embed a SpeedFix seed, so the original
+    // zero-initialized demo seed table supplies zero for deterministic Bugs.
+    let mut game = Game::with_random_seed(session.level, 0).map_err(|error| error.to_string())?;
+    if let Some(audio) = audio.as_mut() {
+        audio.restart_level();
+    }
+    if !fade_game(
+        canvas,
+        renderer,
+        event_pump,
+        &game,
+        session,
+        FadeDirection::In,
+    )? {
+        return Ok(DemoOutcome::Quit);
+    }
+
+    let step = simulation_step(session.steps_per_second);
+    const MAX_STEPS_PER_FRAME: usize = 6;
+    let mut playback = demo.playback();
+    let mut previous = Instant::now();
+    let mut accumulator = Duration::ZERO;
+    let mut stream_finished = false;
+    let mut window_title = String::new();
+
+    loop {
+        let frame_started = Instant::now();
+        accumulator += frame_started
+            .duration_since(previous)
+            .min(Duration::from_millis(250));
+        previous = frame_started;
+        let mut interrupted = false;
+        for event in event_pump.poll_iter() {
+            match event {
+                Event::Quit { .. } => return Ok(DemoOutcome::Quit),
+                Event::KeyDown { repeat: false, .. }
+                | Event::MouseButtonDown {
+                    mouse_btn: MouseButton::Left | MouseButton::Right,
+                    ..
+                } => interrupted = true,
+                _ => {}
+            }
+        }
+
+        let mut processed_steps = 0;
+        while accumulator >= step && processed_steps < MAX_STEPS_PER_FRAME && !stream_finished {
+            if let Some(input) = playback.next() {
+                game.tick(input);
+                if let Some(audio) = audio.as_mut() {
+                    // Demo effects pass through the same one-channel priority
+                    // gate as live play while recorded input remains immutable.
+                    for effect in game.take_sound_effects() {
+                        audio.play(effect);
+                    }
+                } else {
+                    game.take_sound_effects();
+                }
+                accumulator -= step;
+                processed_steps += 1;
+            } else {
+                stream_finished = true;
+            }
+        }
+        if processed_steps == MAX_STEPS_PER_FRAME {
+            // Discard excess lag exactly like live play so demo input does not
+            // continue long after the display becomes responsive again.
+            accumulator = Duration::ZERO;
+        }
+
+        let title = format!(
+            "Supaplex - Demo - Level {:03}: {} - {} steps remaining",
+            session.level_number,
+            game.title(),
+            playback.len()
+        );
+        if title != window_title {
+            canvas
+                .window_mut()
+                .set_title(&title)
+                .map_err(|error| format!("update demo window title: {error}"))?;
+            window_title = title;
+        }
+        renderer
+            .draw(
+                canvas,
+                &game,
+                session.level_number,
+                session.steps_per_second,
+            )
+            .map_err(|error| error.to_string())?;
+        canvas.present();
+
+        if interrupted || stream_finished || game.terminal_transition_ready() {
+            let status = game.status();
+            if !fade_game(
+                canvas,
+                renderer,
+                event_pump,
+                &game,
+                session,
+                FadeDirection::Out,
+            )? {
+                return Ok(DemoOutcome::Quit);
+            }
+            if let Some(audio) = audio.as_mut() {
+                audio.restart_level();
+            }
+            return Ok(DemoOutcome::Menu(status));
+        }
+
+        if let Some(remaining) = RENDER_INTERVAL.checked_sub(frame_started.elapsed()) {
+            std::thread::sleep(remaining);
+        }
+    }
+}
+
+/// Maps the original F1 through F10 shortcuts to zero-based demo indices.
+fn demo_index_for_scancode(scancode: Scancode) -> Option<usize> {
+    // An explicit mapping avoids relying on SDL enum discriminant contiguity.
+    match scancode {
+        Scancode::F1 => Some(0),
+        Scancode::F2 => Some(1),
+        Scancode::F3 => Some(2),
+        Scancode::F4 => Some(3),
+        Scancode::F5 => Some(4),
+        Scancode::F6 => Some(5),
+        Scancode::F7 => Some(6),
+        Scancode::F8 => Some(7),
+        Scancode::F9 => Some(8),
+        Scancode::F10 => Some(9),
+        _ => None,
+    }
+}
+
+/// Selects one of ten attract demos from the current wall-clock instant.
+fn random_demo_index() -> usize {
+    // The original seeds its random selection from the clock. Nanoseconds give
+    // repeated clicks useful variation while a pre-epoch failure falls back to 0.
+    let ticks = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_nanos();
+    usize::try_from(ticks % 10).expect("demo modulo always fits usize")
+}
+
 /// Fades a stationary gameplay snapshot between black and the game palette.
 fn fade_game(
     canvas: &mut sdl2::render::Canvas<sdl2::video::Window>,
@@ -606,6 +786,8 @@ fn show_main_menu(
     let MainMenuResources {
         level_set,
         level_count,
+        demos,
+        steps_per_second,
         players,
         profile_path,
         text_input,
@@ -626,6 +808,7 @@ fn show_main_menu(
         let frame_started = Instant::now();
         let selection_before_events = selection;
         let mut requested_action = None;
+        let mut requested_demo = None;
         let mut clicked_player_row = None;
         for event in event_pump.poll_iter() {
             // Text entry is a modal menu state: ordinary level shortcuts cannot
@@ -765,6 +948,14 @@ fn show_main_menu(
                     ..
                 } => requested_action = Some(MainMenuTarget::Controls),
                 Event::KeyDown {
+                    scancode: Some(scancode),
+                    repeat: false,
+                    ..
+                } if demo_index_for_scancode(scancode).is_some() => {
+                    requested_demo = demo_index_for_scancode(scancode);
+                    requested_action = Some(MainMenuTarget::Demo);
+                }
+                Event::KeyDown {
                     scancode: Some(Scancode::M),
                     repeat: false,
                     ..
@@ -872,10 +1063,54 @@ fn show_main_menu(
                     reveal_started = Instant::now();
                 }
                 MainMenuTarget::Demo => {
-                    // Demo playback is supplied by the following focused
-                    // front-end change; until then the control remains visibly
-                    // responsive instead of silently swallowing the click.
-                    message = " SELECT DEMO WITH F1-F10".to_owned();
+                    let demo_index = requested_demo.unwrap_or_else(random_demo_index);
+                    let demo = demos
+                        .get(demo_index)
+                        .ok_or_else(|| format!("demo {} is unavailable", demo_index + 1))?;
+                    if !fade_menu_to_black(
+                        canvas,
+                        renderer,
+                        event_pump,
+                        MainMenuFrame {
+                            rows: &rows,
+                            players,
+                            message: &message,
+                            ranking_offset,
+                            hovered,
+                        },
+                    )? {
+                        return Ok(MenuOutcome::Quit);
+                    }
+                    let level = level_set.load(demo.level_number()).map_err(|error| {
+                        format!(
+                            "load demo {} level {}: {error}",
+                            demo_index + 1,
+                            demo.level_number()
+                        )
+                    })?;
+                    match play_demo(
+                        canvas,
+                        renderer,
+                        event_pump,
+                        audio,
+                        demo,
+                        LevelSession {
+                            level: &level,
+                            level_number: demo.level_number(),
+                            level_count,
+                            steps_per_second,
+                        },
+                    )? {
+                        DemoOutcome::Menu(GameStatus::Completed) => {
+                            message = "    DEMO SUCCESSFUL    ".to_owned();
+                        }
+                        DemoOutcome::Menu(GameStatus::Playing | GameStatus::Dead) => {
+                            message = "      DEMO FAILED      ".to_owned();
+                        }
+                        DemoOutcome::Quit => return Ok(MenuOutcome::Quit),
+                    }
+                    hovered = None;
+                    reveal_started = Instant::now();
                 }
                 MainMenuTarget::Controls => {
                     if !show_controls_screen(canvas, renderer, event_pump, audio)? {

@@ -369,7 +369,9 @@ impl Game {
     }
 
     /// Creates a play session with an explicit stream seed for tests/replays.
-    fn with_random_seed(level: &Level, random_seed: u16) -> Result<Self, GameError> {
+    pub fn with_random_seed(level: &Level, random_seed: u16) -> Result<Self, GameError> {
+        // Replays must supply the seed recorded or implied by their format so
+        // randomized Bug wakeups remain deterministic across every playback.
         let board = Board::from_level(level)?;
         let murphy_count = board
             .cells()

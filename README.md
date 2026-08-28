@@ -34,6 +34,7 @@ An unbundled build reads the following distribution tree at startup:
 
 ```text
 data/levels.dat
+data/demo{0,1,2,3,4,5,6,7,8,9}.bin
 assets/gfx/{fixed,moving,chars8,chars6,title,menu,gfx,controls,back,panel}.png
 assets/audio/music.xm
 assets/audio/{explosion,infotron,push,fall,bug,base,exit}.wav
@@ -56,6 +57,8 @@ Controls:
   `Home`/`End` select the first or last level. `N`, `Delete`, `K`, `T`, `G`,
   `D`, and `C` activate New Player, Delete Player, Skip Level, Statistics,
   GFX Tutor, Demo, and Controls respectively.
+- `F1` through `F10`: play the corresponding original demonstration; any key or
+  mouse button returns from a running demo to the menu.
 - `Enter` or `Space`: start the highlighted menu level.
 - Arrow keys: move Murphy.
 - Space + arrow: eat Base or collect an adjacent Infotron/Red Disk without
@@ -126,8 +129,9 @@ chained 3×3 explosions, Electron-to-Infotron residue, synchronized initial Bug
 cycles with randomized per-Bug cooldowns, animated player death,
 completion, restart, and progression back to the next menu selection. Persistent
 twenty-slot player profiles enforce the original completed/skipped/first-open
-level progression and three-skip limit. The current scope intentionally omits
-demo playback.
+level progression and three-skip limit. The supplied legacy demos decode their
+original run-length input at fixed-step boundaries and use the deterministic
+zero seed expected by their standalone format.
 
 ## Original data and PNG conversion
 
