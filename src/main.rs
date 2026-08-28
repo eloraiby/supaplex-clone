@@ -5,18 +5,13 @@ use std::{process::ExitCode, time::Duration};
 use sdl2::{event::Event, keyboard::Scancode};
 use supaplex_clone::{
     actor::Direction,
+    assets,
     audio::AudioPlayer,
     cli::Options,
     game::{Game, GameStatus, Input},
     level::{Level, LevelSet},
     render::{LOGICAL_HEIGHT, LOGICAL_WIDTH, Renderer},
 };
-
-/// Contains the original 111-level set in the executable.
-///
-/// Embedding the bytes makes `cargo run -- --level N` independent of the
-/// caller's current directory while still parsing the supplied DOS data.
-const ORIGINAL_LEVELS: &[u8] = include_bytes!("../data/levels.dat");
 
 /// Parses the command line, loads one record, and runs its SDL2 session.
 fn main() -> ExitCode {
@@ -30,9 +25,20 @@ fn main() -> ExitCode {
         }
     };
 
-    // Decode the chosen record before initializing platform resources. This
-    // gives corrupt data the same clear error path as bad CLI use.
-    let level = match LevelSet::new(ORIGINAL_LEVELS).load(options.level_number()) {
+    // Acquire the level collection before initializing platform resources. A
+    // default build borrows embedded bytes, while `unbundle` reports a missing
+    // external file through the same startup-error path.
+    let level_bytes = match assets::load_levels() {
+        Ok(level_bytes) => level_bytes,
+        Err(error) => {
+            eprintln!("could not load level data: {error}");
+            return ExitCode::FAILURE;
+        }
+    };
+
+    // Decode the chosen record only after acquisition succeeds so corrupt data
+    // remains distinguishable from a missing unbundled asset.
+    let level = match LevelSet::new(level_bytes.as_ref()).load(options.level_number()) {
         Ok(level) => level,
         Err(error) => {
             eprintln!("could not load level {}: {error}", options.level_number());

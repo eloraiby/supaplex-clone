@@ -14,6 +14,7 @@ use crate::{
         Actor, AnimationKind, Direction, EnemyTurn, MurphyAnimation, MurphyMoveTarget, Position,
         State,
     },
+    assets::{self, AssetError, FIXED_GRAPHICS_PATH, FONT_GRAPHICS_PATH, MOVING_GRAPHICS_PATH},
     game::{Game, GameStatus},
     murphy_animation::{SourcePoint, SpritePart, sprite_parts},
 };
@@ -47,15 +48,6 @@ const FONT_SCALE: u32 = 2;
 
 /// Number of glyphs placed horizontally in `CHARS8.DAT`.
 const FONT_GLYPHS: u8 = 64;
-
-/// Pixel-perfect conversion of the original `FIXED.DAT` tile strip.
-const FIXED_PNG: &[u8] = include_bytes!("../assets/gfx/fixed.png");
-
-/// Font converted from the original headerless `CHARS8.DAT` file.
-const CHARS8_PNG: &[u8] = include_bytes!("../assets/gfx/chars8.png");
-
-/// Pixel-perfect conversion of the original `MOVING.DAT` sprite sheet.
-const MOVING_PNG: &[u8] = include_bytes!("../assets/gfx/moving.png");
 
 /// Integer enlargement from original 16-pixel tiles to the 32-pixel board.
 const MOVING_SCALE: u32 = 2;
@@ -108,32 +100,35 @@ pub struct Renderer<'textures> {
 }
 
 impl<'textures> Renderer<'textures> {
-    /// Decodes embedded PNG assets and uploads nearest-neighbor SDL textures.
+    /// Loads production PNG assets and uploads nearest-neighbor SDL textures.
     pub fn new(
         texture_creator: &'textures TextureCreator<WindowContext>,
     ) -> Result<Self, RenderError> {
+        // Asset acquisition is completed before the first texture upload so an
+        // unbundled build reports missing files without retaining partial state.
+        let graphics = assets::load_graphics().map_err(RenderError::Asset)?;
         let fixed = load_texture(
             texture_creator,
-            FIXED_PNG,
+            graphics.fixed.as_ref(),
             640,
             16,
-            "assets/gfx/fixed.png",
+            FIXED_GRAPHICS_PATH,
             BlackPixelPolicy::Opaque,
         )?;
         let moving = load_texture(
             texture_creator,
-            MOVING_PNG,
+            graphics.moving.as_ref(),
             320,
             462,
-            "assets/gfx/moving.png",
+            MOVING_GRAPHICS_PATH,
             BlackPixelPolicy::Opaque,
         )?;
         let font = load_texture(
             texture_creator,
-            CHARS8_PNG,
+            graphics.font.as_ref(),
             512,
             8,
-            "assets/gfx/chars8.png",
+            FONT_GRAPHICS_PATH,
             BlackPixelPolicy::Transparent,
         )?;
 
@@ -880,7 +875,7 @@ fn load_texture<'textures>(
     black_pixel_policy: BlackPixelPolicy,
 ) -> Result<Texture<'textures>, RenderError> {
     // Validate the decoded geometry before applying any pixel transformation so
-    // malformed embedded resources report their dimensions without mutation.
+    // malformed production resources report their dimensions without mutation.
     let mut image = decode_png(png_bytes)?;
     if image.width != expected_width || image.height != expected_height {
         return Err(RenderError::UnexpectedDimensions {
@@ -932,7 +927,7 @@ fn apply_black_pixel_policy(pixels: &mut [u8], policy: BlackPixelPolicy) {
     }
 }
 
-/// Decodes one embedded PNG and requires a tightly packed RGBA8 output frame.
+/// Decodes one production PNG and requires a tightly packed RGBA8 output frame.
 fn decode_png(bytes: &[u8]) -> Result<DecodedPng, RenderError> {
     let mut decoder = png::Decoder::new(Cursor::new(bytes));
     decoder.set_transformations(png::Transformations::EXPAND | png::Transformations::STRIP_16);
@@ -1133,11 +1128,13 @@ fn camera_for(game: &Game) -> Option<Camera> {
 /// Errors produced while decoding assets, uploading textures, or drawing SDL.
 #[derive(Debug)]
 pub enum RenderError {
-    /// The PNG decoder rejected an embedded asset.
+    /// A required production asset could not be acquired.
+    Asset(AssetError),
+    /// The PNG decoder rejected a production asset.
     Png(png::DecodingError),
     /// Decoded dimensions did not match the asset contract.
     UnexpectedDimensions {
-        /// Human-readable embedded asset name.
+        /// Human-readable production asset name.
         asset: &'static str,
         /// Required pixel width.
         expected_width: u32,
@@ -1165,7 +1162,8 @@ impl fmt::Display for RenderError {
     /// Formats an actionable asset or SDL failure.
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            Self::Png(error) => write!(formatter, "could not decode embedded PNG: {error}"),
+            Self::Asset(error) => error.fmt(formatter),
+            Self::Png(error) => write!(formatter, "could not decode production PNG: {error}"),
             Self::UnexpectedDimensions {
                 asset,
                 expected_width,
@@ -1184,7 +1182,7 @@ impl fmt::Display for RenderError {
                 bit_depth,
             } => write!(
                 formatter,
-                "embedded PNG decoded as {color_type:?}/{bit_depth:?}; expected RGBA/8-bit"
+                "production PNG decoded as {color_type:?}/{bit_depth:?}; expected RGBA/8-bit"
             ),
             Self::Sdl(error) => write!(formatter, "SDL rendering failed: {error}"),
         }
@@ -1195,6 +1193,7 @@ impl Error for RenderError {
     /// Exposes the PNG decoder source while string-based SDL errors have none.
     fn source(&self) -> Option<&(dyn Error + 'static)> {
         match self {
+            Self::Asset(error) => Some(error),
             Self::Png(error) => Some(error),
             _ => None,
         }
@@ -1206,22 +1205,28 @@ mod tests {
     //! Pure mapping and decoding tests that do not initialize SDL video.
 
     use super::{
-        BlackPixelPolicy, CHARS8_PNG, FIXED_PNG, FIXED_TILE_COUNT, FIXED_TILE_SIZE, MOVING_PNG,
-        SourcePoint, animated_cell_sprite_part, apply_black_pixel_policy, decode_png,
-        electron_sprite_part, fixed_tile_source, gravity_sprite_part, murphy_movement_offset,
-        snik_snak_sprite_part, terminal_source_row,
+        BlackPixelPolicy, FIXED_TILE_COUNT, FIXED_TILE_SIZE, SourcePoint,
+        animated_cell_sprite_part, apply_black_pixel_policy, decode_png, electron_sprite_part,
+        fixed_tile_source, gravity_sprite_part, murphy_movement_offset, snik_snak_sprite_part,
+        terminal_source_row,
     };
-    use crate::actor::{
-        Actor, AnimationKind, Direction, EnemyTurn, Infotron, MurphyAnimation, MurphyMoveTarget,
-        MurphyPushTarget, OrangeDisk, Zonk,
+    use crate::{
+        actor::{
+            Actor, AnimationKind, Direction, EnemyTurn, Infotron, MurphyAnimation,
+            MurphyMoveTarget, MurphyPushTarget, OrangeDisk, Zonk,
+        },
+        assets,
     };
 
-    /// Confirms all embedded resources decode to their contracted RGBA sizes.
+    /// Confirms all production resources decode to their contracted RGBA sizes.
     #[test]
-    fn embedded_render_assets_are_valid_rgba_pngs() {
-        let fixed = decode_png(FIXED_PNG).expect("original fixed strip should decode");
-        let moving = decode_png(MOVING_PNG).expect("original moving sheet should decode");
-        let font = decode_png(CHARS8_PNG).expect("font should decode");
+    fn production_render_assets_are_valid_rgba_pngs() {
+        let graphics = assets::load_graphics().expect("production graphics should load");
+        let fixed =
+            decode_png(graphics.fixed.as_ref()).expect("original fixed strip should decode");
+        let moving =
+            decode_png(graphics.moving.as_ref()).expect("original moving sheet should decode");
+        let font = decode_png(graphics.font.as_ref()).expect("font should decode");
 
         assert_eq!((fixed.width, fixed.height), (640, 16));
         assert_eq!((moving.width, moving.height), (320, 462));
@@ -1272,7 +1277,9 @@ mod tests {
     /// Confirms every completed Base-eating rectangle carries opaque black background pixels.
     #[test]
     fn final_base_movement_frames_contain_opaque_erase_data() {
-        let mut moving = decode_png(MOVING_PNG).expect("MOVING.DAT conversion should decode");
+        let graphics = assets::load_graphics().expect("production graphics should load");
+        let mut moving =
+            decode_png(graphics.moving.as_ref()).expect("MOVING.DAT conversion should decode");
         apply_black_pixel_policy(&mut moving.pixels, BlackPixelPolicy::Opaque);
         let variants = [
             (Direction::Up, true),

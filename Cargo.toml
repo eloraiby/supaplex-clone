@@ -4,6 +4,10 @@ version = "0.1.0"
 edition = "2024"
 default-run = "supaplex-clone"
 
+[features]
+default = []
+unbundle = []
+
 [dependencies]
 png = "0.18.1"
 sdl2 = "0.38.0"

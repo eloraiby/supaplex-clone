@@ -15,9 +15,30 @@ Install Rust and an SDL2 development library discoverable through
 cargo run --release -- --level 1
 ```
 
-Valid numbers are `1..=111`. The executable embeds the supplied level set and
-rendering assets, so it does not depend on the process working directory after
-it is built.
+Valid numbers are `1..=111`. The default executable embeds every runtime asset,
+so it does not depend on the process working directory after it is built.
+
+### Unbundled build
+
+Enable the `unbundle` feature to keep levels, graphics, music, and effects out
+of the executable:
+
+```bash
+cargo run --release --features unbundle -- --level 1
+```
+
+An unbundled build reads the following distribution tree at startup:
+
+```text
+data/levels.dat
+assets/gfx/{fixed,moving,chars8}.png
+assets/audio/music.xm
+assets/audio/{explosion,infotron,push,fall,bug,base,exit}.wav
+```
+
+Paths are relative to the working directory by default. Set
+`SUPAPLEX_ASSET_ROOT` to the directory containing `data/` and `assets/` when
+launching the executable from elsewhere.
 
 Controls:
 
@@ -97,7 +118,7 @@ fonts use one bit per pixel, and dimensions live outside each file. The
 `dat-to-png` utility decodes those planes with `PALETTES.DAT` and then writes a
 real PNG header and compressed image stream.
 
-The committed files in `assets/` can be reproduced with:
+The committed files in `assets/gfx/` can be reproduced with:
 
 ```bash
 cargo run --bin dat-to-png -- data/fixed.dat assets/gfx/fixed.png
@@ -114,8 +135,9 @@ Sound Blaster effects. The music remains the original compact XM arrangement;
 the in-tree tracker player decodes its delta-compressed samples and sequences
 the four channels directly in SDL's callback. Effects retain the original
 one-channel priority rules, while music loops independently and pauses when the
-Exit sound is accepted. Both are embedded in the executable and require only
-SDL2, not SDL2_mixer.
+Exit sound is accepted. The default build embeds both asset groups; `unbundle`
+reads them from the same paths instead. Playback requires only SDL2, not
+SDL2_mixer.
 
 ## Verification
 

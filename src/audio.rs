@@ -1,10 +1,10 @@
 //! SDL audio-device ownership, original AdLib music, and Sound Blaster effects.
 //!
-//! The DOS `.snd` files bundled in `data/` contain executable driver code, so
-//! they cannot be queued as PCM. This module embeds WAV renders of their seven
-//! gameplay effects, converts those short clips to the opened-device format,
-//! and mixes them with an in-tree player for the original XM arrangement in
-//! SDL's real-time callback.
+//! The DOS `.snd` files supplied in `data/` contain executable driver code, so
+//! they cannot be queued as PCM. This module loads WAV renders of their seven
+//! gameplay effects from the configured asset source, converts those short
+//! clips to the opened-device format, and mixes them with an in-tree player for
+//! the original XM arrangement in SDL's real-time callback.
 
 use sdl2::{
     AudioSubsystem,
@@ -15,9 +15,9 @@ use sdl2::{
     rwops::RWops,
 };
 
-use crate::{game::SoundEffect, xm::XmPlayer};
+use crate::{assets, game::SoundEffect, xm::XmPlayer};
 
-/// Requested device frequency used by every decoded embedded clip.
+/// Requested device frequency used by every decoded production clip.
 const OUTPUT_FREQUENCY: i32 = 44_100;
 
 /// Stereo output matches the modern SDL renderer and leaves room for music.
@@ -32,20 +32,6 @@ const PRIORITY_UNIT_MILLISECONDS: usize = 20;
 /// Background level used before effects are added to the callback buffer.
 const MUSIC_VOLUME: f32 = 0.38;
 
-/// Original AdLib soundtrack preserved as its compact tracker arrangement.
-const EMBEDDED_MUSIC: &[u8] = include_bytes!("../assets/audio/music.xm");
-
-/// Sound Blaster renders of the seven effects in [`SoundEffect`] index order.
-const EMBEDDED_EFFECTS: [&[u8]; 7] = [
-    include_bytes!("../assets/audio/explosion.wav"),
-    include_bytes!("../assets/audio/infotron.wav"),
-    include_bytes!("../assets/audio/push.wav"),
-    include_bytes!("../assets/audio/fall.wav"),
-    include_bytes!("../assets/audio/bug.wav"),
-    include_bytes!("../assets/audio/base.wav"),
-    include_bytes!("../assets/audio/exit.wav"),
-];
-
 /// Owns the live SDL playback device and its callback mixer.
 pub struct AudioPlayer {
     /// SDL serializes callback access while this handle mutates mixer state.
@@ -55,12 +41,14 @@ pub struct AudioPlayer {
 impl AudioPlayer {
     /// Opens the default 44.1-kHz stereo device and starts music playback.
     pub fn new(subsystem: &AudioSubsystem) -> Result<Self, String> {
-        // Decode before opening the device so malformed embedded data produces
-        // a normal initialization error rather than panicking inside SDL's
-        // callback-construction closure.
-        let effects = EffectBank::decode(OUTPUT_FREQUENCY, OUTPUT_CHANNELS)?;
-        let music = XmPlayer::new(EMBEDDED_MUSIC, OUTPUT_FREQUENCY as u32)
-            .map_err(|error| format!("decode embedded music: {error}"))?;
+        // Load and decode before opening the device so missing or malformed
+        // production data produces a normal initialization error rather than
+        // panicking inside SDL's callback-construction closure.
+        let asset_set = assets::load_audio().map_err(|error| error.to_string())?;
+        let effect_bytes = std::array::from_fn(|index| asset_set.effects[index].as_ref());
+        let effects = EffectBank::decode(effect_bytes, OUTPUT_FREQUENCY, OUTPUT_CHANNELS)?;
+        let music = XmPlayer::new(asset_set.music.as_ref(), OUTPUT_FREQUENCY as u32)
+            .map_err(|error| format!("decode production music: {error}"))?;
         let desired = AudioSpecDesired {
             freq: Some(OUTPUT_FREQUENCY),
             channels: Some(OUTPUT_CHANNELS),
@@ -126,21 +114,21 @@ struct EffectBank {
 }
 
 impl EffectBank {
-    /// Decodes every embedded WAV into one uniform callback format.
-    fn decode(frequency: i32, channels: u8) -> Result<Self, String> {
+    /// Decodes every production WAV into one uniform callback format.
+    fn decode(encoded_effects: [&[u8]; 7], frequency: i32, channels: u8) -> Result<Self, String> {
         // Preserve enum order explicitly so adding an effect cannot silently
         // associate one trigger with a different clip.
-        let mut clips = Vec::with_capacity(EMBEDDED_EFFECTS.len());
-        for (index, encoded) in EMBEDDED_EFFECTS.into_iter().enumerate() {
+        let mut clips = Vec::with_capacity(encoded_effects.len());
+        for (index, encoded) in encoded_effects.into_iter().enumerate() {
             clips.push(
                 decode_wav(encoded, frequency, channels)
-                    .map_err(|error| format!("decode embedded effect {index}: {error}"))?
+                    .map_err(|error| format!("decode production effect {index}: {error}"))?
                     .into_boxed_slice(),
             );
         }
         let clips = clips
             .try_into()
-            .map_err(|_| "embedded effect count does not match SoundEffect".to_owned())?;
+            .map_err(|_| "production effect count does not match SoundEffect".to_owned())?;
         Ok(Self { clips })
     }
 
@@ -302,7 +290,7 @@ impl AudioCallback for Mixer {
 }
 
 impl SoundEffect {
-    /// Maps semantic variants to the stable embedded-asset array order.
+    /// Maps semantic variants to the stable production-asset array order.
     const fn index(self) -> usize {
         match self {
             Self::Explosion => 0,
@@ -393,12 +381,8 @@ fn decode_wav(encoded: &[u8], frequency: i32, channels: u8) -> Result<Vec<f32>, 
 mod tests {
     //! Decoder and mixer checks that do not open a host audio device.
 
-    use super::{
-        AudioCallback, AudioSpec, EMBEDDED_MUSIC, EffectBank, Mixer, OUTPUT_CHANNELS,
-        OUTPUT_FREQUENCY,
-    };
-    use crate::game::SoundEffect;
-    use crate::xm::XmPlayer;
+    use super::{AudioCallback, AudioSpec, EffectBank, Mixer, OUTPUT_CHANNELS, OUTPUT_FREQUENCY};
+    use crate::{assets, game::SoundEffect, xm::XmPlayer};
 
     /// Builds a mixer with decoded production assets and a production layout.
     fn decoded_mixer() -> Mixer {
@@ -412,16 +396,18 @@ mod tests {
             samples: 512,
             size: 4_096,
         };
-        let effects = EffectBank::decode(spec.freq, spec.channels)
-            .expect("embedded Sound Blaster effects should decode");
-        let music = XmPlayer::new(EMBEDDED_MUSIC, OUTPUT_FREQUENCY as u32)
-            .expect("embedded AdLib music should decode");
+        let asset_set = assets::load_audio().expect("production audio should load");
+        let effect_bytes = std::array::from_fn(|index| asset_set.effects[index].as_ref());
+        let effects = EffectBank::decode(effect_bytes, spec.freq, spec.channels)
+            .expect("production Sound Blaster effects should decode");
+        let music = XmPlayer::new(asset_set.music.as_ref(), OUTPUT_FREQUENCY as u32)
+            .expect("production AdLib music should decode");
         Mixer::new(spec, effects, music)
     }
 
     /// Confirms each production WAV becomes non-empty interleaved stereo data.
     #[test]
-    fn embedded_effects_decode_for_the_callback_layout() {
+    fn production_effects_decode_for_the_callback_layout() {
         let mixer = decoded_mixer();
 
         // Every clip must contain whole stereo frames and audible non-zero PCM.
