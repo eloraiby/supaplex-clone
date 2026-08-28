@@ -16,7 +16,7 @@ use supaplex_clone::{
     actor::Direction,
     assets,
     audio::AudioPlayer,
-    cli::{FIRST_STEP_RATE, LAST_STEP_RATE, MusicPlayer, Options},
+    cli::{FIRST_STEP_RATE, LAST_STEP_RATE, Options},
     demo::Demo,
     frontend::{
         ControlsTarget, MainMenuTarget, MenuSelection, ORIGINAL_FADE_DURATION, controls_target_at,
@@ -194,7 +194,6 @@ fn main() -> ExitCode {
         level_bytes.as_ref(),
         options.level_number(),
         options.steps_per_second(),
-        options.music_player(),
     ) {
         Ok(()) => ExitCode::SUCCESS,
         Err(error) => {
@@ -204,13 +203,8 @@ fn main() -> ExitCode {
     }
 }
 
-/// Initializes SDL2, the selected music backend, and one fixed-rate play loop.
-fn run(
-    level_bytes: &[u8],
-    initial_level: usize,
-    steps_per_second: u32,
-    music_player: MusicPlayer,
-) -> Result<(), String> {
+/// Initializes SDL2 and owns the front end plus one fixed-rate play loop.
+fn run(level_bytes: &[u8], initial_level: usize, steps_per_second: u32) -> Result<(), String> {
     // Nearest-neighbor scaling preserves the hard pixel edges of the original
     // 16×16 artwork after its 2× atlas repack and logical-window scaling.
     sdl2::hint::set("SDL_RENDER_SCALE_QUALITY", "0");
@@ -243,7 +237,7 @@ fn run(
     let mut audio = match sdl
         .audio()
         .map_err(|error| format!("initialize SDL2 audio: {error}"))
-        .and_then(|subsystem| AudioPlayer::new(&subsystem, music_player))
+        .and_then(|subsystem| AudioPlayer::new(&subsystem))
     {
         Ok(audio) => Some(audio),
         Err(error) => {

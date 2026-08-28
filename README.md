@@ -20,9 +20,6 @@ row; omitting it starts at level 1. The default executable embeds every runtime
 asset, so it does not depend on the process working directory after it is built.
 The optional `--step <5-60>` argument selects fixed simulation updates per second;
 omitting it preserves the original rate of 35 updates per second.
-The optional `--player <opl|xm>` argument selects the soundtrack backend. `opl`
-is the default and synthesizes the original DOS driver's YM3812 register stream;
-`xm` selects the sampled FastTracker conversion for comparison.
 
 ### Unbundled build
 
@@ -39,7 +36,7 @@ An unbundled build reads the following distribution tree at startup:
 assets/data/levels.dat
 assets/data/demo{0,1,2,3,4,5,6,7,8,9}.bin
 assets/gfx/{fixed,moving,chars8,chars6,title,menu,gfx,controls,back,panel}.png
-assets/audio/{music.opl,music.xm}
+assets/audio/ADLIB.SND
 assets/audio/{explosion,infotron,push,fall,bug,base,exit}.wav
 ```
 
@@ -147,23 +144,21 @@ distribution root:
 
 - `assets/data/` contains the original level collection and demonstration inputs.
 - `assets/gfx/` contains playback-ready RGBA PNG sheets and screens.
-- `assets/audio/` contains the original OPL register stream, the optional XM
-  conversion, and playback-ready WAV effects.
+- `assets/audio/` contains the original `ADLIB.SND` driver/score and
+  playback-ready WAV effects.
 
 The one-time DOS graphics and sound conversion inputs are intentionally not
 shipped with the runtime tree. Gameplay still addresses the original fixed-tile
 layout and variably sized moving descriptors within the converted PNG sheets.
-The default player sends a deterministic capture of the exact 5,354-byte
-`ADLIB.SND` driver's register writes to a native Rust YM3812 emulator at the
-original 50 Hz timer rate. The stream records the source file's SHA-256 identity
-and one complete 15,621-tick composition traversal; it is 76,786 bytes because
-it stores chip commands rather than rendered PCM samples. The alternative
-in-tree tracker player decodes the XM module's delta-compressed samples and
-sequences its four channels directly in SDL's callback. Effects retain the
-original one-channel priority rules, while music loops independently and pauses
-when the Exit sound is accepted. The default build embeds the complete asset
-tree; `unbundle` reads the same files from disk. Playback requires only SDL2,
-not SDL2_mixer.
+The player reads the exact original 5,354-byte `ADLIB.SND` at runtime. A safe
+Rust port of its DOS music routines interprets the file's compact pattern
+bytecode, instrument definitions, frequency tables, tempo changes, transposes,
+and pattern loops at the original 50 Hz interrupt rate, sending each resulting
+register operation directly to a native Rust YM3812 emulator. Effects retain
+the original one-channel priority rules, while music loops independently and
+pauses when the Exit sound is accepted. The default build embeds the complete
+asset tree; `unbundle` reads the same files from disk. Playback requires only
+SDL2, not SDL2_mixer.
 
 ## Verification
 
@@ -177,8 +172,8 @@ Tests cover the CLI range, complete record layout and metadata, row-major board
 indexing, every supplied level, actor movement and collection, gravity
 overrides, falling-object collision matrices, Red Disk planting, ordered and
 chained explosions, Bug timing/RNG, exit gating, PNG asset validation, audio
-event timing, effect priorities, WAV decoding, OPL stream validation and
-synthesis, XM parsing and playback, and fixed-strip bounds.
+event timing, effect priorities, WAV decoding, direct `ADLIB.SND` validation,
+sequencing and synthesis, and fixed-strip bounds.
 
 Format and mapping references:
 

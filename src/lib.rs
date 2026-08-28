@@ -15,4 +15,3 @@ mod murphy_animation;
 mod opl;
 pub mod profiles;
 pub mod render;
-mod xm;
