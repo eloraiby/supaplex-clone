@@ -16,7 +16,7 @@ use crate::{
     },
     assets::{
         self, AssetError, FIXED_GRAPHICS_PATH, FONT_GRAPHICS_PATH, MOVING_GRAPHICS_PATH,
-        PANEL_GRAPHICS_PATH,
+        PANEL_GRAPHICS_PATH, TITLE_GRAPHICS_PATH,
     },
     game::{Game, GameStatus},
     murphy_animation::{SourcePoint, SpritePart, sprite_parts},
@@ -100,6 +100,8 @@ pub struct Renderer<'textures> {
     font: Texture<'textures>,
     /// Original 320×24 in-game panel, enlarged to the full logical width.
     panel: Texture<'textures>,
+    /// Original 320×200 title artwork decoded with its dedicated palette.
+    title: Texture<'textures>,
     /// Most recent camera centered on a live Murphy.
     ///
     /// A death transition replaces Murphy with an Explosion immediately. The
@@ -147,14 +149,58 @@ impl<'textures> Renderer<'textures> {
             PANEL_GRAPHICS_PATH,
             BlackPixelPolicy::Opaque,
         )?;
+        let title = load_texture(
+            texture_creator,
+            graphics.title.as_ref(),
+            320,
+            200,
+            TITLE_GRAPHICS_PATH,
+            BlackPixelPolicy::Opaque,
+        )?;
 
         Ok(Self {
             fixed,
             moving,
             font,
             panel,
+            title,
             camera: Camera::default(),
         })
+    }
+
+    /// Draws the original title at exact three-times scale with black letterboxing.
+    pub fn draw_splash(&mut self, canvas: &mut Canvas<Window>) -> Result<(), RenderError> {
+        // A 320×200 image enlarged by three occupies 960×600. Centering those
+        // pixels preserves its aspect ratio inside the taller gameplay window.
+        canvas.set_draw_color(Color::RGB(0, 0, 0));
+        canvas.clear();
+        let destination_height = 200 * ORIGINAL_SCREEN_SCALE;
+        let destination_y = (LOGICAL_HEIGHT - destination_height) / 2;
+        canvas
+            .copy(
+                &self.title,
+                None,
+                Rect::new(0, destination_y as i32, LOGICAL_WIDTH, destination_height),
+            )
+            .map_err(RenderError::Sdl)
+    }
+
+    /// Covers the current logical frame with a blendable black fade layer.
+    pub fn draw_black_overlay(
+        &mut self,
+        canvas: &mut Canvas<Window>,
+        opacity: u8,
+    ) -> Result<(), RenderError> {
+        // SDL's canvas blend mode applies the alpha component to primitive fills.
+        // Zero is skipped to avoid needless backend work on fully visible frames.
+        if opacity == 0 {
+            return Ok(());
+        }
+        canvas.set_blend_mode(BlendMode::Blend);
+        canvas.set_draw_color(Color::RGBA(0, 0, 0, opacity));
+        canvas
+            .fill_rect(Rect::new(0, 0, LOGICAL_WIDTH, LOGICAL_HEIGHT))
+            .map_err(RenderError::Sdl)
     }
 
     /// Draws the scrolling board, HUD, and completion/death overlay.
@@ -206,7 +252,6 @@ impl<'textures> Renderer<'textures> {
 
         self.draw_hud(canvas, game, level_number, steps_per_second)?;
         self.draw_status_overlay(canvas, game.status())?;
-        canvas.present();
         Ok(())
     }
 

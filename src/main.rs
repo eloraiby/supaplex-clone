@@ -1,6 +1,9 @@
 //! SDL2 entry point for selecting and playing one original Supaplex level.
 
-use std::{process::ExitCode, time::Duration};
+use std::{
+    process::ExitCode,
+    time::{Duration, Instant},
+};
 
 use sdl2::{event::Event, keyboard::Scancode};
 use supaplex_clone::{
@@ -8,10 +11,14 @@ use supaplex_clone::{
     assets,
     audio::AudioPlayer,
     cli::{FIRST_STEP_RATE, LAST_STEP_RATE, Options},
+    frontend::splash_frame,
     game::{Game, GameStatus, Input},
     level::{Level, LevelSet},
     render::{LOGICAL_HEIGHT, LOGICAL_WIDTH, Renderer},
 };
+
+/// Maximum display rate used when vsync is unavailable or ignored.
+const RENDER_INTERVAL: Duration = Duration::from_nanos(1_000_000_000 / 60);
 
 /// Parses the command line, loads one record, and runs its SDL2 session.
 fn main() -> ExitCode {
@@ -86,6 +93,11 @@ fn run(level: &Level, level_number: usize, steps_per_second: u32) -> Result<(), 
     let mut event_pump = sdl
         .event_pump()
         .map_err(|error| format!("create SDL2 event pump: {error}"))?;
+    if !show_splash(&mut canvas, &mut renderer, &mut event_pump)? {
+        // Closing the window during startup is an ordinary successful exit,
+        // exactly like closing it from gameplay rather than a loading failure.
+        return Ok(());
+    }
     let mut game = Game::new(level).map_err(|error| error.to_string())?;
     let mut audio = match sdl
         .audio()
@@ -109,7 +121,6 @@ fn run(level: &Level, level_number: usize, steps_per_second: u32) -> Result<(), 
     // Vsync is only a request and is ignored by some SDL render backends. An
     // independent deadline prevents those backends from rendering hundreds of
     // redundant frames per second and consuming an entire CPU core.
-    const RENDER_INTERVAL: Duration = Duration::from_nanos(1_000_000_000 / 60);
     let mut previous = std::time::Instant::now();
     let mut accumulator = Duration::ZERO;
     let mut window_title = String::new();
@@ -225,6 +236,7 @@ fn run(level: &Level, level_number: usize, steps_per_second: u32) -> Result<(), 
         renderer
             .draw(&mut canvas, &game, level_number, steps_per_second)
             .map_err(|error| error.to_string())?;
+        canvas.present();
 
         // Hardware vsync normally consumes most or all of this interval. The
         // explicit remainder is still required for software, dummy, remote,
@@ -235,6 +247,45 @@ fn run(level: &Level, level_number: usize, steps_per_second: u32) -> Result<(), 
     }
 
     Ok(())
+}
+
+/// Displays the timed original title sequence and reports whether startup continues.
+fn show_splash(
+    canvas: &mut sdl2::render::Canvas<sdl2::video::Window>,
+    renderer: &mut Renderer<'_>,
+    event_pump: &mut sdl2::EventPump,
+) -> Result<bool, String> {
+    // The original title fades at a 70 Hz-derived cadence, but rendering is
+    // sampled independently so 60 Hz and high-refresh displays see equal timing.
+    let started = Instant::now();
+    loop {
+        let frame_started = Instant::now();
+        for event in event_pump.poll_iter() {
+            match event {
+                Event::Quit { .. } => return Ok(false),
+                Event::KeyDown { repeat: false, .. } => return Ok(true),
+                _ => {}
+            }
+        }
+
+        let frame = splash_frame(started.elapsed());
+        renderer
+            .draw_splash(canvas)
+            .map_err(|error| error.to_string())?;
+        renderer
+            .draw_black_overlay(canvas, frame.black_opacity)
+            .map_err(|error| error.to_string())?;
+        canvas.present();
+        if frame.finished {
+            return Ok(true);
+        }
+
+        // Keep the startup loop responsive without busy-spinning when a render
+        // backend accepts the vsync request but does not actually block on it.
+        if let Some(remaining) = RENDER_INTERVAL.checked_sub(frame_started.elapsed()) {
+            std::thread::sleep(remaining);
+        }
+    }
 }
 
 /// Converts a validated updates-per-second rate to one fixed-step duration.
