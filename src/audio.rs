@@ -4,12 +4,9 @@
 //! asset source, converts those short clips to the opened-device format, and
 //! mixes them with native OPL2 synthesis in SDL's real-time callback.
 
-use std::{
-    sync::{
-        Arc, Mutex,
-        atomic::{AtomicBool, Ordering},
-    },
-    time::Duration,
+use std::sync::{
+    Arc,
+    atomic::{AtomicBool, AtomicU8, Ordering},
 };
 
 use sdl2::{
@@ -38,20 +35,23 @@ const PRIORITY_UNIT_MILLISECONDS: usize = 20;
 /// Background level used before effects are added to the callback buffer.
 const MUSIC_VOLUME: f32 = 0.38;
 
-/// Bounded grace period in which the callback observes a shutdown request.
+/// Number of ordered operations retained between the game and audio callback.
 ///
-/// Two 512-frame buffers at 44.1 kHz take less than 24 milliseconds. Waiting
-/// 25 milliseconds therefore lets an in-flight mix finish and the following
-/// callback return silence before SDL synchronously pauses the device.
-const SHUTDOWN_QUIESCE_TIME: Duration = Duration::from_millis(25);
+/// The game can produce several effects during one catch-up frame. Two hundred
+/// fifty-six atomic slots absorb that burst without allocation while keeping
+/// main-thread submission strictly non-blocking if a backend stops consuming.
+const COMMAND_QUEUE_CAPACITY: usize = 256;
+
+/// Atomic slot value that means no command is ready for the callback.
+const EMPTY_COMMAND_SLOT: u8 = 0;
 
 /// Owns the live SDL playback device and its callback mixer.
 pub struct AudioPlayer {
     /// Live SDL callback device, mutated only during final shutdown.
     device: AudioDevice<Mixer>,
-    /// Short commands transferred without taking SDL's device-wide audio lock.
-    pending_commands: Arc<Mutex<Vec<AudioCommand>>>,
-    /// Lock-free request that makes subsequent callbacks return immediate silence.
+    /// Non-waiting producer for ordered callback operations.
+    command_sender: AudioCommandSender,
+    /// Atomic request that makes subsequent callbacks return immediate silence.
     stop_requested: Arc<AtomicBool>,
     /// Main-thread copy of the user's persistent music preference.
     music_enabled: bool,
@@ -70,8 +70,7 @@ impl AudioPlayer {
         let effects = EffectBank::decode(effect_bytes, OUTPUT_FREQUENCY, OUTPUT_CHANNELS)?;
         let music = OplPlayer::new(asset_set.music.as_ref(), OUTPUT_FREQUENCY as u32)
             .map_err(|error| format!("decode production OPL music: {error}"))?;
-        let pending_commands = Arc::new(Mutex::new(Vec::with_capacity(16)));
-        let mixer_commands = Arc::clone(&pending_commands);
+        let (command_sender, command_receiver) = audio_command_channel();
         let stop_requested = Arc::new(AtomicBool::new(false));
         let mixer_stop_requested = Arc::clone(&stop_requested);
         let desired = AudioSpecDesired {
@@ -81,7 +80,7 @@ impl AudioPlayer {
         };
         let device = subsystem
             .open_playback(None, &desired, move |spec| {
-                Mixer::new(spec, effects, music, mixer_commands, mixer_stop_requested)
+                Mixer::new(spec, effects, music, command_receiver, mixer_stop_requested)
             })
             .map_err(|error| format!("open playback device: {error}"))?;
 
@@ -90,7 +89,7 @@ impl AudioPlayer {
         device.resume();
         Ok(Self {
             device,
-            pending_commands,
+            command_sender,
             stop_requested,
             music_enabled: true,
             effects_enabled: true,
@@ -167,30 +166,23 @@ impl AudioPlayer {
         self.queue_command(AudioCommand::RestartLevel);
     }
 
-    /// Stops the callback thread and closes its SDL device in a defined order.
+    /// Requests immediate callback silence and lets SDL close the device once.
     pub fn shutdown(self) {
-        // Do not take SDL's callback lock while exiting: a backend that has
-        // stopped servicing audio could otherwise hold the main thread forever.
-        // The atomic is visible even when no callback command can be drained.
+        // The callback checks this atomic before touching commands or synthesis.
+        // Dropping the device invokes SDL's single close operation, which waits
+        // only for a finite callback already in progress. An explicit pause and
+        // guessed sleep are deliberately absent: pause adds a second synchronous
+        // backend transition and caused the restart-then-Escape deadlock.
         self.stop_requested.store(true, Ordering::Release);
-        std::thread::sleep(SHUTDOWN_QUIESCE_TIME);
-
-        // The callback is now either idle or producing immediate silence.
-        // Pausing preserves the explicit close order required by SDL backends;
-        // normal field drop then closes an already-quiescent device.
-        self.device.pause();
+        drop(self.device);
     }
 
-    /// Appends one main-thread request for the beginning of the next callback.
-    fn queue_command(&self, command: AudioCommand) {
-        // This mutex protects only a tiny command vector; the callback releases
-        // it before OPL rendering, so game input never waits for synthesis or
-        // for SDL's potentially backend-dependent device lock.
-        let mut pending = self
-            .pending_commands
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        pending.push(command);
+    /// Offers one operation without ever waiting for the audio callback.
+    fn queue_command(&mut self, command: AudioCommand) {
+        // A stopped or severely delayed backend may fill the bounded channel.
+        // Dropping that excess request keeps input and shutdown responsive; the
+        // ordinary restart/Explosion pair occupies only two of 256 slots.
+        let _accepted = self.command_sender.send(command);
     }
 }
 
@@ -214,6 +206,176 @@ enum AudioCommand {
     },
     /// Clear terminal audio state before a new level or menu session.
     RestartLevel,
+}
+
+impl AudioCommand {
+    /// Packs one command into the non-zero byte stored by an atomic queue slot.
+    const fn encode(self) -> u8 {
+        // Stable explicit values avoid depending on either enum's Rust layout.
+        // Effects occupy one contiguous range and controls follow afterward.
+        match self {
+            Self::PlayEffect {
+                effect: SoundEffect::Explosion,
+            } => 1,
+            Self::PlayEffect {
+                effect: SoundEffect::Infotron,
+            } => 2,
+            Self::PlayEffect {
+                effect: SoundEffect::Push,
+            } => 3,
+            Self::PlayEffect {
+                effect: SoundEffect::Fall,
+            } => 4,
+            Self::PlayEffect {
+                effect: SoundEffect::Bug,
+            } => 5,
+            Self::PlayEffect {
+                effect: SoundEffect::Base,
+            } => 6,
+            Self::PlayEffect {
+                effect: SoundEffect::Exit,
+            } => 7,
+            Self::SetEffectsEnabled { enabled: false } => 8,
+            Self::SetEffectsEnabled { enabled: true } => 9,
+            Self::SetMusicEnabled { enabled: false } => 10,
+            Self::SetMusicEnabled { enabled: true } => 11,
+            Self::RestartLevel => 12,
+        }
+    }
+
+    /// Restores one command published by the single producer.
+    fn decode(code: u8) -> Option<Self> {
+        // Zero is reserved for an empty queue slot. Any other unrecognized code
+        // would indicate an internal producer defect rather than external data.
+        match code {
+            1 => Some(Self::PlayEffect {
+                effect: SoundEffect::Explosion,
+            }),
+            2 => Some(Self::PlayEffect {
+                effect: SoundEffect::Infotron,
+            }),
+            3 => Some(Self::PlayEffect {
+                effect: SoundEffect::Push,
+            }),
+            4 => Some(Self::PlayEffect {
+                effect: SoundEffect::Fall,
+            }),
+            5 => Some(Self::PlayEffect {
+                effect: SoundEffect::Bug,
+            }),
+            6 => Some(Self::PlayEffect {
+                effect: SoundEffect::Base,
+            }),
+            7 => Some(Self::PlayEffect {
+                effect: SoundEffect::Exit,
+            }),
+            8 => Some(Self::SetEffectsEnabled { enabled: false }),
+            9 => Some(Self::SetEffectsEnabled { enabled: true }),
+            10 => Some(Self::SetMusicEnabled { enabled: false }),
+            11 => Some(Self::SetMusicEnabled { enabled: true }),
+            12 => Some(Self::RestartLevel),
+            _ => None,
+        }
+    }
+}
+
+/// Shared atomic storage for the one-producer, one-consumer command channel.
+struct AudioCommandSlots {
+    /// Ring entries where zero is empty and non-zero is an encoded command.
+    slots: [AtomicU8; COMMAND_QUEUE_CAPACITY],
+}
+
+impl AudioCommandSlots {
+    /// Creates a completely empty ring before either endpoint becomes visible.
+    fn new() -> Self {
+        // Every atomic is initialized independently because `AtomicU8` is not
+        // `Copy`; construction occurs before the SDL callback can run.
+        Self {
+            slots: std::array::from_fn(|_| AtomicU8::new(EMPTY_COMMAND_SLOT)),
+        }
+    }
+}
+
+/// Main-thread endpoint of the non-waiting audio command channel.
+struct AudioCommandSender {
+    /// Atomic ring shared with exactly one callback-side receiver.
+    storage: Arc<AudioCommandSlots>,
+    /// Next ring position considered by the single main-thread producer.
+    next_slot: usize,
+}
+
+impl AudioCommandSender {
+    /// Publishes one command or reports a full ring without blocking.
+    fn send(&mut self, command: AudioCommand) -> bool {
+        let slot = &self.storage.slots[self.next_slot];
+
+        // One Acquire load determines availability without a retry or a
+        // read-modify-write instruction. Because there is exactly one producer,
+        // no other thread can claim the empty slot before the following store.
+        if slot.load(Ordering::Acquire) != EMPTY_COMMAND_SLOT {
+            return false;
+        }
+        // Release publication makes the encoded byte visible before the
+        // callback's corresponding Acquire load.
+        slot.store(command.encode(), Ordering::Release);
+        self.next_slot = next_command_slot(self.next_slot);
+        true
+    }
+}
+
+/// Audio-callback endpoint of the non-waiting audio command channel.
+struct AudioCommandReceiver {
+    /// Atomic ring shared with exactly one main-thread sender.
+    storage: Arc<AudioCommandSlots>,
+    /// Next ring position consumed in strict publication order.
+    next_slot: usize,
+}
+
+impl AudioCommandReceiver {
+    /// Takes one ready command or returns immediately when the ring is empty.
+    fn receive(&mut self) -> Option<AudioCommand> {
+        let slot = &self.storage.slots[self.next_slot];
+        let code = slot.load(Ordering::Acquire);
+        if code == EMPTY_COMMAND_SLOT {
+            return None;
+        }
+        let command = AudioCommand::decode(code)
+            .expect("the private audio producer publishes only valid command codes");
+
+        // Release clearing lets the producer safely reuse this position only
+        // after the command has been copied into callback-owned stack state.
+        slot.store(EMPTY_COMMAND_SLOT, Ordering::Release);
+        self.next_slot = next_command_slot(self.next_slot);
+        Some(command)
+    }
+}
+
+/// Creates the unique producer and consumer endpoints for one audio device.
+fn audio_command_channel() -> (AudioCommandSender, AudioCommandReceiver) {
+    // Both cursors begin at zero and advance only in their owning threads. The
+    // atomic slot values provide publication; no cursor itself is shared.
+    let storage = Arc::new(AudioCommandSlots::new());
+    (
+        AudioCommandSender {
+            storage: Arc::clone(&storage),
+            next_slot: 0,
+        },
+        AudioCommandReceiver {
+            storage,
+            next_slot: 0,
+        },
+    )
+}
+
+/// Advances a ring cursor without allowing it to leave the fixed slot array.
+const fn next_command_slot(current: usize) -> usize {
+    // A branch avoids modulo division in both the event loop and real-time
+    // callback while preserving exact wrap at the final array element.
+    if current + 1 == COMMAND_QUEUE_CAPACITY {
+        0
+    } else {
+        current + 1
+    }
 }
 
 /// Device-format sample arrays indexed by [`SoundEffect::index`].
@@ -290,9 +452,9 @@ struct Mixer {
     priority_frames_remaining: usize,
     /// User-controlled effect switch toggled by the S key.
     effects_enabled: bool,
-    /// Ordered main-thread operations waiting for a callback boundary.
-    pending_commands: Arc<Mutex<Vec<AudioCommand>>>,
-    /// Lock-free terminal request checked before any synthesis work.
+    /// Non-waiting endpoint receiving ordered main-thread operations.
+    command_receiver: AudioCommandReceiver,
+    /// Atomic terminal request checked before any synthesis work.
     stop_requested: Arc<AtomicBool>,
 }
 
@@ -302,7 +464,7 @@ impl Mixer {
         spec: AudioSpec,
         effects: EffectBank,
         music: OplPlayer,
-        pending_commands: Arc<Mutex<Vec<AudioCommand>>>,
+        command_receiver: AudioCommandReceiver,
         stop_requested: Arc<AtomicBool>,
     ) -> Self {
         // The audio device owns this value for its full lifetime; no callback
@@ -317,22 +479,20 @@ impl Mixer {
             current_priority: 0,
             priority_frames_remaining: 0,
             effects_enabled: true,
-            pending_commands,
+            command_receiver,
             stop_requested,
         }
     }
 
     /// Applies every main-thread operation queued since the previous callback.
     fn apply_pending_commands(&mut self) {
-        // Clone the lightweight Arc so the guard borrows a local owner instead
-        // of borrowing `self`; command application can then mutate mixer state.
-        // The guard remains held only across small scalar/cursor operations and
-        // is released before the OPL player synthesizes a single frame.
-        let queue = Arc::clone(&self.pending_commands);
-        let mut pending = queue
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        for command in pending.drain(..) {
+        // `receive` performs one Acquire load and never waits. The fixed loop
+        // limit prevents a producer that is continually publishing operations
+        // from keeping the real-time callback here indefinitely.
+        for _ in 0..COMMAND_QUEUE_CAPACITY {
+            let Some(command) = self.command_receiver.receive() else {
+                break;
+            };
             match command {
                 AudioCommand::PlayEffect { effect } => {
                     self.play_effect(effect);
@@ -552,18 +712,18 @@ mod tests {
     //! Decoder and mixer checks that do not open a host audio device.
 
     use std::sync::{
-        Arc, Mutex,
+        Arc,
         atomic::{AtomicBool, Ordering},
     };
 
     use super::{
-        AudioCallback, AudioCommand, AudioSpec, EffectBank, Mixer, OUTPUT_CHANNELS,
-        OUTPUT_FREQUENCY,
+        AudioCallback, AudioCommand, AudioCommandSender, AudioSpec, COMMAND_QUEUE_CAPACITY,
+        EffectBank, Mixer, OUTPUT_CHANNELS, OUTPUT_FREQUENCY, audio_command_channel,
     };
     use crate::{assets, game::SoundEffect, opl::OplPlayer};
 
     /// Builds a mixer with decoded production assets and a production layout.
-    fn decoded_mixer() -> Mixer {
+    fn decoded_mixer() -> (Mixer, AudioCommandSender) {
         // AudioSpec fields are public precisely so callback code can retain the
         // obtained layout; the tests construct the desired layout directly.
         let spec = AudioSpec {
@@ -575,27 +735,38 @@ mod tests {
             size: 4_096,
         };
         let asset_set = assets::load_audio().expect("production audio should load");
-        let effect_bytes = std::array::from_fn(|index| asset_set.effects[index].as_ref());
-        let effects = EffectBank::decode(effect_bytes, spec.freq, spec.channels)
-            .expect("production Sound Blaster effects should decode");
+        let effects = EffectBank {
+            clips: std::array::from_fn(|index| {
+                // Distinct non-zero samples make effect selection observable
+                // without invoking SDL's process-global converter in parallel.
+                vec![(index + 1) as f32 / 16.0; 4_096].into_boxed_slice()
+            }),
+        };
         let music = OplPlayer::new(asset_set.music.as_ref(), OUTPUT_FREQUENCY as u32)
             .expect("production OPL music should decode");
-        Mixer::new(
-            spec,
-            effects,
-            music,
-            Arc::new(Mutex::new(Vec::new())),
-            Arc::new(AtomicBool::new(false)),
+        let (command_sender, command_receiver) = audio_command_channel();
+        (
+            Mixer::new(
+                spec,
+                effects,
+                music,
+                command_receiver,
+                Arc::new(AtomicBool::new(false)),
+            ),
+            command_sender,
         )
     }
 
     /// Confirms each production WAV becomes non-empty interleaved stereo data.
     #[test]
     fn production_effects_decode_for_the_callback_layout() {
-        let mixer = decoded_mixer();
+        let asset_set = assets::load_audio().expect("production audio should load");
+        let effect_bytes = std::array::from_fn(|index| asset_set.effects[index].as_ref());
+        let effects = EffectBank::decode(effect_bytes, OUTPUT_FREQUENCY, OUTPUT_CHANNELS)
+            .expect("production Sound Blaster effects should decode");
 
         // Every clip must contain whole stereo frames and audible non-zero PCM.
-        for clip in &mixer.effects.clips {
+        for clip in &effects.clips {
             assert!(!clip.is_empty());
             assert!(clip.len().is_multiple_of(usize::from(OUTPUT_CHANNELS)));
             assert!(clip.iter().any(|sample| *sample != 0.0));
@@ -605,7 +776,7 @@ mod tests {
     /// Confirms requests obey the original global priority comparisons.
     #[test]
     fn effect_priority_rejects_and_interrupts_the_original_pairs() {
-        let mut mixer = decoded_mixer();
+        let (mut mixer, _) = decoded_mixer();
 
         assert!(mixer.play_effect(SoundEffect::Base));
         assert!(!mixer.play_effect(SoundEffect::Base));
@@ -621,7 +792,7 @@ mod tests {
     /// Confirms the callback emits samples and disabling clears current state.
     #[test]
     fn callback_mixes_one_effect_and_muting_discards_it() {
-        let mut mixer = decoded_mixer();
+        let (mut mixer, _) = decoded_mixer();
         assert!(mixer.play_effect(SoundEffect::Base));
         let mut output = [0.0; 128];
 
@@ -637,40 +808,73 @@ mod tests {
         assert!(!mixer.play_effect(SoundEffect::Bug));
     }
 
-    /// Confirms main-thread commands take effect without SDL's callback lock.
+    /// Confirms main-thread commands take effect at the next callback boundary.
     #[test]
     fn callback_applies_shared_commands_before_mixing() {
-        let mut mixer = decoded_mixer();
-        let queue = Arc::clone(&mixer.pending_commands);
+        let (mut mixer, mut sender) = decoded_mixer();
         let mut output = [0.0; 128];
 
         // Queue an effect exactly as the Escape explosion path does. The main
-        // thread releases the small command mutex before the callback begins.
-        queue
-            .lock()
-            .expect("test command queue should not be poisoned")
-            .push(AudioCommand::PlayEffect {
-                effect: SoundEffect::Explosion,
-            });
+        // thread only publishes one atomic byte before the callback begins.
+        assert!(sender.send(AudioCommand::PlayEffect {
+            effect: SoundEffect::Explosion,
+        }));
         mixer.music_enabled = false;
         mixer.music_playing = false;
         mixer.callback(&mut output);
         assert!(mixer.effect_voice.is_some());
         assert!(output.iter().any(|sample| *sample != 0.0));
 
-        queue
-            .lock()
-            .expect("test command queue should not be poisoned")
-            .push(AudioCommand::SetEffectsEnabled { enabled: false });
+        assert!(sender.send(AudioCommand::SetEffectsEnabled { enabled: false }));
         mixer.callback(&mut output);
         assert!(!mixer.effects_enabled);
         assert!(mixer.effect_voice.is_none());
     }
 
+    /// Reproduces restart followed by Escape without losing the explosion.
+    #[test]
+    fn restart_then_escape_resets_priority_and_plays_the_explosion() {
+        let (mut mixer, mut sender) = decoded_mixer();
+        let mut output = [0.0; 1_024];
+
+        // Begin in the terminal state left by an accepted Exit sound. Restart
+        // must clear that protected voice before the following Escape explosion.
+        assert!(mixer.play_effect(SoundEffect::Exit));
+        assert!(!mixer.music_playing);
+        assert!(sender.send(AudioCommand::RestartLevel));
+        assert!(sender.send(AudioCommand::PlayEffect {
+            effect: SoundEffect::Explosion,
+        }));
+
+        // Isolate the effect samples while retaining Restart's command behavior.
+        mixer.music_enabled = false;
+        mixer.callback(&mut output);
+        assert_eq!(
+            mixer.effect_voice.map(|voice| voice.effect),
+            Some(SoundEffect::Explosion)
+        );
+        assert!(output.iter().any(|sample| *sample != 0.0));
+    }
+
+    /// Confirms a stalled callback can never block the main-thread producer.
+    #[test]
+    fn full_command_ring_rejects_excess_input_immediately() {
+        let (_, mut sender) = decoded_mixer();
+
+        // With no callback consuming slots, exactly the fixed capacity succeeds.
+        // The next operation reports saturation after its single occupancy read.
+        for _ in 0..COMMAND_QUEUE_CAPACITY {
+            assert!(sender.send(AudioCommand::RestartLevel));
+        }
+        assert!(!sender.send(AudioCommand::PlayEffect {
+            effect: SoundEffect::Explosion,
+        }));
+    }
+
     /// Confirms shutdown quiescence bypasses synthesis and returns only silence.
     #[test]
-    fn callback_honors_the_lock_free_stop_request() {
-        let mut mixer = decoded_mixer();
+    fn callback_honors_the_atomic_stop_request() {
+        let (mut mixer, _) = decoded_mixer();
         let starting_frame = mixer.music.rendered_frames();
         let mut output = [1.0; 128];
 
@@ -684,7 +888,7 @@ mod tests {
     /// Confirms the OPL soundtrack advances and Exit pauses only its voice.
     #[test]
     fn music_advances_and_an_accepted_exit_pauses_it() {
-        let mut mixer = decoded_mixer();
+        let (mut mixer, _) = decoded_mixer();
         let mut output = [0.0; 4_096];
         let starting_frame = mixer.music.rendered_frames();
 
