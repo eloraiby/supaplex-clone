@@ -670,9 +670,16 @@ impl<'textures> Renderer<'textures> {
             }
         }
 
+        // A stationary snap descriptor touches only the neighboring material
+        // cell. Repaint the complete Murphy image which the persistent DOS
+        // level bitmap kept in his own cell before copying that descriptor.
+        let parts = sprite_parts(action, frame);
+        if let Some(retained) = parts.retained {
+            self.draw_murphy_part(canvas, position, retained, camera)?;
+        }
+
         // Each descriptor is a complete opaque rectangle rather than a
         // transparent sprite layer, exactly matching the original byte copy.
-        let parts = sprite_parts(action, frame);
         self.draw_murphy_part(canvas, position, parts.primary, camera)?;
         if let Some(secondary) = parts.secondary {
             self.draw_murphy_part(canvas, position, secondary, camera)?;

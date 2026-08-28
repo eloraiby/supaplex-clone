@@ -69,9 +69,11 @@ pub(crate) struct SpritePart {
     pub(crate) offset_y: i32,
 }
 
-/// One primary sprite and the optional opposite endpoint used by ports.
+/// Ordered sprite layers needed to reconstruct one complete Murphy action frame.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) struct SpriteParts {
+    /// Complete Murphy cell retained underneath an adjacent snap descriptor.
+    pub(crate) retained: Option<SpritePart>,
     /// Main descriptor layer drawn for every Murphy action.
     pub(crate) primary: SpritePart,
     /// Second clipped Murphy layer drawn only during port traversal.
@@ -92,6 +94,7 @@ pub(crate) fn sprite_parts(action: MurphyAnimation, frame: u8) -> SpriteParts {
             SourcePoint { x: 256, y: 164 }
         };
         return SpriteParts {
+            retained: None,
             primary: SpritePart {
                 source,
                 width: 16,
@@ -138,7 +141,48 @@ pub(crate) fn sprite_parts(action: MurphyAnimation, frame: u8) -> SpriteParts {
         None
     };
 
-    SpriteParts { primary, secondary }
+    // Snap descriptors draw only into the adjacent material cell. The DOS
+    // level bitmap retained a complete Murphy picture in his own cell, so a
+    // stateless renderer must explicitly reproduce that persistent underlay.
+    let retained = if let MurphyAnimation::Snap { direction, target } = action {
+        Some(snap_retained_part(direction, target))
+    } else {
+        None
+    };
+
+    SpriteParts {
+        retained,
+        primary,
+        secondary,
+    }
+}
+
+/// Returns the complete Murphy picture retained while an adjacent cell is snapped.
+fn snap_retained_part(direction: Direction, target: MurphySnapTarget) -> SpritePart {
+    // Base and Infotron handlers copied these direction-specific pictures into
+    // Murphy's cell immediately before starting the adjacent-cell strip. Red
+    // Disk handlers relied on the already persistent bitmap instead; the still
+    // picture is the faithful deterministic reconstruction after Murphy rests.
+    let source = match target {
+        MurphySnapTarget::Base | MurphySnapTarget::Infotron => match direction {
+            Direction::Up => SourcePoint { x: 160, y: 64 },
+            Direction::Left => SourcePoint { x: 208, y: 16 },
+            Direction::Down => SourcePoint { x: 176, y: 64 },
+            Direction::Right => SourcePoint { x: 192, y: 16 },
+        },
+        MurphySnapTarget::RedDisk => SourcePoint { x: 304, y: 132 },
+    };
+
+    // The retained image replaces exactly Murphy's own cell. Directional
+    // displacement belongs exclusively to the primary snap descriptor, which
+    // is deliberately positioned over the neighboring material cell.
+    SpritePart {
+        source,
+        width: 16,
+        height: 16,
+        offset_x: 0,
+        offset_y: 0,
+    }
 }
 
 /// Maps a typed action to the descriptor selected by the original direction handlers.
@@ -751,6 +795,56 @@ mod tests {
             0,
         );
         assert_ne!(base.primary.source, infotron.primary.source);
+    }
+
+    /// Verifies every snap reconstructs Murphy while its descriptor replaces the target cell.
+    #[test]
+    fn snap_frames_retain_a_complete_murphy_in_his_own_cell() {
+        let directional_poses = [
+            (Direction::Up, SourcePoint { x: 160, y: 64 }),
+            (Direction::Left, SourcePoint { x: 208, y: 16 }),
+            (Direction::Down, SourcePoint { x: 176, y: 64 }),
+            (Direction::Right, SourcePoint { x: 192, y: 16 }),
+        ];
+
+        for target in [MurphySnapTarget::Base, MurphySnapTarget::Infotron] {
+            for (direction, expected_source) in directional_poses {
+                let parts = sprite_parts(MurphyAnimation::Snap { direction, target }, 0);
+                let retained = parts
+                    .retained
+                    .expect("Base and Infotron snaps must retain Murphy");
+
+                assert_eq!(retained.source, expected_source);
+                assert_eq!((retained.width, retained.height), (16, 16));
+                assert_eq!((retained.offset_x, retained.offset_y), (0, 0));
+                assert_ne!(
+                    (parts.primary.offset_x, parts.primary.offset_y),
+                    (0, 0),
+                    "the animated descriptor must remain in the adjacent cell"
+                );
+            }
+        }
+
+        for direction in [
+            Direction::Up,
+            Direction::Left,
+            Direction::Down,
+            Direction::Right,
+        ] {
+            let retained = sprite_parts(
+                MurphyAnimation::Snap {
+                    direction,
+                    target: MurphySnapTarget::RedDisk,
+                },
+                0,
+            )
+            .retained
+            .expect("Red Disk snaps must retain Murphy");
+
+            assert_eq!(retained.source, SourcePoint { x: 304, y: 132 });
+            assert_eq!((retained.width, retained.height), (16, 16));
+            assert_eq!((retained.offset_x, retained.offset_y), (0, 0));
+        }
     }
 
     /// Verifies wide pushes use the full three-tile composite width.
