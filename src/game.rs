@@ -465,6 +465,14 @@ impl Game {
         self.status
     }
 
+    /// Reports whether a terminal level has completed its original exit delay.
+    pub fn terminal_transition_ready(&self) -> bool {
+        // Completed and dead levels continue non-player simulation for 0x40
+        // updates. The front end may leave only after that shared countdown is
+        // exhausted, so exit and explosion animations are never cut short.
+        self.status != GameStatus::Playing && self.quit_countdown == 0
+    }
+
     /// Returns the number of fixed simulation steps processed.
     pub fn tick_count(&self) -> u64 {
         self.tick
@@ -3140,8 +3148,10 @@ mod tests {
         open.tick(input);
 
         assert_eq!(locked.status(), GameStatus::Playing);
+        assert!(!locked.terminal_transition_ready());
         assert!(locked.take_sound_effects().is_empty());
         assert_eq!(open.status(), GameStatus::Completed);
+        assert!(!open.terminal_transition_ready());
         assert_eq!(open.take_sound_effects(), vec![SoundEffect::Exit]);
         assert_eq!(
             open.board()
@@ -3157,6 +3167,10 @@ mod tests {
         }
         assert_eq!(open.status(), GameStatus::Completed);
         assert!(open.murphy_position().is_none());
+        for _ in 0..24 {
+            open.tick(Input::default());
+        }
+        assert!(open.terminal_transition_ready());
     }
 
     /// Confirms Murphy cannot enter an enemy cell without being destroyed.

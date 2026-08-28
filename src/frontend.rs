@@ -102,6 +102,13 @@ pub fn fade_in_opacity(elapsed: Duration) -> u8 {
     u8::MAX - fade_component(elapsed, ORIGINAL_FADE_DURATION)
 }
 
+/// Returns black opacity for a screen fading out over the original duration.
+pub fn fade_out_opacity(elapsed: Duration) -> u8 {
+    // The shared component reaches 255 at and after the historical duration,
+    // leaving the completed transition fully black until its caller changes state.
+    fade_component(elapsed, ORIGINAL_FADE_DURATION)
+}
+
 /// Calculates the title frame corresponding to an elapsed wall-clock duration.
 pub fn splash_frame(elapsed: Duration) -> SplashFrame {
     // The opening half fades black away, the middle preserves the decoded title
@@ -153,7 +160,7 @@ mod tests {
 
     use super::{
         MenuSelection, ORIGINAL_FADE_DURATION, SPLASH_HOLD_DURATION, SplashFrame, fade_in_opacity,
-        splash_frame,
+        fade_out_opacity, splash_frame,
     };
     use std::time::Duration;
 
@@ -241,5 +248,13 @@ mod tests {
         assert_eq!(fade_in_opacity(Duration::ZERO), u8::MAX);
         assert_eq!(fade_in_opacity(ORIGINAL_FADE_DURATION), 0);
         assert_eq!(fade_in_opacity(ORIGINAL_FADE_DURATION * 2), 0);
+    }
+
+    /// Confirms reusable fade-out opacity reaches and retains opaque black.
+    #[test]
+    fn fade_out_reaches_fully_black() {
+        assert_eq!(fade_out_opacity(Duration::ZERO), 0);
+        assert_eq!(fade_out_opacity(ORIGINAL_FADE_DURATION), u8::MAX);
+        assert_eq!(fade_out_opacity(ORIGINAL_FADE_DURATION * 2), u8::MAX);
     }
 }

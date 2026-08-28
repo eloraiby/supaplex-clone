@@ -56,11 +56,13 @@ Controls:
 - `R`: restart the selected level from its original record.
 - `M`: mute or resume music.
 - `S`: mute or enable sound effects.
-- `Escape`: quit.
+- `Escape`: return from gameplay to the menu, or quit from the menu.
 
 The original bottom status panel shows the player, level number and title, game
 time, remaining Infotrons, and Red Disk inventory. The camera follows Murphy
-across the full 60×24 board.
+across the full 60×24 board. Menu-to-level and level-to-menu changes use the
+original 64-frame, 70 Hz palette-fade duration. Finishing a level returns with
+the following level highlighted; death returns with the same level selected.
 
 ## Simulation design
 
@@ -113,8 +115,8 @@ multi-way ports, special-port toggles, Bug timing, Snik Snaks, Electrons,
 Terminal/Yellow Disk detonation, single-fuse planted Red Disks, merged and
 chained 3×3 explosions, Electron-to-Infotron residue, synchronized initial Bug
 cycles with randomized per-Bug cooldowns, animated player death,
-completion, and restart. The current scope intentionally omits persistent
-profiles, demos, and progression between levels.
+completion, restart, and progression back to the next menu selection. The
+current scope intentionally omits persistent profiles and demos.
 
 ## Original data and PNG conversion
 
