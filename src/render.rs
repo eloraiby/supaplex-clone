@@ -1436,29 +1436,41 @@ fn load_texture<'textures>(
     texture
         .update(None, &image.pixels, image.width as usize * 4)
         .map_err(|error| RenderError::Sdl(error.to_string()))?;
-    texture.set_blend_mode(BlendMode::Blend);
+    // Opaque DOS rectangles are literal replacements, so disable blending at
+    // the SDL copy operation as well as forcing their stored alpha bytes. Font
+    // masks retain ordinary source-alpha blending.
+    texture.set_blend_mode(match black_pixel_policy {
+        BlackPixelPolicy::Opaque => BlendMode::None,
+        BlackPixelPolicy::Transparent => BlendMode::Blend,
+    });
     Ok(texture)
 }
 
 /// Applies opaque-copy or black-colorkey semantics to tightly packed RGBA pixels.
 fn apply_black_pixel_policy(pixels: &mut [u8], policy: BlackPixelPolicy) {
-    // Opaque images already carry the alpha bytes emitted by the asset
-    // converter. Leaving them untouched preserves black as active erase data.
-    if policy == BlackPixelPolicy::Opaque {
-        return;
-    }
-
-    // Transparent images use pure black as their colorkey. Colored pixels keep
-    // their original alpha so this transformation remains safe for a future
-    // asset containing deliberately translucent non-black artwork.
     let (pixels, remainder) = pixels.as_chunks_mut::<4>();
     debug_assert!(
         remainder.is_empty(),
         "RGBA image must contain complete pixels"
     );
-    for pixel in pixels {
-        if pixel[0] == 0 && pixel[1] == 0 && pixel[2] == 0 {
-            pixel[3] = 0;
+
+    match policy {
+        // A DOS bitmap copy has no alpha channel. Force every source pixel to
+        // replace its destination, even if an unbundled PNG was previously
+        // converted with transparent black or contains partial alpha.
+        BlackPixelPolicy::Opaque => {
+            for pixel in pixels {
+                pixel[3] = u8::MAX;
+            }
+        }
+        // Transparent images use pure black as their colorkey. Colored pixels
+        // keep their original alpha for deliberately translucent artwork.
+        BlackPixelPolicy::Transparent => {
+            for pixel in pixels {
+                if pixel[0] == 0 && pixel[1] == 0 && pixel[2] == 0 {
+                    pixel[3] = 0;
+                }
+            }
         }
     }
 }
@@ -1797,16 +1809,16 @@ mod tests {
     /// Confirms opaque DOS copies and transparent overlays treat black differently.
     #[test]
     fn black_pixel_policy_preserves_moving_erase_pixels() {
-        let source = [0, 0, 0, 255, 12, 34, 56, 192];
+        let source = [0, 0, 0, 0, 12, 34, 56, 192];
         let mut opaque = source;
         let mut transparent = source;
 
-        // Opaque moving frames use black to erase the previously drawn target,
-        // while overlay textures discard only pure black and retain colored alpha.
+        // Solid moving frames force every alpha byte to full coverage, while
+        // overlay textures discard only pure black and retain colored alpha.
         apply_black_pixel_policy(&mut opaque, BlackPixelPolicy::Opaque);
         apply_black_pixel_policy(&mut transparent, BlackPixelPolicy::Transparent);
 
-        assert_eq!(opaque, source);
+        assert_eq!(opaque, [0, 0, 0, 255, 12, 34, 56, 255]);
         assert_eq!(transparent, [0, 0, 0, 0, 12, 34, 56, 192]);
     }
 
