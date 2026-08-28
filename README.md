@@ -54,9 +54,9 @@ Controls:
 - `S`: mute or enable sound effects.
 - `Escape`: quit.
 
-The HUD shows the original level title, remaining Infotrons, Red Disk inventory,
-gravity, and the Zonk freeze state. The camera follows Murphy across the full
-60×24 board.
+The original bottom status panel shows the player, level number and title, game
+time, remaining Infotrons, and Red Disk inventory. The camera follows Murphy
+across the full 60×24 board.
 
 ## Simulation design
 

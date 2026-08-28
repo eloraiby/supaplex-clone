@@ -14,7 +14,10 @@ use crate::{
         Actor, AnimationKind, Direction, EnemyTurn, MurphyAnimation, MurphyMoveTarget, Position,
         State,
     },
-    assets::{self, AssetError, FIXED_GRAPHICS_PATH, FONT_GRAPHICS_PATH, MOVING_GRAPHICS_PATH},
+    assets::{
+        self, AssetError, FIXED_GRAPHICS_PATH, FONT_GRAPHICS_PATH, MOVING_GRAPHICS_PATH,
+        PANEL_GRAPHICS_PATH,
+    },
     game::{Game, GameStatus},
     murphy_animation::{SourcePoint, SpritePart, sprite_parts},
 };
@@ -25,8 +28,8 @@ pub const LOGICAL_WIDTH: u32 = 960;
 /// Logical height used by the resizable SDL window.
 pub const LOGICAL_HEIGHT: u32 = 640;
 
-/// Height reserved for the two-line status panel.
-const HUD_HEIGHT: u32 = 64;
+/// Three-times-scaled height of the original 320×24 status panel.
+const HUD_HEIGHT: u32 = 72;
 
 /// Height of the scrolling board viewport above the HUD.
 const VIEW_HEIGHT: u32 = LOGICAL_HEIGHT - HUD_HEIGHT;
@@ -45,6 +48,9 @@ const FONT_CELL_SIZE: u32 = 8;
 
 /// Integer scale used to keep HUD lettering crisp and legible.
 const FONT_SCALE: u32 = 2;
+
+/// Integer enlargement used for original 320-pixel-wide screen coordinates.
+const ORIGINAL_SCREEN_SCALE: u32 = LOGICAL_WIDTH / 320;
 
 /// Number of glyphs placed horizontally in `CHARS8.DAT`.
 const FONT_GLYPHS: u8 = 64;
@@ -92,6 +98,8 @@ pub struct Renderer<'textures> {
     moving: Texture<'textures>,
     /// Original eight-pixel DOS font converted to an RGBA PNG.
     font: Texture<'textures>,
+    /// Original 320×24 in-game panel, enlarged to the full logical width.
+    panel: Texture<'textures>,
     /// Most recent camera centered on a live Murphy.
     ///
     /// A death transition replaces Murphy with an Explosion immediately. The
@@ -131,11 +139,20 @@ impl<'textures> Renderer<'textures> {
             FONT_GRAPHICS_PATH,
             BlackPixelPolicy::Transparent,
         )?;
+        let panel = load_texture(
+            texture_creator,
+            graphics.panel.as_ref(),
+            320,
+            24,
+            PANEL_GRAPHICS_PATH,
+            BlackPixelPolicy::Opaque,
+        )?;
 
         Ok(Self {
             fixed,
             moving,
             font,
+            panel,
             camera: Camera::default(),
         })
     }
@@ -146,6 +163,7 @@ impl<'textures> Renderer<'textures> {
         canvas: &mut Canvas<Window>,
         game: &Game,
         level_number: usize,
+        steps_per_second: u32,
     ) -> Result<(), RenderError> {
         // Every cell sprite uses black as its original DOS background. Clearing
         // first also supplies black behind pixels made transparent on upload.
@@ -186,7 +204,7 @@ impl<'textures> Renderer<'textures> {
             }
         }
 
-        self.draw_hud(canvas, game, level_number)?;
+        self.draw_hud(canvas, game, level_number, steps_per_second)?;
         self.draw_status_overlay(canvas, game.status())?;
         canvas.present();
         Ok(())
@@ -487,42 +505,72 @@ impl<'textures> Renderer<'textures> {
         self.draw_murphy_part(canvas, position, part, camera)
     }
 
-    /// Draws level metadata and live counters with the converted DOS font.
+    /// Draws the original panel and its live values at their historical positions.
     fn draw_hud(
         &mut self,
         canvas: &mut Canvas<Window>,
         game: &Game,
         level_number: usize,
+        steps_per_second: u32,
     ) -> Result<(), RenderError> {
+        // PANEL.DAT is exactly 320×24, so a three-times integer copy fills the
+        // logical width without sampling artifacts or changing its proportions.
         let hud_y = VIEW_HEIGHT as i32;
-        canvas.set_draw_color(Color::RGB(34, 34, 42));
         canvas
-            .fill_rect(Rect::new(0, hud_y, LOGICAL_WIDTH, HUD_HEIGHT))
-            .map_err(RenderError::Sdl)?;
-        canvas.set_draw_color(Color::RGB(122, 122, 132));
-        canvas
-            .fill_rect(Rect::new(0, hud_y, LOGICAL_WIDTH, 2))
+            .copy(
+                &self.panel,
+                None,
+                Rect::new(0, hud_y, LOGICAL_WIDTH, HUD_HEIGHT),
+            )
             .map_err(RenderError::Sdl)?;
 
-        let first_line = format!("LEVEL {level_number:03}  {}", game.title());
-        let second_line = format!(
-            "INFOTRONS {:03}  RED DISKS {:02}  GRAVITY {}  ZONKS {}",
-            game.remaining_infotrons(),
-            game.red_disks(),
-            if game.gravity() { "ON" } else { "OFF" },
-            if game.freeze_zonks() {
-                "FROZEN"
-            } else {
-                "LIVE"
-            },
-        );
-        self.draw_text(canvas, &first_line, 12, hud_y + 8, Color::RGB(255, 210, 40))?;
-        self.draw_text(
+        // Palette indices 6 and 8 are the original red highlight and blue
+        // informational colors. The PNG font is a mask, so SDL color modulation
+        // recreates those indexed writes over the preserved panel background.
+        const RED_TEXT: Color = Color::RGB(0xe0, 0x10, 0x10);
+        const BLUE_TEXT: Color = Color::RGB(0x70, 0x90, 0xe0);
+        self.draw_panel_text(canvas, "MURPHY", 72, 3, RED_TEXT)?;
+        self.draw_panel_text(canvas, &format!("{level_number:03}"), 16, 14, BLUE_TEXT)?;
+        self.draw_panel_text(canvas, game.title(), 64, 14, BLUE_TEXT)?;
+
+        let infotrons = game.remaining_infotrons().min(999);
+        let infotron_color = if infotrons == 0 { RED_TEXT } else { BLUE_TEXT };
+        self.draw_panel_text(canvas, &format!("{infotrons:03}"), 272, 14, infotron_color)?;
+
+        // The original panel shows only the last two digits for each time field
+        // and Red Disk inventory. Derive elapsed play time from fixed simulation
+        // ticks so menus, pauses, and slow render frames do not inflate it.
+        let total_seconds = game.tick_count() / u64::from(steps_per_second.max(1));
+        let seconds = total_seconds % 60;
+        let minutes = total_seconds / 60 % 60;
+        let hours = total_seconds / 3_600 % 100;
+        self.draw_panel_text(canvas, &format!("{hours:02}"), 160, 3, RED_TEXT)?;
+        self.draw_panel_text(canvas, &format!("{minutes:02}"), 184, 3, RED_TEXT)?;
+        self.draw_panel_text(canvas, &format!("{seconds:02}"), 208, 3, RED_TEXT)?;
+
+        let red_disks = game.red_disks() % 100;
+        let red_disk_color = if red_disks == 0 { BLUE_TEXT } else { RED_TEXT };
+        self.draw_panel_text(canvas, &format!("{red_disks:02}"), 304, 14, red_disk_color)
+    }
+
+    /// Draws CHARS8 text using original panel coordinates and three-times scale.
+    fn draw_panel_text(
+        &mut self,
+        canvas: &mut Canvas<Window>,
+        text: &str,
+        original_x: i32,
+        original_y: i32,
+        color: Color,
+    ) -> Result<(), RenderError> {
+        // Converting both axes at this boundary keeps every call site readable
+        // against the original drawing routine's literal 320×24 coordinates.
+        self.draw_text_scaled(
             canvas,
-            &second_line,
-            12,
-            hud_y + 34,
-            Color::RGB(225, 225, 225),
+            text,
+            original_x * ORIGINAL_SCREEN_SCALE as i32,
+            VIEW_HEIGHT as i32 + original_y * ORIGINAL_SCREEN_SCALE as i32,
+            color,
+            ORIGINAL_SCREEN_SCALE,
         )
     }
 
@@ -557,8 +605,25 @@ impl<'textures> Renderer<'textures> {
         y: i32,
         color: Color,
     ) -> Result<(), RenderError> {
+        // General overlays retain the clone's existing two-times font size;
+        // original-resolution UI surfaces call the scaled primitive directly.
+        self.draw_text_scaled(canvas, text, x, y, color, FONT_SCALE)
+    }
+
+    /// Draws supported ASCII text with an explicit integer glyph scale.
+    fn draw_text_scaled(
+        &mut self,
+        canvas: &mut Canvas<Window>,
+        text: &str,
+        x: i32,
+        y: i32,
+        color: Color,
+        scale: u32,
+    ) -> Result<(), RenderError> {
+        // Color modulation turns the white mask into one indexed-palette color;
+        // transparent black leaves the destination panel or board untouched.
         self.font.set_color_mod(color.r, color.g, color.b);
-        let glyph_size = (FONT_CELL_SIZE * FONT_SCALE) as i32;
+        let glyph_size = (FONT_CELL_SIZE * scale) as i32;
 
         for (character_index, character) in text.chars().enumerate() {
             // The original strip covers ASCII space through underscore. Uppercase
@@ -579,8 +644,8 @@ impl<'textures> Renderer<'textures> {
             let destination = Rect::new(
                 x + character_index as i32 * glyph_size,
                 y,
-                FONT_CELL_SIZE * FONT_SCALE,
-                FONT_CELL_SIZE * FONT_SCALE,
+                FONT_CELL_SIZE * scale,
+                FONT_CELL_SIZE * scale,
             );
             canvas
                 .copy(&self.font, source, destination)

@@ -223,7 +223,7 @@ fn run(level: &Level, level_number: usize, steps_per_second: u32) -> Result<(), 
             window_title = title;
         }
         renderer
-            .draw(&mut canvas, &game, level_number)
+            .draw(&mut canvas, &game, level_number, steps_per_second)
             .map_err(|error| error.to_string())?;
 
         // Hardware vsync normally consumes most or all of this interval. The
