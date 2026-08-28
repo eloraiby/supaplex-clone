@@ -17,6 +17,8 @@ cargo run --release -- --level 1
 
 Valid numbers are `1..=111`. The default executable embeds every runtime asset,
 so it does not depend on the process working directory after it is built.
+The optional `--step <5-60>` argument selects fixed simulation updates per
+second; omitting it preserves the original rate of 35 updates per second.
 
 ### Unbundled build
 

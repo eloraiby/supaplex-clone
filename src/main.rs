@@ -7,7 +7,7 @@ use supaplex_clone::{
     actor::Direction,
     assets,
     audio::AudioPlayer,
-    cli::Options,
+    cli::{FIRST_STEP_RATE, LAST_STEP_RATE, Options},
     game::{Game, GameStatus, Input},
     level::{Level, LevelSet},
     render::{LOGICAL_HEIGHT, LOGICAL_WIDTH, Renderer},
@@ -46,7 +46,7 @@ fn main() -> ExitCode {
         }
     };
 
-    match run(&level, options.level_number()) {
+    match run(&level, options.level_number(), options.steps_per_second()) {
         Ok(()) => ExitCode::SUCCESS,
         Err(error) => {
             eprintln!("could not run level {}: {error}", options.level_number());
@@ -55,8 +55,8 @@ fn main() -> ExitCode {
     }
 }
 
-/// Initializes SDL2 and owns every resource for one windowed play loop.
-fn run(level: &Level, level_number: usize) -> Result<(), String> {
+/// Initializes SDL2 and owns every resource for one fixed-rate play loop.
+fn run(level: &Level, level_number: usize, steps_per_second: u32) -> Result<(), String> {
     // Nearest-neighbor scaling preserves the hard pixel edges of the original
     // 16×16 artwork after its 2× atlas repack and logical-window scaling.
     sdl2::hint::set("SDL_RENDER_SCALE_QUALITY", "0");
@@ -101,12 +101,10 @@ fn run(level: &Level, level_number: usize) -> Result<(), String> {
         }
     };
 
-    // The DOS game and the SpeedFix reference timing both advance gameplay at
-    // thirty-five iterations per second.  Keep this as an integer nanosecond
-    // duration so the fixed-step accumulator loses less than one nanosecond per
-    // iteration instead of rounding every update to 28 or 29 milliseconds.
-    // Rendering remains independently capped at sixty frames per second below.
-    const STEP: Duration = Duration::from_nanos(1_000_000_000 / 35);
+    // Convert the validated CLI frequency once. Integer nanoseconds lose less
+    // than one nanosecond per update instead of rounding through milliseconds;
+    // rendering remains independently capped at sixty frames per second below.
+    let step = simulation_step(steps_per_second);
     const MAX_STEPS_PER_FRAME: usize = 6;
     // Vsync is only a request and is ignored by some SDL render backends. An
     // independent deadline prevents those backends from rendering hundreds of
@@ -178,7 +176,7 @@ fn run(level: &Level, level_number: usize) -> Result<(), String> {
         }
 
         let mut processed_steps = 0;
-        while accumulator >= STEP && processed_steps < MAX_STEPS_PER_FRAME {
+        while accumulator >= step && processed_steps < MAX_STEPS_PER_FRAME {
             let keyboard = event_pump.keyboard_state();
             let input = Input {
                 direction: keyboard_direction(&keyboard),
@@ -196,7 +194,7 @@ fn run(level: &Level, level_number: usize) -> Result<(), String> {
                 // letting an unused queue grow for the lifetime of the level.
                 game.take_sound_effects();
             }
-            accumulator -= STEP;
+            accumulator -= step;
             processed_steps += 1;
         }
         if processed_steps == MAX_STEPS_PER_FRAME {
@@ -239,6 +237,15 @@ fn run(level: &Level, level_number: usize) -> Result<(), String> {
     Ok(())
 }
 
+/// Converts a validated updates-per-second rate to one fixed-step duration.
+fn simulation_step(steps_per_second: u32) -> Duration {
+    // `Options` enforces this range before SDL startup. Keep the assertion near
+    // the division so a future non-CLI caller cannot silently violate it in a
+    // debug build; the positive minimum also makes division by zero impossible.
+    debug_assert!((FIRST_STEP_RATE..=LAST_STEP_RATE).contains(&steps_per_second));
+    Duration::from_nanos(1_000_000_000 / u64::from(steps_per_second))
+}
+
 /// Selects at most one held arrow key using stable directional precedence.
 fn keyboard_direction(keyboard: &sdl2::keyboard::KeyboardState<'_>) -> Option<Direction> {
     // A deterministic order avoids diagonal commands, which the original grid
@@ -253,5 +260,36 @@ fn keyboard_direction(keyboard: &sdl2::keyboard::KeyboardState<'_>) -> Option<Di
         Some(Direction::Right)
     } else {
         None
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    //! Fixed-step conversion checks that do not initialize SDL.
+
+    use std::time::Duration;
+
+    use super::simulation_step;
+    use supaplex_clone::cli::{DEFAULT_STEP_RATE, FIRST_STEP_RATE, LAST_STEP_RATE};
+
+    /// Confirms the omitted-option default retains the historical 35-Hz duration.
+    #[test]
+    fn default_step_rate_preserves_original_timing() {
+        let duration = simulation_step(DEFAULT_STEP_RATE);
+
+        assert_eq!(duration, Duration::from_nanos(1_000_000_000 / 35));
+    }
+
+    /// Confirms both validated custom endpoints use the requested rate divisor.
+    #[test]
+    fn custom_step_rate_boundaries_convert_to_nanoseconds() {
+        assert_eq!(
+            simulation_step(FIRST_STEP_RATE),
+            Duration::from_nanos(1_000_000_000 / u64::from(FIRST_STEP_RATE))
+        );
+        assert_eq!(
+            simulation_step(LAST_STEP_RATE),
+            Duration::from_nanos(1_000_000_000 / u64::from(LAST_STEP_RATE))
+        );
     }
 }
