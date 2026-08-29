@@ -17,9 +17,11 @@ then launch the front end:
 cargo run --release
 ```
 
-The optional `--level <1-111>` argument chooses the initially highlighted menu
-row; omitting it starts at level 1. The default executable embeds every runtime
-asset, so it does not depend on the process working directory after it is built.
+The optional `--level <1-111>` argument launches that level directly, bypassing
+the title, menu, player profiles, and progression checks. The process exits when
+the level ends. Omitting it opens the normal front end with level 1 highlighted.
+The default executable embeds every runtime asset, so it does not depend on the
+process working directory after it is built.
 The optional `--step <5-60>` argument selects fixed simulation updates per second;
 omitting it uses 50 updates per second.
 

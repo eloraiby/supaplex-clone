@@ -1,4 +1,4 @@
-//! Minimal command-line parsing for initial menu selection and simulation rate.
+//! Minimal command-line parsing for direct level launch and simulation rate.
 
 use std::{error::Error, fmt};
 
@@ -8,7 +8,7 @@ pub const FIRST_LEVEL: usize = 1;
 /// The final level number accepted by the original 111-level collection.
 pub const LAST_LEVEL: usize = 111;
 
-/// Initial main-menu level used when `--level` is omitted.
+/// Initial main-menu level used during ordinary startup.
 pub const DEFAULT_LEVEL: usize = FIRST_LEVEL;
 
 /// Slowest supported simulation rate in fixed updates per second.
@@ -23,8 +23,8 @@ pub const DEFAULT_STEP_RATE: u32 = 50;
 /// Validated options needed to initialize the front end.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct Options {
-    /// One-based level number matching the numbering shown by Supaplex.
-    level_number: usize,
+    /// Explicit one-based level to launch without entering the front end.
+    requested_level: Option<usize>,
     /// Validated number of fixed simulation updates performed per second.
     steps_per_second: u32,
 }
@@ -32,10 +32,11 @@ pub struct Options {
 impl Options {
     /// Parses optional `--level` and `--step` argument pairs.
     ///
-    /// The level selector defaults to level one and merely chooses the initial
-    /// main-menu row, while `--step` defaults to 50 updates per
-    /// second. Pairs may appear in either order. A deliberately small parser
-    /// keeps startup dependencies light and every rejection deterministic.
+    /// An explicit level launches that record directly, while omitting it uses
+    /// the ordinary title and main-menu flow at level one. `--step` defaults to
+    /// 50 updates per second. Pairs may appear in either order. A deliberately
+    /// small parser keeps startup dependencies light and every rejection
+    /// deterministic.
     pub fn parse<I, S>(arguments: I) -> Result<Self, OptionsError>
     where
         I: IntoIterator<Item = S>,
@@ -68,18 +69,22 @@ impl Options {
             }
         }
 
-        // Both defaults describe front-end startup rather than bypassing it:
-        // level one is highlighted and the historical fixed rate is retained.
+        // Preserve the absence of `--level` so startup can distinguish the
+        // ordinary front end from an explicit direct-play request.
         Ok(Self {
-            level_number: level_number.unwrap_or(DEFAULT_LEVEL),
+            requested_level: level_number,
             steps_per_second: steps_per_second.unwrap_or(DEFAULT_STEP_RATE),
         })
     }
 
-    /// Returns the one-based level initially highlighted in the main menu.
+    /// Returns the explicit one-based level requested for direct play.
+    pub fn requested_level(self) -> Option<usize> {
+        self.requested_level
+    }
+
+    /// Returns the requested level, or the ordinary initial menu level.
     pub fn level_number(self) -> usize {
-        // Copying the validated scalar cannot expose an invalid record index.
-        self.level_number
+        self.requested_level.unwrap_or(DEFAULT_LEVEL)
     }
 
     /// Returns the selected number of fixed simulation updates per second.
@@ -183,6 +188,8 @@ mod tests {
 
         assert_eq!(first.level_number(), FIRST_LEVEL);
         assert_eq!(last.level_number(), LAST_LEVEL);
+        assert_eq!(first.requested_level(), Some(FIRST_LEVEL));
+        assert_eq!(last.requested_level(), Some(LAST_LEVEL));
         assert_eq!(first.steps_per_second(), DEFAULT_STEP_RATE);
         assert_eq!(last.steps_per_second(), DEFAULT_STEP_RATE);
     }
@@ -215,8 +222,10 @@ mod tests {
         let rate_only = Options::parse(["--step", "35"]).expect("rate-only form should parse");
 
         assert_eq!(defaults.level_number(), DEFAULT_LEVEL);
+        assert_eq!(defaults.requested_level(), None);
         assert_eq!(defaults.steps_per_second(), DEFAULT_STEP_RATE);
         assert_eq!(rate_only.level_number(), DEFAULT_LEVEL);
+        assert_eq!(rate_only.requested_level(), None);
     }
 
     /// Confirms unknown, incomplete, and repeated pairs receive precise errors.

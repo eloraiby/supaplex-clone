@@ -213,17 +213,19 @@ fn main() -> ExitCode {
         }
     };
 
-    // Validate the initial menu record before SDL startup so malformed level
-    // data remains distinguishable from a later platform initialization error.
-    if let Err(error) = LevelSet::new(level_bytes.as_ref()).load(options.level_number()) {
-        eprintln!("could not load level {}: {error}", options.level_number());
+    // Validate a directly requested record before SDL startup so malformed
+    // level data remains distinguishable from platform initialization errors.
+    if let Some(level_number) = options.requested_level()
+        && let Err(error) = LevelSet::new(level_bytes.as_ref()).load(level_number)
+    {
+        eprintln!("could not load level {level_number}: {error}");
         return ExitCode::FAILURE;
     }
     startup_trace("bundled_levels_validated");
 
     match run(
         level_bytes.as_ref(),
-        options.level_number(),
+        options.requested_level(),
         options.steps_per_second(),
     ) {
         Ok(()) => ExitCode::SUCCESS,
@@ -235,7 +237,11 @@ fn main() -> ExitCode {
 }
 
 /// Initializes SDL2 and owns the front end plus one fixed-rate play loop.
-fn run(level_bytes: &[u8], initial_level: usize, steps_per_second: u32) -> Result<(), String> {
+fn run(
+    level_bytes: &[u8],
+    requested_level: Option<usize>,
+    steps_per_second: u32,
+) -> Result<(), String> {
     startup_trace(if cfg!(debug_assertions) {
         "build_debug"
     } else {
@@ -317,6 +323,35 @@ fn run(level_bytes: &[u8], initial_level: usize, steps_per_second: u32) -> Resul
     } else {
         "audio_disabled"
     });
+    let level_set = LevelSet::new(level_bytes);
+    let level_count = level_set
+        .level_count()
+        .map_err(|error| format!("validate level collection: {error}"))?;
+
+    // `--level` is an explicit standalone play request. It deliberately avoids
+    // title/menu assets, demonstrations, profiles, progression locks, and save
+    // writes; after this one session reaches a terminal result the process ends.
+    if let Some(level_number) = requested_level {
+        startup_trace("direct_level_entered");
+        let level = level_set
+            .load(level_number)
+            .map_err(|error| format!("load requested level {level_number}: {error}"))?;
+        let result = play_level(
+            &mut canvas,
+            &mut renderer,
+            &mut event_pump,
+            &mut audio,
+            LevelSession {
+                level: &level,
+                level_number,
+                level_count,
+                steps_per_second,
+            },
+        );
+        shutdown_audio(&mut audio);
+        return result.map(|_| ());
+    }
+
     startup_trace("splash_entered");
     if !show_splash(&mut canvas, &mut renderer, &mut event_pump)? {
         // Closing the window during startup is an ordinary successful exit,
@@ -325,10 +360,6 @@ fn run(level_bytes: &[u8], initial_level: usize, steps_per_second: u32) -> Resul
         return Ok(());
     }
     startup_trace("splash_completed");
-    let level_set = LevelSet::new(level_bytes);
-    let level_count = level_set
-        .level_count()
-        .map_err(|error| format!("validate level collection: {error}"))?;
     let demo_assets = assets::load_demos().map_err(|error| format!("load demos: {error}"))?;
     let demos: Vec<Demo> = demo_assets
         .demos
@@ -344,7 +375,7 @@ fn run(level_bytes: &[u8], initial_level: usize, steps_per_second: u32) -> Resul
         .map_err(|error| format!("load player profiles: {error}"))?;
     startup_trace("profiles_loaded");
     let text_input = video.text_input();
-    let mut menu_level = initial_level;
+    let mut menu_level = supaplex_clone::cli::DEFAULT_LEVEL;
     startup_trace("main_menu_entered");
     loop {
         let level_number = match show_main_menu(
