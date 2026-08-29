@@ -266,6 +266,13 @@ fn run(level_bytes: &[u8], initial_level: usize, steps_per_second: u32) -> Resul
     canvas
         .set_logical_size(LOGICAL_WIDTH, LOGICAL_HEIGHT)
         .map_err(|error| format!("set logical render size: {error}"))?;
+    // A resizable window can otherwise map one logical pixel to a fractional
+    // number of output pixels. SDL then produces uneven pixel widths even with
+    // nearest texture sampling, which visibly distorts the sprite artwork.
+    #[cfg(not(any(feature = "pocketgo", target_env = "uclibc")))]
+    canvas
+        .set_integer_scale(true)
+        .map_err(|error| format!("enable integer render scaling: {error}"))?;
     startup_trace("framebuffer_canvas_ready");
 
     // The creator outlives `Renderer`, satisfying SDL texture lifetime rules

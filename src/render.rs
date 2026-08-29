@@ -3,6 +3,8 @@
 use std::{error::Error, fmt, io::Cursor};
 
 use crate::platform as sdl2;
+#[cfg(not(any(feature = "pocketgo", target_env = "uclibc")))]
+use sdl2::render::ScaleMode;
 use sdl2::{
     pixels::{Color, PixelFormatEnum},
     rect::Rect,
@@ -1457,14 +1459,17 @@ fn load_texture<'textures>(
     // and uses the modern colorkey behavior selected by its caller.
     apply_black_pixel_policy(&mut image.pixels, black_pixel_policy);
 
-    // Upload the transformed straight-alpha bytes without filtering; the
-    // logical-size canvas supplies the only integer enlargement afterwards.
+    // Upload the transformed straight-alpha bytes. The desktop texture mode is
+    // set explicitly rather than relying only on SDL_RENDER_SCALE_QUALITY: an
+    // environment override or backend default must not introduce atlas bleed.
     let mut texture = texture_creator
         .create_texture_streaming(PixelFormatEnum::RGBA32, image.width, image.height)
         .map_err(|error| RenderError::Sdl(error.to_string()))?;
     texture
         .update(None, &image.pixels, image.width as usize * 4)
         .map_err(|error| RenderError::Sdl(error.to_string()))?;
+    #[cfg(not(any(feature = "pocketgo", target_env = "uclibc")))]
+    texture.set_scale_mode(ScaleMode::Nearest);
     // Opaque DOS rectangles are literal replacements, so disable blending at
     // the SDL copy operation as well as forcing their stored alpha bytes. Font
     // masks retain ordinary source-alpha blending.
