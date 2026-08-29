@@ -1,4 +1,4 @@
-//! SDL audio-device ownership, original AdLib music, and Sound Blaster effects.
+//! Audio-device ownership, original AdLib music, and Sound Blaster effects.
 //!
 //! This module reads both original DOS driver images from the configured asset
 //! source. It interprets `ADLIB.SND` as live OPL2 music and extracts the seven
@@ -88,15 +88,15 @@ const COMMAND_QUEUE_CAPACITY: usize = 256;
 /// Atomic slot value that means no command is ready for the callback.
 const EMPTY_COMMAND_SLOT: u8 = 0;
 
-/// Owns the live SDL playback device and its callback mixer.
+/// Owns the live platform playback device and its callback mixer.
 pub struct AudioPlayer {
-    /// Live SDL callback device taken and closed explicitly by [`Self::drop`].
+    /// Live callback device taken and closed explicitly by [`Self::drop`].
     ///
     /// The option is populated throughout normal playback. Its empty state
     /// exists only while destruction is already in progress, allowing `Drop`
     /// to move the device out and close it before releasing other fields.
     device: Option<AudioDevice<Mixer>>,
-    /// Independent handle keeping SDL audio initialized through device closure.
+    /// Independent handle keeping the audio subsystem initialized through closure.
     ///
     /// `AudioDevice` internally declares its subsystem handle before its device
     /// identifier. If that internal handle is the last one, its generated field
@@ -145,7 +145,7 @@ impl AudioPlayer {
             })
             .map_err(|error| format!("open playback device: {error}"))?;
 
-        // SDL devices begin paused so construction cannot race the caller.
+        // Platform devices begin paused so construction cannot race the caller.
         // Resume only after the fully initialized handle is ready to return.
         device.resume();
         Ok(Self {

@@ -4,8 +4,8 @@ This project plays the 111 original Supaplex levels. It opens with the
 original title and main-menu artwork, loads the DOS `LEVELS.DAT`, simulates
 actor-owned animation and behavior, and renders pixel-perfect conversions of
 the original graphics with nearest-neighbor scaling. Desktop builds use SDL2;
-the original PocketGo uses its Linux framebuffer, evdev keypad, and OSS audio
-device directly. The original AdLib music and Sound Blaster gameplay effects
+the original PocketGo uses its Linux framebuffer, keypad, and ALSA audio device
+directly. The original AdLib music and Sound Blaster gameplay effects
 play through the same self-contained mixer on both backends.
 
 ## Run a level
@@ -55,8 +55,9 @@ The PocketGo V1 reports `armv5tejl` and runs MiyooCFW's ARM/uClibc userspace.
 Its build does not link SDL1 or SDL2: it writes 320×240 RGB565 frames directly
 to `/dev/fb0`, reads the Miyoo kernel keyboard from `/dev/input/event*` when
 evdev is enabled or from the active Linux console in medium-raw mode on the
-original firmware, and streams 44.1 kHz signed 16-bit stereo audio to
-`/dev/dsp`.
+original firmware, and streams 44.1 kHz signed 16-bit stereo audio through the
+firmware's ALSA PCM device. Set `SUPAPLEX_ALSA_DEVICE` to override the default
+PCM name if a modified firmware exposes its playback device differently.
 
 Install nightly Rust with its source component, then download and extract the
 [MiyooCFW 1.3.3 toolchain](https://github.com/NxHope/miyoo_dev/releases/download/v1.3.3/toolchain.7z).

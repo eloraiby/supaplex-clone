@@ -3,7 +3,7 @@
 //! This module deliberately mirrors only the small rust-sdl2 API surface used
 //! by the game. It writes RGB565 frames to `/dev/fb0`, reads the Miyoo kernel
 //! keyboard through evdev when available or the active Linux console on older
-//! firmware, and streams signed 16-bit stereo samples to OSS `/dev/dsp`.
+//! firmware, and streams signed 16-bit stereo samples through ALSA.
 
 use std::io;
 
@@ -1237,10 +1237,11 @@ mod input_tests {
 
 pub mod audio {
     use std::{
-        fs::OpenOptions,
-        io::Write,
+        env,
+        ffi::{CStr, CString},
         marker::PhantomData,
-        os::fd::AsRawFd,
+        mem::size_of,
+        ptr,
         sync::{
             Arc,
             atomic::{AtomicBool, Ordering},
@@ -1249,24 +1250,207 @@ pub mod audio {
         time::Duration,
     };
 
-    const AFMT_S16_LE: i32 = 0x10;
-    const SNDCTL_DSP_SPEED: libc::c_ulong = 0xc004_5002;
-    const SNDCTL_DSP_SETFMT: libc::c_ulong = 0xc004_5005;
-    const SNDCTL_DSP_CHANNELS: libc::c_ulong = 0xc004_5006;
-    const SNDCTL_DSP_SETFRAGMENT: libc::c_ulong = 0xc004_500a;
+    const SND_PCM_STREAM_PLAYBACK: libc::c_int = 0;
+    const SND_PCM_ACCESS_RW_INTERLEAVED: libc::c_int = 3;
+    const SND_PCM_FORMAT_S16_LE: libc::c_int = 2;
+    const ALSA_LATENCY_MICROSECONDS: libc::c_uint = 50_000;
+    const ALSA_DEVICE_ENVIRONMENT_VARIABLE: &str = "SUPAPLEX_ALSA_DEVICE";
+
+    #[repr(C)]
+    struct SndPcm {
+        _private: [u8; 0],
+    }
+
+    #[link(name = "asound")]
+    unsafe extern "C" {
+        fn snd_pcm_open(
+            pcm: *mut *mut SndPcm,
+            name: *const libc::c_char,
+            stream: libc::c_int,
+            mode: libc::c_int,
+        ) -> libc::c_int;
+        fn snd_pcm_close(pcm: *mut SndPcm) -> libc::c_int;
+        fn snd_pcm_drop(pcm: *mut SndPcm) -> libc::c_int;
+        fn snd_pcm_writei(
+            pcm: *mut SndPcm,
+            buffer: *const libc::c_void,
+            frames: libc::c_ulong,
+        ) -> libc::c_long;
+        fn snd_pcm_recover(
+            pcm: *mut SndPcm,
+            error: libc::c_int,
+            silent: libc::c_int,
+        ) -> libc::c_int;
+        fn snd_pcm_set_params(
+            pcm: *mut SndPcm,
+            format: libc::c_int,
+            access: libc::c_int,
+            channels: libc::c_uint,
+            rate: libc::c_uint,
+            soft_resample: libc::c_int,
+            latency: libc::c_uint,
+        ) -> libc::c_int;
+        fn snd_strerror(error: libc::c_int) -> *const libc::c_char;
+    }
+
+    struct AlsaPcm {
+        handle: *mut SndPcm,
+        device_name: String,
+    }
+
+    // ALSA permits one PCM handle to be owned and used by one worker thread.
+    // The main thread never touches it after ownership moves into the closure.
+    unsafe impl Send for AlsaPcm {}
+
+    impl AlsaPcm {
+        fn open(device_name: &str, frequency: i32, channels: u8) -> Result<Self, String> {
+            let name = CString::new(device_name)
+                .map_err(|_| format!("ALSA device name contains a NUL byte: {device_name:?}"))?;
+            let mut handle = ptr::null_mut();
+            // SAFETY: `handle` is writable, `name` is NUL terminated, and ALSA
+            // initializes the returned opaque handle on success.
+            let result =
+                unsafe { snd_pcm_open(&mut handle, name.as_ptr(), SND_PCM_STREAM_PLAYBACK, 0) };
+            if result < 0 {
+                return Err(format!(
+                    "open ALSA PCM {device_name:?}: {}",
+                    alsa_error(result)
+                ));
+            }
+
+            let pcm = Self {
+                handle,
+                device_name: device_name.to_owned(),
+            };
+            // SAFETY: the live PCM handle is uniquely owned here. The selected
+            // format matches the byte conversion in the playback thread.
+            let result = unsafe {
+                snd_pcm_set_params(
+                    pcm.handle,
+                    SND_PCM_FORMAT_S16_LE,
+                    SND_PCM_ACCESS_RW_INTERLEAVED,
+                    libc::c_uint::from(channels),
+                    frequency as libc::c_uint,
+                    1,
+                    ALSA_LATENCY_MICROSECONDS,
+                )
+            };
+            if result < 0 {
+                return Err(format!(
+                    "configure ALSA PCM {device_name:?} as {frequency} Hz, {channels} channel S16_LE: {}",
+                    alsa_error(result)
+                ));
+            }
+            Ok(pcm)
+        }
+
+        fn write_interleaved(
+            &mut self,
+            bytes: &[u8],
+            channels: usize,
+            stopped: &AtomicBool,
+        ) -> Result<(), String> {
+            let frame_bytes = channels * size_of::<i16>();
+            debug_assert!(bytes.len().is_multiple_of(frame_bytes));
+            let frame_count = bytes.len() / frame_bytes;
+            let mut frame_offset = 0;
+            while frame_offset < frame_count && !stopped.load(Ordering::Acquire) {
+                let remaining = frame_count - frame_offset;
+                // SAFETY: `frame_offset` remains inside `bytes`; ALSA receives
+                // exactly `remaining` complete interleaved frames and consumes
+                // the buffer before this blocking call returns.
+                let written = unsafe {
+                    snd_pcm_writei(
+                        self.handle,
+                        bytes.as_ptr().add(frame_offset * frame_bytes).cast(),
+                        remaining as libc::c_ulong,
+                    )
+                };
+                if written > 0 {
+                    frame_offset += written as usize;
+                    continue;
+                }
+                if written == 0 {
+                    thread::yield_now();
+                    continue;
+                }
+
+                let write_error = written as libc::c_int;
+                // SAFETY: the handle remains uniquely owned; ALSA uses the
+                // original negative write result to recover underruns/suspends.
+                let recovery = unsafe { snd_pcm_recover(self.handle, write_error, 1) };
+                if recovery < 0 {
+                    return Err(format!(
+                        "write ALSA PCM {:?}: {}; recovery failed: {}",
+                        self.device_name,
+                        alsa_error(write_error),
+                        alsa_error(recovery)
+                    ));
+                }
+            }
+            Ok(())
+        }
+    }
+
+    impl Drop for AlsaPcm {
+        fn drop(&mut self) {
+            // SAFETY: this object uniquely owns the live ALSA handle. Dropping
+            // queued audio keeps application shutdown bounded before close.
+            unsafe {
+                snd_pcm_drop(self.handle);
+                snd_pcm_close(self.handle);
+            }
+        }
+    }
+
+    fn alsa_error(error: libc::c_int) -> String {
+        // SAFETY: ALSA returns a process-lifetime NUL-terminated error string.
+        let message = unsafe { snd_strerror(error) };
+        if message.is_null() {
+            format!("ALSA error {error}")
+        } else {
+            // SAFETY: the null check above establishes a valid C string pointer.
+            unsafe { CStr::from_ptr(message) }
+                .to_string_lossy()
+                .into_owned()
+        }
+    }
+
+    fn open_alsa(frequency: i32, channels: u8) -> Result<AlsaPcm, String> {
+        if frequency <= 0 {
+            return Err(format!("invalid ALSA sample rate: {frequency}"));
+        }
+        if channels == 0 {
+            return Err("invalid ALSA channel count: 0".to_owned());
+        }
+
+        if let Some(device_name) = env::var_os(ALSA_DEVICE_ENVIRONMENT_VARIABLE) {
+            let device_name = device_name.to_string_lossy();
+            return AlsaPcm::open(&device_name, frequency, channels);
+        }
+
+        let mut errors = Vec::new();
+        for device_name in ["default", "plughw:0,0", "hw:0,0"] {
+            match AlsaPcm::open(device_name, frequency, channels) {
+                Ok(pcm) => return Ok(pcm),
+                Err(error) => errors.push(error),
+            }
+        }
+        Err(errors.join("; "))
+    }
 
     #[derive(Clone, Copy, Debug, Eq, PartialEq)]
     pub struct AudioFormat(i32);
 
     impl AudioFormat {
         pub const fn s16_sys() -> Self {
-            Self(AFMT_S16_LE)
+            Self(SND_PCM_FORMAT_S16_LE)
         }
 
         /// The game-facing callback is floating point; the native audio thread
-        /// converts it to the signed 16-bit OSS device format after mixing.
+        /// converts it to ALSA's signed 16-bit device format after mixing.
         pub const fn f32_sys() -> Self {
-            Self(AFMT_S16_LE)
+            Self(SND_PCM_FORMAT_S16_LE)
         }
     }
 
@@ -1322,33 +1506,22 @@ pub mod audio {
         C: AudioCallback<Channel = f32>,
         F: FnOnce(AudioSpec) -> C,
     {
-        let mut device = OpenOptions::new()
-            .write(true)
-            .open("/dev/dsp")
-            .map_err(|error| format!("open /dev/dsp: {error}"))?;
-        let fd = device.as_raw_fd();
-        let mut fragments = (4_i32 << 16) | 11;
-        let _ = set(fd, SNDCTL_DSP_SETFRAGMENT, &mut fragments);
-        let mut format = AFMT_S16_LE;
-        set(fd, SNDCTL_DSP_SETFMT, &mut format)?;
-        let mut channels = i32::from(desired.channels.unwrap_or(2));
-        set(fd, SNDCTL_DSP_CHANNELS, &mut channels)?;
-        let mut frequency = desired.freq.unwrap_or(44_100);
-        set(fd, SNDCTL_DSP_SPEED, &mut frequency)?;
-        if format != AFMT_S16_LE || channels != 2 || frequency != desired.freq.unwrap_or(44_100) {
-            return Err(format!(
-                "OSS returned unsupported format={format:#x}, channels={channels}, rate={frequency}"
-            ));
-        }
+        let frequency = desired.freq.unwrap_or(44_100);
+        let channels = desired.channels.unwrap_or(2);
+        let mut pcm = open_alsa(frequency, channels)?;
         let samples = desired.samples.unwrap_or(512);
         let spec = AudioSpec {
             freq: frequency,
-            format: AudioFormat(format),
-            channels: channels as u8,
+            format: AudioFormat(SND_PCM_FORMAT_S16_LE),
+            channels,
             silence: 0,
             samples,
-            size: u32::from(samples) * channels as u32 * 2,
+            size: u32::from(samples) * u32::from(channels) * 2,
         };
+        eprintln!(
+            "supaplex_audio=alsa device={} rate={} channels={} frames={} latency_us={}",
+            pcm.device_name, frequency, channels, samples, ALSA_LATENCY_MICROSECONDS
+        );
         let stopped = Arc::new(AtomicBool::new(false));
         let paused = Arc::new(AtomicBool::new(true));
         let thread_stopped = Arc::clone(&stopped);
@@ -1371,7 +1544,10 @@ pub mod audio {
                         let sample = (sample.clamp(-1.0, 1.0) * 32_767.0).round() as i16;
                         bytes.copy_from_slice(&sample.to_le_bytes());
                     }
-                    if device.write_all(&bytes).is_err() {
+                    if let Err(error) =
+                        pcm.write_interleaved(&bytes, usize::from(spec.channels), &thread_stopped)
+                    {
+                        eprintln!("supaplex_audio_error={error}");
                         break;
                     }
                 }
@@ -1383,15 +1559,6 @@ pub mod audio {
             thread: Some(thread),
             _callback: PhantomData,
         })
-    }
-
-    fn set(fd: i32, request: libc::c_ulong, value: &mut i32) -> Result<(), String> {
-        // SAFETY: each OSS request takes one writable C int.
-        if unsafe { libc::ioctl(fd, request, value as *mut i32) } < 0 {
-            Err(std::io::Error::last_os_error().to_string())
-        } else {
-            Ok(())
-        }
     }
 }
 

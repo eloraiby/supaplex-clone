@@ -388,7 +388,7 @@ fn run(level_bytes: &[u8], initial_level: usize, steps_per_second: u32) -> Resul
     }
 }
 
-/// Removes and synchronously shuts down the optional SDL audio player.
+/// Removes and synchronously shuts down the optional audio player.
 fn shutdown_audio(audio: &mut Option<AudioPlayer>) {
     // Taking the value first prevents a later scope exit from attempting a
     // second close. Headless sessions deliberately have nothing to stop.

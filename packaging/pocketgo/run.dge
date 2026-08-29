@@ -10,8 +10,12 @@ log="$game_dir/supaplex.log"
     echo "launcher_started=1"
     echo "initial_cwd=$(pwd)"
     uname -a
-    ls -l "$binary" /lib/ld-uClibc.so.0 /lib/libc.so.0 /lib/libgcc_s.so.1
-    ls -l /dev/fb0 /dev/dsp /dev/miyoo_kbd /dev/tty /dev/tty0
+    ls -l "$binary" /lib/ld-uClibc.so.0 /lib/libc.so.0 /lib/libgcc_s.so.1 /usr/lib/libasound.so.2
+    ls -l /dev/fb0 /dev/miyoo_kbd /dev/tty /dev/tty0
+    ls -ld /dev/snd 2>/dev/null
+    ls -l /dev/snd/* 2>/dev/null
+    cat /proc/asound/cards 2>/dev/null
+    cat /proc/asound/pcm 2>/dev/null
     ls -l /dev/input/event* 2>/dev/null
     cat /proc/bus/input/devices 2>/dev/null
 } >>"$log" 2>&1
