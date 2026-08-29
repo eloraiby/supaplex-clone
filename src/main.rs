@@ -12,6 +12,7 @@ use sdl2::{
     keyboard::{Scancode, TextInputUtil},
     mouse::MouseButton,
 };
+use supaplex_clone::platform as sdl2;
 use supaplex_clone::{
     actor::Direction,
     assets,
@@ -30,7 +31,10 @@ use supaplex_clone::{
 };
 
 /// Maximum display rate used when vsync is unavailable or ignored.
+#[cfg(not(any(feature = "pocketgo", target_env = "uclibc")))]
 const RENDER_INTERVAL: Duration = Duration::from_nanos(1_000_000_000 / 60);
+#[cfg(any(feature = "pocketgo", target_env = "uclibc"))]
+const RENDER_INTERVAL: Duration = Duration::from_nanos(1_000_000_000 / 35);
 
 /// Optional exact player-save path used by portable installs and test sessions.
 const PLAYER_PROFILE_PATH_ENVIRONMENT_VARIABLE: &str = "SUPAPLEX_PROFILE_PATH";
@@ -160,8 +164,19 @@ enum FadeDirection {
     Out,
 }
 
+/// Emits PocketGo-only startup milestones for the diagnostic launcher log.
+fn startup_trace(message: &str) {
+    #[cfg(any(feature = "pocketgo", target_env = "uclibc"))]
+    eprintln!("supaplex_startup={message}");
+
+    #[cfg(not(any(feature = "pocketgo", target_env = "uclibc")))]
+    let _ = message;
+}
+
 /// Parses the command line, loads one record, and runs its SDL2 session.
 fn main() -> ExitCode {
+    startup_trace("process_entered");
+
     // Parse only the arguments after the executable name. `Options` owns all
     // user-facing syntax validation so the eventual SDL front end stays small.
     let options = match Options::parse(std::env::args().skip(1)) {
@@ -189,6 +204,7 @@ fn main() -> ExitCode {
         eprintln!("could not load level {}: {error}", options.level_number());
         return ExitCode::FAILURE;
     }
+    startup_trace("bundled_levels_validated");
 
     match run(
         level_bytes.as_ref(),
@@ -205,6 +221,12 @@ fn main() -> ExitCode {
 
 /// Initializes SDL2 and owns the front end plus one fixed-rate play loop.
 fn run(level_bytes: &[u8], initial_level: usize, steps_per_second: u32) -> Result<(), String> {
+    startup_trace(if cfg!(debug_assertions) {
+        "build_debug"
+    } else {
+        "build_release"
+    });
+
     // Nearest-neighbor scaling preserves the hard pixel edges of the original
     // 16×16 artwork after its 2× atlas repack and logical-window scaling.
     sdl2::hint::set("SDL_RENDER_SCALE_QUALITY", "0");
@@ -218,13 +240,18 @@ fn run(level_bytes: &[u8], initial_level: usize, steps_per_second: u32) -> Resul
     // to try PipeWire first while retaining PulseAudio for older installations.
     // `SDL_SetHint` uses normal priority, so an explicit `SDL_AUDIODRIVER`
     // environment override still wins for users who require another backend.
-    #[cfg(target_os = "linux")]
+    #[cfg(all(
+        target_os = "linux",
+        not(any(feature = "pocketgo", target_env = "uclibc"))
+    ))]
     sdl2::hint::set("SDL_AUDIODRIVER", "pipewire,pulseaudio");
 
     let sdl = sdl2::init().map_err(|error| format!("initialize SDL2: {error}"))?;
+    startup_trace("platform_initialized");
     let video = sdl
         .video()
         .map_err(|error| format!("initialize SDL2 video: {error}"))?;
+    startup_trace("video_initialized");
     let window = video
         .window("Supaplex", LOGICAL_WIDTH, LOGICAL_HEIGHT)
         .position_centered()
@@ -239,14 +266,17 @@ fn run(level_bytes: &[u8], initial_level: usize, steps_per_second: u32) -> Resul
     canvas
         .set_logical_size(LOGICAL_WIDTH, LOGICAL_HEIGHT)
         .map_err(|error| format!("set logical render size: {error}"))?;
+    startup_trace("framebuffer_canvas_ready");
 
     // The creator outlives `Renderer`, satisfying SDL texture lifetime rules
     // without leaking either the canvas or an atlas texture.
     let texture_creator = canvas.texture_creator();
     let mut renderer = Renderer::new(&texture_creator).map_err(|error| error.to_string())?;
+    startup_trace("graphics_decoded");
     let mut event_pump = sdl
         .event_pump()
         .map_err(|error| format!("create SDL2 event pump: {error}"))?;
+    startup_trace("input_opened");
     let mut audio = match sdl
         .audio()
         .map_err(|error| format!("initialize SDL2 audio: {error}"))
@@ -260,12 +290,19 @@ fn run(level_bytes: &[u8], initial_level: usize, steps_per_second: u32) -> Resul
             None
         }
     };
+    startup_trace(if audio.is_some() {
+        "audio_opened"
+    } else {
+        "audio_disabled"
+    });
+    startup_trace("splash_entered");
     if !show_splash(&mut canvas, &mut renderer, &mut event_pump)? {
         // Closing the window during startup is an ordinary successful exit,
         // exactly like closing it from gameplay rather than a loading failure.
         shutdown_audio(&mut audio);
         return Ok(());
     }
+    startup_trace("splash_completed");
     let level_set = LevelSet::new(level_bytes);
     let level_count = level_set
         .level_count()
@@ -283,8 +320,10 @@ fn run(level_bytes: &[u8], initial_level: usize, steps_per_second: u32) -> Resul
     let profile_path = player_profile_path()?;
     let mut players = PlayerBook::load(&profile_path, level_count)
         .map_err(|error| format!("load player profiles: {error}"))?;
+    startup_trace("profiles_loaded");
     let text_input = video.text_input();
     let mut menu_level = initial_level;
+    startup_trace("main_menu_entered");
     loop {
         let level_number = match show_main_menu(
             &mut canvas,
@@ -434,12 +473,12 @@ fn play_level(
             match event {
                 Event::Quit { .. } => return Ok(GameOutcome::Quit),
                 Event::KeyDown {
-                    scancode: Some(Scancode::Escape),
+                    scancode: Some(Scancode::Escape | Scancode::LCtrl),
                     repeat: false,
                     ..
                 } => destroy_murphy = true,
                 Event::KeyDown {
-                    scancode: Some(Scancode::R),
+                    scancode: Some(Scancode::R | Scancode::LShift),
                     repeat: false,
                     ..
                 } => {
@@ -455,7 +494,7 @@ fn play_level(
                     previous = frame_started;
                 }
                 Event::KeyDown {
-                    scancode: Some(Scancode::M),
+                    scancode: Some(Scancode::M | Scancode::Tab),
                     repeat: false,
                     ..
                 } => {
@@ -467,7 +506,7 @@ fn play_level(
                     }
                 }
                 Event::KeyDown {
-                    scancode: Some(Scancode::S),
+                    scancode: Some(Scancode::S | Scancode::Backspace),
                     repeat: false,
                     ..
                 } => {
@@ -495,7 +534,8 @@ fn play_level(
             let keyboard = event_pump.keyboard_state();
             let input = Input {
                 direction: keyboard_direction(&keyboard),
-                action: keyboard.is_scancode_pressed(Scancode::Space),
+                action: keyboard.is_scancode_pressed(Scancode::Space)
+                    || keyboard.is_scancode_pressed(Scancode::LAlt),
             };
             game.tick(input);
             if game.status() == GameStatus::Completed && completion_tick.is_none() {
@@ -839,7 +879,7 @@ fn show_main_menu(
                         return Ok(MenuOutcome::Quit);
                     }
                     Event::KeyDown {
-                        scancode: Some(Scancode::Escape),
+                        scancode: Some(Scancode::Escape | Scancode::LCtrl),
                         repeat: false,
                         ..
                     } => {
@@ -896,7 +936,7 @@ fn show_main_menu(
             match event {
                 Event::Quit { .. }
                 | Event::KeyDown {
-                    scancode: Some(Scancode::Escape),
+                    scancode: Some(Scancode::Escape | Scancode::LCtrl),
                     repeat: false,
                     ..
                 } => return Ok(MenuOutcome::Quit),
@@ -909,11 +949,11 @@ fn show_main_menu(
                     ..
                 } => selection.move_by(1),
                 Event::KeyDown {
-                    scancode: Some(Scancode::PageUp),
+                    scancode: Some(Scancode::PageUp | Scancode::Tab),
                     ..
                 } => selection.move_by(-10),
                 Event::KeyDown {
-                    scancode: Some(Scancode::PageDown),
+                    scancode: Some(Scancode::PageDown | Scancode::Backspace),
                     ..
                 } => selection.move_by(10),
                 Event::KeyDown {
@@ -927,7 +967,8 @@ fn show_main_menu(
                     ..
                 } => selection.select_last(),
                 Event::KeyDown {
-                    scancode: Some(Scancode::Return | Scancode::KpEnter | Scancode::Space),
+                    scancode:
+                        Some(Scancode::Return | Scancode::KpEnter | Scancode::Space | Scancode::LAlt),
                     repeat: false,
                     ..
                 } => requested_action = Some(MainMenuTarget::Ok),
@@ -963,6 +1004,11 @@ fn show_main_menu(
                 } => requested_action = Some(MainMenuTarget::Demo),
                 Event::KeyDown {
                     scancode: Some(Scancode::C),
+                    repeat: false,
+                    ..
+                } => requested_action = Some(MainMenuTarget::Controls),
+                Event::KeyDown {
+                    scancode: Some(Scancode::LShift),
                     repeat: false,
                     ..
                 } => requested_action = Some(MainMenuTarget::Controls),
@@ -1291,7 +1337,7 @@ fn fade_menu_to_black(
                 event,
                 Event::Quit { .. }
                     | Event::KeyDown {
-                        scancode: Some(Scancode::Escape),
+                        scancode: Some(Scancode::Escape | Scancode::LCtrl),
                         repeat: false,
                         ..
                     }
@@ -1655,7 +1701,7 @@ fn show_controls_screen(
             match event {
                 Event::Quit { .. } => return Ok(false),
                 Event::KeyDown {
-                    scancode: Some(Scancode::Escape),
+                    scancode: Some(Scancode::Escape | Scancode::LCtrl),
                     repeat: false,
                     ..
                 } => leave = true,

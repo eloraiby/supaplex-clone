@@ -1,0 +1,4 @@
+title=Supaplex
+description=Original Supaplex puzzle game
+exec=/mnt/games/supaplex/run.dge
+icon=/mnt/games/supaplex/icon.png

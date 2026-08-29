@@ -13,7 +13,10 @@ pub const ORIGINAL_FADE_DURATION: Duration = Duration::from_millis(64 * 1_000 / 
 const SPLASH_HOLD_DURATION: Duration = Duration::from_millis(1_000);
 
 /// Integer enlargement used for every original 320×200 front-end screen.
+#[cfg(not(any(feature = "pocketgo", target_env = "uclibc")))]
 const ORIGINAL_SCREEN_SCALE: i32 = 3;
+#[cfg(any(feature = "pocketgo", target_env = "uclibc"))]
+const ORIGINAL_SCREEN_SCALE: i32 = 1;
 
 /// Logical top edge of the centered 600-pixel-high original screen.
 const ORIGINAL_SCREEN_Y: i32 = 20;
@@ -492,8 +495,8 @@ mod tests {
 
     use super::{
         ControlsTarget, MainMenuTarget, MenuSelection, ORIGINAL_FADE_DURATION,
-        SPLASH_HOLD_DURATION, SplashFrame, controls_target_at, fade_in_opacity, fade_out_opacity,
-        main_menu_target_at, splash_frame,
+        ORIGINAL_SCREEN_SCALE, ORIGINAL_SCREEN_Y, SPLASH_HOLD_DURATION, SplashFrame,
+        controls_target_at, fade_in_opacity, fade_out_opacity, main_menu_target_at, splash_frame,
     };
     use std::time::Duration;
 
@@ -594,29 +597,52 @@ mod tests {
     /// Confirms centered logical coordinates reach representative menu regions.
     #[test]
     fn main_menu_hit_testing_accounts_for_scale_and_letterbox() {
+        let scale = ORIGINAL_SCREEN_SCALE;
         assert_eq!(
-            main_menu_target_at(15, 20 + 18),
+            main_menu_target_at(5 * scale, ORIGINAL_SCREEN_Y + 6 * scale),
             Some(MainMenuTarget::NewPlayer)
         );
-        assert_eq!(main_menu_target_at(300, 20 + 450), Some(MainMenuTarget::Ok));
         assert_eq!(
-            main_menu_target_at(900, 20 + 120),
+            main_menu_target_at(100 * scale, ORIGINAL_SCREEN_Y + 150 * scale),
+            Some(MainMenuTarget::Ok)
+        );
+        assert_eq!(
+            main_menu_target_at(300 * scale, ORIGINAL_SCREEN_Y + 40 * scale),
             Some(MainMenuTarget::Credits)
         );
-        assert_eq!(main_menu_target_at(500, 10), None);
-        assert_eq!(main_menu_target_at(959, 639), None);
+        assert_eq!(
+            main_menu_target_at(100 * scale, ORIGINAL_SCREEN_Y - 1),
+            None
+        );
+        assert_eq!(
+            main_menu_target_at(320 * scale, ORIGINAL_SCREEN_Y + 200 * scale),
+            None
+        );
     }
 
     /// Confirms inclusive source edges and overlapping exit regions remain usable.
     #[test]
     fn controls_hit_testing_preserves_original_edges() {
-        assert_eq!(controls_target_at(36, 20 + 39), Some(ControlsTarget::Adlib));
+        let scale = ORIGINAL_SCREEN_SCALE;
         assert_eq!(
-            controls_target_at(396, 20 + 258),
+            controls_target_at(12 * scale, ORIGINAL_SCREEN_Y + 13 * scale),
+            Some(ControlsTarget::Adlib)
+        );
+        assert_eq!(
+            controls_target_at(132 * scale, ORIGINAL_SCREEN_Y + 86 * scale),
             Some(ControlsTarget::Music)
         );
-        assert_eq!(controls_target_at(0, 20 + 597), Some(ControlsTarget::Exit));
-        assert_eq!(controls_target_at(957, 20), Some(ControlsTarget::Exit));
-        assert_eq!(controls_target_at(330, 20 + 300), None);
+        assert_eq!(
+            controls_target_at(0, ORIGINAL_SCREEN_Y + 199 * scale),
+            Some(ControlsTarget::Exit)
+        );
+        assert_eq!(
+            controls_target_at(319 * scale, ORIGINAL_SCREEN_Y),
+            Some(ControlsTarget::Exit)
+        );
+        assert_eq!(
+            controls_target_at(110 * scale, ORIGINAL_SCREEN_Y + 100 * scale),
+            None
+        );
     }
 }

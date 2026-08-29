@@ -2,6 +2,7 @@
 
 use std::{error::Error, fmt, io::Cursor};
 
+use crate::platform as sdl2;
 use sdl2::{
     pixels::{Color, PixelFormatEnum},
     rect::Rect,
@@ -24,20 +25,32 @@ use crate::{
     murphy_animation::{SourcePoint, SpritePart, sprite_parts},
 };
 
-/// Logical width used by the resizable SDL window.
+/// Logical width used by the active display backend.
+#[cfg(not(any(feature = "pocketgo", target_env = "uclibc")))]
 pub const LOGICAL_WIDTH: u32 = 960;
+#[cfg(any(feature = "pocketgo", target_env = "uclibc"))]
+pub const LOGICAL_WIDTH: u32 = 320;
 
-/// Logical height used by the resizable SDL window.
+/// Logical height used by the active display backend.
+#[cfg(not(any(feature = "pocketgo", target_env = "uclibc")))]
 pub const LOGICAL_HEIGHT: u32 = 640;
+#[cfg(any(feature = "pocketgo", target_env = "uclibc"))]
+pub const LOGICAL_HEIGHT: u32 = 240;
 
-/// Three-times-scaled height of the original 320×24 status panel.
+/// Displayed height of the original 320×24 status panel.
+#[cfg(not(any(feature = "pocketgo", target_env = "uclibc")))]
 const HUD_HEIGHT: u32 = 72;
+#[cfg(any(feature = "pocketgo", target_env = "uclibc"))]
+const HUD_HEIGHT: u32 = 24;
 
 /// Height of the scrolling board viewport above the HUD.
 const VIEW_HEIGHT: u32 = LOGICAL_HEIGHT - HUD_HEIGHT;
 
 /// Displayed width and height of one board cell.
+#[cfg(not(any(feature = "pocketgo", target_env = "uclibc")))]
 const TILE_SIZE: u32 = 32;
+#[cfg(any(feature = "pocketgo", target_env = "uclibc"))]
+const TILE_SIZE: u32 = 16;
 
 /// Source width and height of one tile in the original fixed strip.
 const FIXED_TILE_SIZE: u32 = 16;
@@ -49,7 +62,10 @@ const FIXED_TILE_COUNT: u8 = 40;
 const FONT_CELL_SIZE: u32 = 8;
 
 /// Integer scale used to keep HUD lettering crisp and legible.
+#[cfg(not(any(feature = "pocketgo", target_env = "uclibc")))]
 const FONT_SCALE: u32 = 2;
+#[cfg(any(feature = "pocketgo", target_env = "uclibc"))]
+const FONT_SCALE: u32 = 1;
 
 /// Integer enlargement used for original 320-pixel-wide screen coordinates.
 const ORIGINAL_SCREEN_SCALE: u32 = LOGICAL_WIDTH / 320;
@@ -136,8 +152,11 @@ pub struct MenuDisplay<'text> {
     pub hovered: Option<MainMenuTarget>,
 }
 
-/// Integer enlargement from original 16-pixel tiles to the 32-pixel board.
+/// Integer enlargement from original 16-pixel tiles to the displayed board.
+#[cfg(not(any(feature = "pocketgo", target_env = "uclibc")))]
 const MOVING_SCALE: u32 = 2;
+#[cfg(any(feature = "pocketgo", target_env = "uclibc"))]
+const MOVING_SCALE: u32 = 1;
 
 /// Display-space distance Murphy advances during one original movement update.
 const MURPHY_STEP: i32 = 2 * MOVING_SCALE as i32;
@@ -984,20 +1003,30 @@ impl<'textures> Renderer<'textures> {
         canvas: &mut Canvas<Window>,
         status: GameStatus,
     ) -> Result<(), RenderError> {
+        #[cfg(not(any(feature = "pocketgo", target_env = "uclibc")))]
+        let restart_key = "R";
+        #[cfg(any(feature = "pocketgo", target_env = "uclibc"))]
+        let restart_key = "X";
         let (message, color) = match status {
             GameStatus::Playing => return Ok(()),
-            GameStatus::Completed => ("LEVEL COMPLETE - PRESS R", Color::RGB(80, 255, 120)),
-            GameStatus::Dead => ("MURPHY DESTROYED - PRESS R", Color::RGB(255, 90, 70)),
+            GameStatus::Completed => (
+                format!("LEVEL COMPLETE - PRESS {restart_key}"),
+                Color::RGB(80, 255, 120),
+            ),
+            GameStatus::Dead => (
+                format!("MURPHY DESTROYED - PRESS {restart_key}"),
+                Color::RGB(255, 90, 70),
+            ),
         };
 
-        let width = text_width(message) + 32;
+        let width = text_width(&message) + 32;
         let x = (LOGICAL_WIDTH.saturating_sub(width) / 2) as i32;
         let y = (VIEW_HEIGHT / 2).saturating_sub(24) as i32;
         canvas.set_draw_color(Color::RGB(20, 20, 24));
         canvas
             .fill_rect(Rect::new(x, y, width, 48))
             .map_err(RenderError::Sdl)?;
-        self.draw_text(canvas, message, x + 16, y + 16, color)
+        self.draw_text(canvas, &message, x + 16, y + 16, color)
     }
 
     /// Draws supported ASCII text from the 64-glyph `CHARS8.DAT` strip.
@@ -1753,7 +1782,7 @@ mod tests {
     //! Pure mapping and decoding tests that do not initialize SDL video.
 
     use super::{
-        BlackPixelPolicy, FIXED_TILE_COUNT, FIXED_TILE_SIZE, SourcePoint,
+        BlackPixelPolicy, FIXED_TILE_COUNT, FIXED_TILE_SIZE, MOVING_SCALE, SourcePoint,
         animated_cell_sprite_part, apply_black_pixel_policy, decode_png, electron_sprite_part,
         fixed_tile_source, gravity_sprite_part, murphy_movement_offset, snik_snak_sprite_part,
         terminal_source_row,
@@ -1910,19 +1939,26 @@ mod tests {
         let completed_world_x = 5 * tile + murphy_movement_offset(movement, 7).0;
         let next_started_world_x = 6 * tile + murphy_movement_offset(movement, 0).0;
 
-        assert_eq!(murphy_movement_offset(movement, 0), (-28, 0));
+        assert_eq!(
+            murphy_movement_offset(movement, 0),
+            (-14 * MOVING_SCALE as i32, 0)
+        );
         assert_eq!(murphy_movement_offset(movement, 7), (0, 0));
-        assert_eq!(next_started_world_x - completed_world_x, 4);
+        assert_eq!(
+            next_started_world_x - completed_world_x,
+            2 * MOVING_SCALE as i32
+        );
     }
 
     /// Confirms every cardinal move uses the original two-pixel unscaled velocity.
     #[test]
     fn murphy_move_camera_offsets_advance_four_display_pixels_per_update() {
+        let distance = 14 * MOVING_SCALE as i32;
         let cases = [
-            (Direction::Up, (0, 28), (0, 0)),
-            (Direction::Right, (-28, 0), (0, 0)),
-            (Direction::Down, (0, -28), (0, 0)),
-            (Direction::Left, (28, 0), (0, 0)),
+            (Direction::Up, (0, distance), (0, 0)),
+            (Direction::Right, (-distance, 0), (0, 0)),
+            (Direction::Down, (0, -distance), (0, 0)),
+            (Direction::Left, (distance, 0), (0, 0)),
         ];
 
         for (direction, first, last) in cases {
@@ -1948,10 +1984,11 @@ mod tests {
             direction: Direction::Down,
         };
 
-        assert_eq!(murphy_movement_offset(push, 0), (-4, 0));
-        assert_eq!(murphy_movement_offset(push, 7), (-32, 0));
-        assert_eq!(murphy_movement_offset(port, 0), (0, 8));
-        assert_eq!(murphy_movement_offset(port, 7), (0, 64));
+        let scale = MOVING_SCALE as i32;
+        assert_eq!(murphy_movement_offset(push, 0), (-2 * scale, 0));
+        assert_eq!(murphy_movement_offset(push, 7), (-16 * scale, 0));
+        assert_eq!(murphy_movement_offset(port, 0), (0, 4 * scale));
+        assert_eq!(murphy_movement_offset(port, 7), (0, 32 * scale));
     }
 
     /// Confirms the ninth rightward Red Disk picture does not overshoot its destination.

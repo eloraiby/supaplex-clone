@@ -1,10 +1,12 @@
 # Supaplex clone
 
-This project plays the 111 original Supaplex levels in SDL2. It opens with the
+This project plays the 111 original Supaplex levels. It opens with the
 original title and main-menu artwork, loads the DOS `LEVELS.DAT`, simulates
 actor-owned animation and behavior, and renders pixel-perfect conversions of
-the original graphics with nearest-neighbor scaling. The original AdLib music
-and Sound Blaster gameplay effects play through a self-contained SDL mixer.
+the original graphics with nearest-neighbor scaling. Desktop builds use SDL2;
+the original PocketGo uses its Linux framebuffer, evdev keypad, and OSS audio
+device directly. The original AdLib music and Sound Blaster gameplay effects
+play through the same self-contained mixer on both backends.
 
 ## Run a level
 
@@ -46,6 +48,58 @@ executable from elsewhere.
 Player names, completion time, level results, and the selected profile are saved
 under SDL's per-user preference directory. Set `SUPAPLEX_PROFILE_PATH` to an
 exact file path for a portable installation or an isolated test session.
+
+## Original PocketGo build
+
+The PocketGo V1 reports `armv5tejl` and runs MiyooCFW's ARM/uClibc userspace.
+Its build does not link SDL1 or SDL2: it writes 320×240 RGB565 frames directly
+to `/dev/fb0`, reads the Miyoo kernel keyboard from `/dev/input/event*` when
+evdev is enabled or from the active Linux console in medium-raw mode on the
+original firmware, and streams 44.1 kHz signed 16-bit stereo audio to
+`/dev/dsp`.
+
+Install nightly Rust with its source component, then download and extract the
+[MiyooCFW 1.3.3 toolchain](https://github.com/NxHope/miyoo_dev/releases/download/v1.3.3/toolchain.7z).
+Place the extracted SDK in the project-local `miyoo/` directory. That directory
+is intentionally ignored by Git because the complete SDK is roughly 905 MB.
+`MIYOO_SDK` may still point to another extracted SDK when needed:
+
+```bash
+rustup toolchain install nightly
+rustup component add rust-src --toolchain nightly
+./scripts/build-pocketgo.sh
+```
+
+The script produces `target/supaplex-pocketgo.zip`. Extract that archive into
+the root of the SD card's main data partition (mounted as `/mnt` by MiyooCFW),
+then restart GMenu2X. The game appears in the Games section and stores progress
+in `/mnt/games/supaplex/players.dat`.
+
+To install an already-built package onto a main partition mounted on the build
+machine, pass its mount point to the installer (the default is
+`/media/aifu/main`):
+
+```bash
+./scripts/install-pocketgo.sh /path/to/mounted/main
+```
+
+The GMenu2X entry uses `run.dge`, a small diagnostic wrapper consistent with
+other MiyooCFW games. It records loader/device checks, startup milestones, and
+the process exit status in `/mnt/games/supaplex/supaplex.log`. The PocketGo
+backend still resolves `players.dat` beside the executable without relying on
+the wrapper environment.
+
+PocketGo controls:
+
+- D-pad: move or choose a menu row.
+- A or Y: action; hold with a direction to snap, or press alone to plant a Red Disk.
+- A or Start: confirm the selected level.
+- B or Select: explode Murphy in-game; return/quit in menus.
+- X: restart the current level; open Controls from the main menu.
+- L1/R1: move ten levels in the menu; toggle music/effects during play.
+
+The `pocketgo` Cargo feature can also compile-check this backend on a desktop
+without opening the devices: `cargo check --features pocketgo`.
 
 Controls:
 

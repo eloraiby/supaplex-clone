@@ -7,10 +7,14 @@ default-run = "supaplex-clone"
 [features]
 default = []
 unbundle = []
+pocketgo = []
 
 [dependencies]
+libc = "0.2.175"
 oplon = "1.0.0"
 png = "0.18.1"
+
+[target.'cfg(not(target_env = "uclibc"))'.dependencies]
 sdl2 = "0.38.0"
 
 [profile.release]

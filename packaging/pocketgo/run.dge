@@ -1,0 +1,34 @@
+#!/bin/sh
+
+game_dir=/mnt/games/supaplex
+binary="$game_dir/supaplex-clone"
+log="$game_dir/supaplex.log"
+
+{
+    echo
+    echo "=== Supaplex launch: $(date) ==="
+    echo "launcher_started=1"
+    echo "initial_cwd=$(pwd)"
+    uname -a
+    ls -l "$binary" /lib/ld-uClibc.so.0 /lib/libc.so.0 /lib/libgcc_s.so.1
+    ls -l /dev/fb0 /dev/dsp /dev/miyoo_kbd /dev/tty /dev/tty0
+    ls -l /dev/input/event* 2>/dev/null
+    cat /proc/bus/input/devices 2>/dev/null
+} >>"$log" 2>&1
+
+cd "$game_dir" || {
+    echo "launcher_error=cannot enter $game_dir" >>"$log"
+    sync
+    exit 125
+}
+
+export RUST_BACKTRACE=1
+"$binary" "$@" >>"$log" 2>&1
+status=$?
+
+{
+    echo "exit_status=$status"
+    echo "=== Supaplex stopped ==="
+} >>"$log" 2>&1
+sync
+exit "$status"

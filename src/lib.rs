@@ -1,7 +1,8 @@
-//! Core library for the SDL2 Supaplex clone.
+//! Core library for the Supaplex clone.
 //!
 //! Platform-independent parsing and simulation live in the library so they can
-//! be tested without opening a window. The binary is a thin SDL2 adapter.
+//! be tested without opening a window. The binary uses SDL2 on desktops and a
+//! direct Linux framebuffer/input/audio backend on the original PocketGo.
 
 pub mod actor;
 pub mod assets;
@@ -13,5 +14,6 @@ pub mod game;
 pub mod level;
 mod murphy_animation;
 mod opl;
+pub mod platform;
 pub mod profiles;
 pub mod render;

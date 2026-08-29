@@ -10,6 +10,7 @@ use std::sync::{
     atomic::{AtomicBool, AtomicU8, Ordering},
 };
 
+use crate::platform as sdl2;
 use sdl2::{
     AudioSubsystem,
     audio::{AudioCallback, AudioDevice, AudioSpec, AudioSpecDesired},
@@ -974,7 +975,7 @@ mod tests {
         // obtained layout; the tests construct the desired layout directly.
         let spec = AudioSpec {
             freq: OUTPUT_FREQUENCY,
-            format: sdl2::audio::AudioFormat::f32_sys(),
+            format: crate::platform::audio::AudioFormat::f32_sys(),
             channels: OUTPUT_CHANNELS,
             silence: 0,
             samples: 512,
