@@ -17,8 +17,8 @@ pub const FIRST_STEP_RATE: u32 = 5;
 /// Fastest supported simulation rate in fixed updates per second.
 pub const LAST_STEP_RATE: u32 = 60;
 
-/// Original Supaplex and SpeedFix simulation rate used when `--step` is omitted.
-pub const DEFAULT_STEP_RATE: u32 = 35;
+/// Simulation rate used when `--step` is omitted.
+pub const DEFAULT_STEP_RATE: u32 = 50;
 
 /// Validated options needed to initialize the front end.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -33,7 +33,7 @@ impl Options {
     /// Parses optional `--level` and `--step` argument pairs.
     ///
     /// The level selector defaults to level one and merely chooses the initial
-    /// main-menu row, while `--step` defaults to the original 35 updates per
+    /// main-menu row, while `--step` defaults to 50 updates per
     /// second. Pairs may appear in either order. A deliberately small parser
     /// keeps startup dependencies light and every rejection deterministic.
     pub fn parse<I, S>(arguments: I) -> Result<Self, OptionsError>

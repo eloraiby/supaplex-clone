@@ -26,7 +26,6 @@ cd "$game_dir" || {
     exit 125
 }
 
-export RUST_BACKTRACE=1
 "$binary" "$@" >>"$log" 2>&1
 status=$?
 

@@ -21,7 +21,7 @@ The optional `--level <1-111>` argument chooses the initially highlighted menu
 row; omitting it starts at level 1. The default executable embeds every runtime
 asset, so it does not depend on the process working directory after it is built.
 The optional `--step <5-60>` argument selects fixed simulation updates per second;
-omitting it preserves the original rate of 35 updates per second.
+omitting it uses 50 updates per second.
 
 ### Unbundled build
 
@@ -70,6 +70,13 @@ rustup toolchain install nightly
 rustup component add rust-src --toolchain nightly
 ./scripts/build-pocketgo.sh
 ```
+
+The handheld build keeps the game code optimized for the ARM926EJ-S while
+rebuilding `std` with size-oriented routines and without its default backtrace
+or panic-unwind features. Panics abort immediately at their call site: they do
+not format a message, demangle symbols, collect a backtrace, run a panic hook,
+or unwind destructors. The build script rejects an output binary that still
+contains the backtrace runtime and prints the final executable size.
 
 The script produces `target/supaplex-pocketgo.zip`. Extract that archive into
 the root of the SD card's main data partition (mounted as `/mnt` by MiyooCFW),

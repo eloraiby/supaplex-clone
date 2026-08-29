@@ -1989,12 +1989,12 @@ mod tests {
     use super::simulation_step;
     use supaplex_clone::cli::{DEFAULT_STEP_RATE, FIRST_STEP_RATE, LAST_STEP_RATE};
 
-    /// Confirms the omitted-option default retains the historical 35-Hz duration.
+    /// Confirms the omitted-option default uses the configured 50-Hz duration.
     #[test]
-    fn default_step_rate_preserves_original_timing() {
+    fn default_step_rate_uses_configured_timing() {
         let duration = simulation_step(DEFAULT_STEP_RATE);
 
-        assert_eq!(duration, Duration::from_nanos(1_000_000_000 / 35));
+        assert_eq!(duration, Duration::from_nanos(1_000_000_000 / 50));
     }
 
     /// Confirms both validated custom endpoints use the requested rate divisor.
