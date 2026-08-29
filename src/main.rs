@@ -39,6 +39,21 @@ const RENDER_INTERVAL: Duration = Duration::from_nanos(1_000_000_000 / 35);
 /// Optional exact player-save path used by portable installs and test sessions.
 const PLAYER_PROFILE_PATH_ENVIRONMENT_VARIABLE: &str = "SUPAPLEX_PROFILE_PATH";
 
+/// Browser-mounted persistent directory populated from IndexedDB before main.
+#[cfg(target_os = "emscripten")]
+const BROWSER_PROFILE_PATH: &str = "/supaplex/players.dat";
+
+// Asyncify-aware browser functions supplied by Emscripten's JavaScript runtime.
+#[cfg(target_os = "emscripten")]
+unsafe extern "C" {
+    fn emscripten_sleep(milliseconds: u32);
+    fn emscripten_run_script(script: *const std::ffi::c_char);
+}
+
+/// JavaScript call that schedules a non-overlapping IDBFS persistence pass.
+#[cfg(target_os = "emscripten")]
+const BROWSER_PROFILE_SYNC_SCRIPT: &[u8] = b"Module.persistProfiles();\0";
+
 /// One decoded level-list row retained between main-menu frames.
 #[derive(Clone, Debug, Eq, PartialEq)]
 struct MenuLevelRow {
@@ -412,10 +427,19 @@ fn player_profile_path() -> Result<PathBuf, String> {
         return Ok(PathBuf::from(path));
     }
 
+    // The web shell mounts this directory as IDBFS and finishes its initial
+    // synchronization before allowing Rust's `main` to run. Keeping the save
+    // inside that mount makes every ordinary synchronous profile write durable
+    // across browser reloads without changing the platform-neutral file format.
+    #[cfg(target_os = "emscripten")]
+    return Ok(PathBuf::from(BROWSER_PROFILE_PATH));
+
     // SDL otherwise chooses the operating system's per-user preference
     // directory, keeping saves outside both bundled and unbundled asset trees.
+    #[cfg(not(target_os = "emscripten"))]
     let directory = sdl2::filesystem::pref_path("eloraiby", "supaplex-clone")
         .map_err(|error| format!("resolve player profile directory: {error}"))?;
+    #[cfg(not(target_os = "emscripten"))]
     Ok(PathBuf::from(directory).join("players.dat"))
 }
 
@@ -425,7 +449,17 @@ fn save_player_book(players: &PlayerBook, path: &Path) -> Result<(), String> {
     // loss if the process later closes through the window manager.
     players
         .save(path)
-        .map_err(|error| format!("save player profiles: {error}"))
+        .map_err(|error| format!("save player profiles: {error}"))?;
+
+    // IDBFS exposes synchronous in-memory file operations to Rust but commits
+    // them to IndexedDB asynchronously. The shell coalesces overlapping flushes,
+    // so rapid menu actions cannot race two synchronization passes.
+    #[cfg(target_os = "emscripten")]
+    unsafe {
+        emscripten_run_script(BROWSER_PROFILE_SYNC_SCRIPT.as_ptr().cast());
+    }
+
+    Ok(())
 }
 
 /// Plays one selected level through its entry and exit transitions.
@@ -633,9 +667,7 @@ fn play_level(
 
         // Hardware vsync normally consumes most of this interval. The explicit
         // remainder covers software, dummy, remote, and misconfigured backends.
-        if let Some(remaining) = RENDER_INTERVAL.checked_sub(frame_started.elapsed()) {
-            std::thread::sleep(remaining);
-        }
+        limit_render_frame(frame_started);
     }
 }
 
@@ -758,9 +790,7 @@ fn play_demo(
             return Ok(DemoOutcome::Menu(status));
         }
 
-        if let Some(remaining) = RENDER_INTERVAL.checked_sub(frame_started.elapsed()) {
-            std::thread::sleep(remaining);
-        }
+        limit_render_frame(frame_started);
     }
 }
 
@@ -832,9 +862,7 @@ fn fade_game(
 
         // A stable frame cap keeps the duration wall-clock based and prevents a
         // non-vsync renderer from consuming a core during the palette effect.
-        if let Some(remaining) = RENDER_INTERVAL.checked_sub(frame_started.elapsed()) {
-            std::thread::sleep(remaining);
-        }
+        limit_render_frame(frame_started);
     }
 }
 
@@ -1321,9 +1349,7 @@ fn show_main_menu(
 
         // Menu animation is limited separately from simulation because no game
         // updates should accumulate while the user browses the level list.
-        if let Some(remaining) = RENDER_INTERVAL.checked_sub(frame_started.elapsed()) {
-            std::thread::sleep(remaining);
-        }
+        limit_render_frame(frame_started);
     }
 }
 
@@ -1375,9 +1401,7 @@ fn fade_menu_to_black(
 
         // Transition sampling follows the shared display cap; opacity itself is
         // derived from elapsed time and therefore does not depend on refresh rate.
-        if let Some(remaining) = RENDER_INTERVAL.checked_sub(frame_started.elapsed()) {
-            std::thread::sleep(remaining);
-        }
+        limit_render_frame(frame_started);
     }
 }
 
@@ -1612,7 +1636,7 @@ fn show_auxiliary_page(
         if reveal_started.elapsed() >= ORIGINAL_FADE_DURATION {
             break;
         }
-        limit_frontend_frame(frame_started);
+        limit_render_frame(frame_started);
     }
 
     loop {
@@ -1634,7 +1658,7 @@ fn show_auxiliary_page(
         if dismissed {
             break;
         }
-        limit_frontend_frame(frame_started);
+        limit_render_frame(frame_started);
     }
 
     // End fully black so the main menu can reveal its restored palette without
@@ -1656,7 +1680,7 @@ fn show_auxiliary_page(
         if hide_started.elapsed() >= ORIGINAL_FADE_DURATION {
             return Ok(true);
         }
-        limit_frontend_frame(frame_started);
+        limit_render_frame(frame_started);
     }
 }
 
@@ -1784,7 +1808,7 @@ fn show_controls_screen(
                 hovered,
             );
         }
-        limit_frontend_frame(frame_started);
+        limit_render_frame(frame_started);
     }
 }
 
@@ -1873,15 +1897,33 @@ fn fade_controls_to_black(
         if started.elapsed() >= ORIGINAL_FADE_DURATION {
             return Ok(true);
         }
-        limit_frontend_frame(frame_started);
+        limit_render_frame(frame_started);
     }
 }
 
-/// Sleeps for the unused portion of one non-gameplay display frame.
-fn limit_frontend_frame(frame_started: Instant) {
+/// Sleeps for the unused portion of one display frame or yields to the browser.
+fn limit_render_frame(frame_started: Instant) {
     // Hardware vsync usually consumes this budget; dummy and software backends
     // receive an explicit cap without affecting wall-clock fade calculations.
-    if let Some(remaining) = RENDER_INTERVAL.checked_sub(frame_started.elapsed()) {
+    let remaining = RENDER_INTERVAL.saturating_sub(frame_started.elapsed());
+
+    // A browser's main thread must return to JavaScript for DOM input, WebAudio,
+    // and canvas presentation to advance. Asyncify turns this synchronous-looking
+    // call into a browser event-loop yield. A zero-millisecond yield remains
+    // necessary after a slow frame, while native targets avoid that extra call.
+    #[cfg(target_os = "emscripten")]
+    unsafe {
+        emscripten_sleep(
+            remaining
+                .as_millis()
+                .min(u128::from(u32::MAX))
+                .try_into()
+                .expect("clamped browser frame delay should fit in u32"),
+        );
+    }
+
+    #[cfg(not(target_os = "emscripten"))]
+    if !remaining.is_zero() {
         std::thread::sleep(remaining);
     }
 }
@@ -1955,9 +1997,7 @@ fn show_splash(
 
         // Keep the startup loop responsive without busy-spinning when a render
         // backend accepts the vsync request but does not actually block on it.
-        if let Some(remaining) = RENDER_INTERVAL.checked_sub(frame_started.elapsed()) {
-            std::thread::sleep(remaining);
-        }
+        limit_render_frame(frame_started);
     }
 }
 

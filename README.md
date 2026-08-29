@@ -49,6 +49,36 @@ Player names, completion time, level results, and the selected profile are saved
 under SDL's per-user preference directory. Set `SUPAPLEX_PROFILE_PATH` to an
 exact file path for a portable installation or an isolated test session.
 
+## WebAssembly build
+
+The browser build uses Rust's `wasm32-unknown-emscripten` target and
+Emscripten's SDL2 port. It embeds the same levels, graphics, music, and effects
+as the default desktop executable. Player profiles and level progress are stored
+locally in the browser with IndexedDB.
+
+Install and activate Emscripten 6.0.5, add the Rust target, and build the site:
+
+```bash
+rustup target add wasm32-unknown-emscripten
+source /path/to/emsdk/emsdk_env.sh
+./scripts/build-web.sh
+```
+
+The deployable output is written to `target/web/`. WebAssembly must be served
+over HTTP rather than opened directly from the filesystem. For a local run:
+
+```bash
+python3 -m http.server -d target/web 8000
+```
+
+Then open `http://localhost:8000/`. Click the canvas once to focus keyboard
+input and satisfy browser audio-autoplay rules.
+
+The `Build and deploy WebAssembly` workflow builds the same site after every
+push to `master` and publishes it with GitHub Pages. In the repository's GitHub
+settings, choose **Pages → Build and deployment → Source: GitHub Actions** once;
+no deployment branch or checked-in build output is needed.
+
 ## Original PocketGo build
 
 The PocketGo V1 reports `armv5tejl` and runs MiyooCFW's ARM/uClibc userspace.

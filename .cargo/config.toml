@@ -1,0 +1,9 @@
+[target.wasm32-unknown-emscripten]
+rustflags = [
+    "-C", "link-arg=-sUSE_SDL=2",
+    "-C", "link-arg=-sASYNCIFY=1",
+    "-C", "link-arg=-sASYNCIFY_STACK_SIZE=65536",
+    "-C", "link-arg=-sALLOW_MEMORY_GROWTH=1",
+    "-C", "link-arg=-sENVIRONMENT=web",
+    "-C", "link-arg=-lidbfs.js",
+]

@@ -1,0 +1,247 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <meta name="theme-color" content="#090b18">
+    <title>Supaplex</title>
+    <link rel="icon" href="icon.png" type="image/png">
+    <style>
+      :root {
+        color-scheme: dark;
+        font-family: ui-monospace, "Cascadia Code", "SFMono-Regular", Consolas, monospace;
+        background: #090b18;
+        color: #edf3ff;
+      }
+
+      * {
+        box-sizing: border-box;
+      }
+
+      body {
+        min-height: 100vh;
+        margin: 0;
+        display: grid;
+        place-items: center;
+        overflow-x: hidden;
+        background:
+          radial-gradient(circle at 50% 25%, rgb(51 38 99 / 48%), transparent 38rem),
+          linear-gradient(180deg, #131629 0%, #090b18 65%);
+      }
+
+      main {
+        width: min(100%, 68rem);
+        padding: clamp(1rem, 3vw, 2.5rem);
+      }
+
+      header {
+        display: flex;
+        align-items: end;
+        justify-content: space-between;
+        gap: 1rem;
+        margin-bottom: 0.8rem;
+      }
+
+      h1 {
+        margin: 0;
+        color: #fff;
+        font-size: clamp(1.2rem, 3vw, 1.75rem);
+        letter-spacing: 0.12em;
+        text-transform: uppercase;
+        text-shadow: 0 0 1rem rgb(225 37 101 / 45%);
+      }
+
+      button {
+        appearance: none;
+        border: 1px solid #7886af;
+        border-radius: 0.3rem;
+        padding: 0.5rem 0.8rem;
+        background: #1b2140;
+        color: #edf3ff;
+        font: inherit;
+        cursor: pointer;
+      }
+
+      button:hover,
+      button:focus-visible {
+        border-color: #e66a95;
+        outline: none;
+        background: #292750;
+      }
+
+      .game-frame {
+        position: relative;
+        width: 100%;
+        aspect-ratio: 3 / 2;
+        overflow: hidden;
+        border: 1px solid #3b456d;
+        border-radius: 0.45rem;
+        background: #000;
+        box-shadow: 0 1.2rem 4rem rgb(0 0 0 / 55%), 0 0 2rem rgb(91 63 159 / 20%);
+      }
+
+      canvas {
+        display: block;
+        width: 100%;
+        height: 100%;
+        outline: none;
+        image-rendering: pixelated;
+        image-rendering: crisp-edges;
+      }
+
+      canvas:focus-visible {
+        box-shadow: inset 0 0 0 2px #e66a95;
+      }
+
+      canvas:fullscreen {
+        width: 100vw;
+        height: 100vh;
+        object-fit: contain;
+        background: #000;
+      }
+
+      #status {
+        position: absolute;
+        inset: 0;
+        display: grid;
+        place-items: center;
+        padding: 2rem;
+        background: #090b18;
+        color: #bec8e7;
+        text-align: center;
+        transition: opacity 180ms ease;
+        pointer-events: none;
+      }
+
+      #status.ready {
+        opacity: 0;
+      }
+
+      .help {
+        display: flex;
+        justify-content: space-between;
+        gap: 1rem 2rem;
+        margin-top: 0.9rem;
+        color: #9ba6c9;
+        font-size: clamp(0.72rem, 2vw, 0.88rem);
+        line-height: 1.5;
+      }
+
+      .help p {
+        margin: 0;
+      }
+
+      kbd {
+        color: #f0b3c7;
+        font: inherit;
+      }
+
+      @media (max-width: 42rem) {
+        header,
+        .help {
+          align-items: stretch;
+          flex-direction: column;
+        }
+
+        button {
+          align-self: start;
+        }
+      }
+    </style>
+  </head>
+  <body>
+    <main>
+      <header>
+        <h1>Supaplex</h1>
+        <button id="fullscreen" type="button">Fullscreen</button>
+      </header>
+      <div class="game-frame">
+        <canvas id="canvas" tabindex="0" oncontextmenu="event.preventDefault()"></canvas>
+        <div id="status" role="status" aria-live="polite">Loading WebAssembly…</div>
+      </div>
+      <div class="help">
+        <p><kbd>Arrows</kbd> move · <kbd>Space</kbd> snap/action · <kbd>R</kbd> restart · <kbd>Esc</kbd> exit</p>
+        <p>Click the game once to enable keyboard input and audio. Progress is saved in this browser.</p>
+      </div>
+    </main>
+
+    <script>
+      const canvas = document.getElementById("canvas");
+      const status = document.getElementById("status");
+      const fullscreen = document.getElementById("fullscreen");
+      const blockedKeys = new Set(["ArrowUp", "ArrowDown", "ArrowLeft", "ArrowRight", "Space"]);
+
+      document.addEventListener("keydown", (event) => {
+        if (blockedKeys.has(event.code)) {
+          event.preventDefault();
+        }
+      }, { passive: false });
+
+      canvas.addEventListener("pointerdown", () => canvas.focus());
+      fullscreen.addEventListener("click", async () => {
+        try {
+          await canvas.requestFullscreen();
+          canvas.focus();
+        } catch (error) {
+          console.error("Could not enter fullscreen", error);
+        }
+      });
+
+      var Module = {
+        canvas,
+        profileSyncing: false,
+        profileSyncPending: false,
+        preRun: [function () {
+          FS.mkdir("/supaplex");
+          FS.mount(IDBFS, {}, "/supaplex");
+          addRunDependency("supaplex-profile-load");
+          FS.syncfs(true, function (error) {
+            if (error) {
+              console.error("Could not load saved Supaplex profiles", error);
+            }
+            removeRunDependency("supaplex-profile-load");
+          });
+        }],
+        persistProfiles: function () {
+          if (Module.profileSyncing) {
+            Module.profileSyncPending = true;
+            return;
+          }
+          Module.profileSyncing = true;
+          FS.syncfs(false, function (error) {
+            Module.profileSyncing = false;
+            if (error) {
+              console.error("Could not persist Supaplex profiles", error);
+            }
+            if (Module.profileSyncPending) {
+              Module.profileSyncPending = false;
+              Module.persistProfiles();
+            }
+          });
+        },
+        printErr: function (message) {
+          console.error(message);
+        },
+        setStatus: function (message) {
+          if (message) {
+            status.textContent = message;
+            status.classList.remove("ready");
+          } else {
+            status.classList.add("ready");
+            canvas.focus();
+          }
+        },
+        onRuntimeInitialized: function () {
+          status.classList.add("ready");
+          canvas.focus();
+        },
+        onAbort: function (reason) {
+          status.textContent = "The game could not start. Open the browser console for details.";
+          status.classList.remove("ready");
+          console.error("Supaplex aborted", reason);
+        }
+      };
+    </script>
+    <script async src="supaplex-clone.js"></script>
+  </body>
+</html>
