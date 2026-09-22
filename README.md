@@ -334,7 +334,9 @@ arbitrary actor/animation pairing. `tests/demo_replay.rs` compares all ten demo
 histories with pre-refactor fixtures over 46,199 input ticks, including every
 cell's sprite timing and collision state, game counters, and emitted sounds.
 These fixtures preserve existing behavior; they do not assert that every legacy
-demo currently completes its level.
+demo currently completes its level. Rendering tests also compare all 182 original
+gravity, enemy, Bug, and explosion rectangles with a pre-refactor fingerprint,
+and check terrain layering and camera interpolation directly from typed phases.
 
 Format and mapping references:
 
