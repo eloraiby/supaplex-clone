@@ -1,8 +1,9 @@
 //! Snik Snak turn cadence, movement reservations, and contact rules.
 
+use super::murphy::murphy_is_crossing_port;
 use super::{
     Actor, Animation, AnimationKind, CellWrite, Direction, EnemyTurn, Position, State, Transition,
-    explode_at, murphy_is_crossing_port,
+    explode_at,
 };
 use crate::game::WorldView;
 
@@ -37,12 +38,12 @@ impl SnikSnak {
             return None;
         }
 
-        let AnimationKind::SnikSnakTurn(turn) = state.animation.kind else {
+        let AnimationKind::SnikSnakTurn(turn) = state.animation().kind() else {
             // Transfers are handled by the generic finite-animation path. This
             // fallback makes an internally malformed idle Snik Snak recover to
             // the correct left-turn cycle without inventing an instant step.
             debug_assert!(
-                matches!(state.animation.kind, AnimationKind::Idle),
+                matches!(state.animation().kind(), AnimationKind::Idle),
                 "Snik Snak decisions require a turn animation"
             );
             return Some(Transition::replace(
@@ -60,7 +61,7 @@ impl SnikSnak {
         if world.tick_count().is_multiple_of(4) {
             // The original draws the current turn picture and then increments
             // its low three state bits, wrapping within the selected cycle.
-            let next_frame = (state.animation.frame + 1) & 7;
+            let next_frame = (state.animation().frame() + 1) & 7;
             return Some(Transition::replace(
                 position,
                 State::animated(
@@ -74,7 +75,7 @@ impl SnikSnak {
             return None;
         }
 
-        let direction = turn.direction_at_frame(state.animation.frame)?;
+        let direction = turn.direction_at_frame(state.animation().frame())?;
         let destination = world.offset(position, direction)?;
         if world.is_empty(destination) {
             return Some(Transition::move_snik_snak(
@@ -99,7 +100,7 @@ impl SnikSnak {
         state: &State,
         world: &WorldView<'_>,
     ) -> Transition {
-        debug_assert_eq!(state.animation.frame, 6);
+        debug_assert_eq!(state.animation().frame(), 6);
         let mut writes = vec![CellWrite::new(
             position,
             State::animated(
@@ -111,7 +112,7 @@ impl SnikSnak {
         if let Some(source) = world.offset(position, direction.opposite())
             && world.state(source).is_some_and(|source_state| {
                 matches!(source_state.actor(), Actor::Empty(_))
-                    && source_state.animation.kind == AnimationKind::SnikSnakVacating(direction)
+                    && source_state.animation().kind() == AnimationKind::SnikSnakVacating(direction)
             })
         {
             // A blast may already have replaced the reservation. As in the DOS

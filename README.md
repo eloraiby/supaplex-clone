@@ -184,7 +184,29 @@ Concrete actors live in `src/actors/` (`murphy.rs`, `zonk.rs`, `infotron.rs`,
 `snik_snak.rs`, and one file for each other actor). Each file owns its actor's
 private data and behavior; `explosion.rs` also owns blast propagation and
 reservation cleanup. Public actor types are re-exported by `actors.rs`, so
-callers need not depend on the file layout.
+callers need not depend on the file layout. The former `actor` module path has
+been renamed to `actors`.
+
+Shared responsibilities are kept in private support modules:
+
+| File | Responsibility |
+| --- | --- |
+| `actors.rs` | Concrete `Actor` enum, dispatch, and cross-actor completion rules |
+| `actors/geometry.rs` | Board positions and cardinal directions |
+| `actors/enemy.rs` | Shared eight-frame enemy turn mapping |
+| `actors/animation.rs` | Validated animation phases, timing, and typed completion actions |
+| `actors/state.rs` | Complete cell values and reservation constructors |
+| `actors/transition.rs` | Owned atomic cell writes and game-session events |
+
+Actor fields and animation storage stay private. Internal constructors and
+transition entry points are visible only where needed within the actor family;
+rendering and other consumers use read-only queries. Actor callbacks take
+`&self` because they compute owned replacement states from an immutable world
+view. The game applies those transitions with exclusive mutable access to the
+board. This ownership boundary needs no `Any`, downcasting, `Cell`, or `RefCell`.
+State transitions retain concrete enums and `match`-based dispatch. When adding
+an actor, keep its local state and behavior in its own file, wire its variant
+into the coordinator, and leave scheduling and session-wide effects in `game.rs`.
 
 Each `State` combines an `Actor` with a validated `Animation`. `Actor` is an
 enum of concrete actor structs (`Murphy`, `Zonk`, `Infotron`, `Port`, and so on),

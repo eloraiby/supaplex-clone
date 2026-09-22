@@ -37,11 +37,11 @@ impl Electron {
             return None;
         }
 
-        let AnimationKind::ElectronTurn(turn) = state.animation.kind else {
+        let AnimationKind::ElectronTurn(turn) = state.animation().kind() else {
             // A valid transfer is consumed by the finite-animation path before
             // this method runs. Recover only malformed idle state here.
             debug_assert!(
-                matches!(state.animation.kind, AnimationKind::Idle),
+                matches!(state.animation().kind(), AnimationKind::Idle),
                 "Electron decisions require a turn animation"
             );
             return Some(Transition::replace(
@@ -59,7 +59,7 @@ impl Electron {
         if world.tick_count().is_multiple_of(4) {
             // As with the original state byte, retain the selected cycle's high
             // group while its low three bits wrap from seven back to zero.
-            let next_frame = (state.animation.frame + 1) & 7;
+            let next_frame = (state.animation().frame() + 1) & 7;
             return Some(Transition::replace(
                 position,
                 State::animated(
@@ -73,7 +73,7 @@ impl Electron {
             return None;
         }
 
-        let direction = turn.direction_at_frame(state.animation.frame)?;
+        let direction = turn.direction_at_frame(state.animation().frame())?;
         let destination = world.offset(position, direction)?;
         if world.is_empty(destination) {
             return Some(Transition::move_electron(
@@ -100,7 +100,7 @@ impl Electron {
         state: &State,
         world: &WorldView<'_>,
     ) -> Transition {
-        debug_assert_eq!(state.animation.frame, 6);
+        debug_assert_eq!(state.animation().frame(), 6);
         let mut writes = vec![CellWrite::new(
             position,
             State::animated(
@@ -112,7 +112,7 @@ impl Electron {
         if let Some(source) = world.offset(position, direction.opposite())
             && world.state(source).is_some_and(|source_state| {
                 matches!(source_state.actor(), Actor::Empty(_))
-                    && source_state.animation.kind == AnimationKind::ElectronVacating(direction)
+                    && source_state.animation().kind() == AnimationKind::ElectronVacating(direction)
             })
         {
             // An explosion that reached the old cell wins over movement cleanup

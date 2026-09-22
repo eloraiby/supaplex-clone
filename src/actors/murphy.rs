@@ -264,14 +264,14 @@ impl Murphy {
         let reservations_intact = target_position
             .and_then(|cell| world.state(cell))
             .is_some_and(|state| {
-                state.animation.kind == AnimationKind::MurphyPushTarget
+                state.animation().kind() == AnimationKind::MurphyPushTarget
                     && pushed_actor_matches(state.actor(), target)
             })
             && destination
                 .and_then(|cell| world.state(cell))
                 .is_some_and(|state| {
                     matches!(state.actor(), Actor::Empty(_))
-                        && state.animation.kind == AnimationKind::MurphyDestination
+                        && state.animation().kind() == AnimationKind::MurphyDestination
                 });
         let still_holding = input.direction == Some(direction) && !input.action;
 
@@ -312,7 +312,7 @@ impl Murphy {
         ));
         if let Some(target_position) = target_position.filter(|cell| {
             world.state(*cell).is_some_and(|state| {
-                state.animation.kind == AnimationKind::MurphyPushTarget
+                state.animation().kind() == AnimationKind::MurphyPushTarget
                     && pushed_actor_matches(state.actor(), target)
             })
         }) {
@@ -324,7 +324,7 @@ impl Murphy {
         if let Some(destination) = destination.filter(|cell| {
             world.state(*cell).is_some_and(|state| {
                 matches!(state.actor(), Actor::Empty(_))
-                    && state.animation.kind == AnimationKind::MurphyDestination
+                    && state.animation().kind() == AnimationKind::MurphyDestination
             })
         }) {
             writes.push(CellWrite::new(destination, State::empty()));
@@ -576,7 +576,7 @@ impl Murphy {
             Actor::Electron(_) => Some(explode_at(world, target, true)),
             Actor::Explosion(explosion)
                 if explosion.residue() == ExplosionResidue::Empty
-                    && target_state.animation.frame >= 4 =>
+                    && target_state.animation().frame() >= 4 =>
             {
                 // Regular explosion states four through seven are already
                 // harmless in the DOS collision helper. It erases that cell
@@ -707,7 +707,7 @@ pub(super) fn murphy_is_protected_from_falling_actor(state: &State) -> bool {
         MurphyPhase::PreparingPush { direction, .. } if direction.is_horizontal()
     );
     let animating_horizontal_push = matches!(
-        state.animation.kind,
+        state.animation().kind(),
         AnimationKind::Murphy(MurphyAnimation::Push { direction, .. })
             if direction.is_horizontal()
     );
@@ -720,14 +720,11 @@ pub(super) fn murphy_is_crossing_port(state: &State) -> bool {
     // 0x18 through 0x1b. Those four bytes are precisely the directional port
     // animations represented by this semantic variant.
     matches!(
-        state,
-        State {
-            actor: Actor::Murphy(_),
-            animation: Animation {
-                kind: AnimationKind::Murphy(MurphyAnimation::Port { .. }),
-                ..
-            },
-        }
+        (state.actor(), state.animation().kind()),
+        (
+            Actor::Murphy(_),
+            AnimationKind::Murphy(MurphyAnimation::Port { .. })
+        )
     )
 }
 

@@ -64,7 +64,7 @@ fn rounded_actor_reservation(
         return None;
     }
 
-    let (reservation, expected_kind) = match state.animation.kind {
+    let (reservation, expected_kind) = match state.animation().kind() {
         AnimationKind::Moving(Direction::Down) => (
             world.offset(position, Direction::Up)?,
             AnimationKind::Vacating(Direction::Down),
@@ -84,7 +84,7 @@ fn rounded_actor_reservation(
         .state(reservation)
         .is_some_and(|reservation_state| {
             matches!(reservation_state.actor(), Actor::Empty(_))
-                && reservation_state.animation.kind == expected_kind
+                && reservation_state.animation().kind() == expected_kind
         })
         .then_some(reservation)
 }
