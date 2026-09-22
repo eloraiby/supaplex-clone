@@ -178,6 +178,9 @@ conversion is:
 index = width * y + x
 ```
 
+The public `actors` module owns actor identities, behavior, and animation state.
+Simulation and rendering import these types through `supaplex_clone::actors`.
+
 Each `State` combines an `Actor` with a validated `Animation`. `Actor` is an
 enum of concrete actor structs (`Murphy`, `Zonk`, `Infotron`, `Port`, and so on),
 and its dispatch method calls the transition method belonging to that concrete

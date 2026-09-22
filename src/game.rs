@@ -8,7 +8,7 @@ use std::{
 };
 
 use crate::{
-    actor::{
+    actors::{
         Actor, AnimationKind, Base, Bug, CHAIN_REACTION_FRAMES, Direction, Electron, Empty, Exit,
         GameEvent, Hardware, Infotron, InvisibleWall, Murphy, OrangeDisk, Port, PortDirections,
         Position, RED_DISK_DETONATION_COUNTDOWN, RamChip, RamChipShape, RedDisk, SnikSnak, State,
@@ -539,7 +539,7 @@ impl Game {
                 .is_some_and(|state| {
                     matches!(
                         state.animation().kind(),
-                        AnimationKind::Murphy(crate::actor::MurphyAnimation::Exit)
+                        AnimationKind::Murphy(crate::actors::MurphyAnimation::Exit)
                     )
                 });
 
@@ -893,7 +893,7 @@ impl Game {
             self.tick,
             &self.special_ports,
         );
-        crate::actor::explode_at(&world, position, electron)
+        crate::actors::explode_at(&world, position, electron)
     }
 }
 
@@ -1152,7 +1152,7 @@ mod tests {
     //! Focused simulations proving indexing, animation occupancy, and mechanics.
 
     use super::{Board, Game, GameStatus, Input, PlantedRedDisk, SoundEffect};
-    use crate::actor::{
+    use crate::actors::{
         Actor, AnimationKind, Base, Bug, CHAIN_REACTION_FRAMES, Direction, Electron, Empty,
         EnemyTurn, Exit, Explosion, ExplosionResidue, Hardware, Infotron, InvisibleWall, Murphy,
         MurphyAnimation, OrangeDisk, Port, PortDirections, Position, RedDisk, SnikSnak, State,
@@ -1350,7 +1350,7 @@ mod tests {
             destination.animation().kind(),
             AnimationKind::Murphy(MurphyAnimation::Move {
                 direction: Direction::Right,
-                target: crate::actor::MurphyMoveTarget::Empty,
+                target: crate::actors::MurphyMoveTarget::Empty,
                 looking_left: false,
             })
         );
@@ -1370,7 +1370,7 @@ mod tests {
             completed.kind(),
             AnimationKind::Murphy(MurphyAnimation::Move {
                 direction: Direction::Right,
-                target: crate::actor::MurphyMoveTarget::Empty,
+                target: crate::actors::MurphyMoveTarget::Empty,
                 looking_left: false,
             })
         );
@@ -1632,7 +1632,7 @@ mod tests {
                 .kind(),
             AnimationKind::Murphy(MurphyAnimation::Snap {
                 direction: Direction::Right,
-                target: crate::actor::MurphySnapTarget::Infotron,
+                target: crate::actors::MurphySnapTarget::Infotron,
             })
         );
 
@@ -1781,7 +1781,7 @@ mod tests {
                 .kind(),
             AnimationKind::Murphy(MurphyAnimation::Move {
                 direction: Direction::Down,
-                target: crate::actor::MurphyMoveTarget::Infotron,
+                target: crate::actors::MurphyMoveTarget::Infotron,
                 looking_left: false,
             })
         );
@@ -2282,7 +2282,7 @@ mod tests {
             murphy.animation().kind(),
             AnimationKind::Murphy(MurphyAnimation::Move {
                 direction: Direction::Right,
-                target: crate::actor::MurphyMoveTarget::Empty,
+                target: crate::actors::MurphyMoveTarget::Empty,
                 looking_left: false,
             })
         );
@@ -2338,7 +2338,7 @@ mod tests {
             ready.animation().kind(),
             AnimationKind::Murphy(MurphyAnimation::Move {
                 direction: Direction::Down,
-                target: crate::actor::MurphyMoveTarget::Empty,
+                target: crate::actors::MurphyMoveTarget::Empty,
                 looking_left: false,
             })
         );
@@ -2372,7 +2372,7 @@ mod tests {
             moving.kind(),
             AnimationKind::Murphy(MurphyAnimation::Move {
                 direction: Direction::Down,
-                target: crate::actor::MurphyMoveTarget::Empty,
+                target: crate::actors::MurphyMoveTarget::Empty,
                 looking_left: false,
             })
         );
@@ -2428,7 +2428,7 @@ mod tests {
             ready.animation().kind(),
             AnimationKind::Murphy(MurphyAnimation::Move {
                 direction: Direction::Down,
-                target: crate::actor::MurphyMoveTarget::Empty,
+                target: crate::actors::MurphyMoveTarget::Empty,
                 looking_left: false,
             })
         );
@@ -2479,7 +2479,7 @@ mod tests {
             moving.kind(),
             AnimationKind::Murphy(MurphyAnimation::Move {
                 direction: Direction::Right,
-                target: crate::actor::MurphyMoveTarget::Empty,
+                target: crate::actors::MurphyMoveTarget::Empty,
                 looking_left: false,
             })
         );
@@ -2903,7 +2903,7 @@ mod tests {
                 .kind(),
             AnimationKind::Murphy(MurphyAnimation::Move {
                 direction: Direction::Left,
-                target: crate::actor::MurphyMoveTarget::PlantedRedDisk,
+                target: crate::actors::MurphyMoveTarget::PlantedRedDisk,
                 looking_left: true,
             })
         );

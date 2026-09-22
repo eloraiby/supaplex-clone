@@ -14,7 +14,7 @@ use sdl2::{
 };
 use supaplex_clone::platform as sdl2;
 use supaplex_clone::{
-    actor::Direction,
+    actors::Direction,
     assets,
     audio::AudioPlayer,
     cli::{FIRST_STEP_RATE, LAST_STEP_RATE, Options},

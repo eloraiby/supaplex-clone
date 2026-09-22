@@ -13,7 +13,7 @@ use sdl2::{
 };
 
 use crate::{
-    actor::{
+    actors::{
         Actor, AnimationKind, Direction, EnemyTurn, MurphyAnimation, MurphyMoveTarget, Position,
         State,
     },
@@ -1793,7 +1793,7 @@ mod tests {
         terminal_source_row,
     };
     use crate::{
-        actor::{
+        actors::{
             Actor, AnimationKind, Direction, EnemyTurn, Infotron, MurphyAnimation,
             MurphyMoveTarget, MurphyPushTarget, OrangeDisk, Zonk,
         },

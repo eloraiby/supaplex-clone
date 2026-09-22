@@ -6,7 +6,7 @@
 
 use std::{error::Error, fmt};
 
-use crate::{actor::Direction, game::Input};
+use crate::{actors::Direction, game::Input};
 
 /// One decoded run of identical player input.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -236,7 +236,7 @@ mod tests {
     //! Format rejection and exact run-expansion checks.
 
     use super::{Demo, DemoError};
-    use crate::{actor::Direction, assets, game::Input};
+    use crate::{actors::Direction, assets, game::Input};
 
     /// Confirms all ten production files decode with their original level headers.
     #[test]

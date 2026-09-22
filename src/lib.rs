@@ -4,7 +4,7 @@
 //! be tested without opening a window. The binary uses SDL2 on desktops and a
 //! direct Linux framebuffer/input/audio backend on the original PocketGo.
 
-pub mod actor;
+pub mod actors;
 pub mod assets;
 pub mod audio;
 pub mod cli;

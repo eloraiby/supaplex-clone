@@ -7,7 +7,7 @@
 //! vertical left/right poses, target-specific eating, wide push composites,
 //! paired port traversal, and the long Exit disappearance.
 
-use crate::actor::{
+use crate::actors::{
     Direction, MurphyAnimation, MurphyMoveTarget, MurphyPushTarget, MurphySnapTarget,
 };
 
@@ -750,7 +750,7 @@ mod tests {
     //! Descriptor checks for the most error-prone direction and target choices.
 
     use super::{SourcePoint, sprite_parts};
-    use crate::actor::{
+    use crate::actors::{
         Direction, MurphyAnimation, MurphyMoveTarget, MurphyPushTarget, MurphySnapTarget,
     };
 
