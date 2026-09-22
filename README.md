@@ -180,6 +180,11 @@ index = width * y + x
 
 The public `actors` module owns actor identities, behavior, and animation state.
 Simulation and rendering import these types through `supaplex_clone::actors`.
+Concrete actors live in `src/actors/` (`murphy.rs`, `zonk.rs`, `infotron.rs`,
+`snik_snak.rs`, and one file for each other actor). Each file owns its actor's
+private data and behavior; `explosion.rs` also owns blast propagation and
+reservation cleanup. Public actor types are re-exported by `actors.rs`, so
+callers need not depend on the file layout.
 
 Each `State` combines an `Actor` with a validated `Animation`. `Actor` is an
 enum of concrete actor structs (`Murphy`, `Zonk`, `Infotron`, `Port`, and so on),
