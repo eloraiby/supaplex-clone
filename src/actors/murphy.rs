@@ -1,8 +1,8 @@
 //! Player input, hold-sensitive actions, and Murphy animation descriptors.
 
 use super::{
-    Actor, Animation, AnimationKind, CellWrite, Direction, Frame, GameEvent, Horizontal,
-    OrangeDisk, Position, State, Transition, YellowDisk, Zonk, explode_at,
+    Actor, CellWrite, Direction, Frame, GameEvent, Horizontal, OrangeDisk, Position, State,
+    Transition, YellowDisk, Zonk, explode_at,
 };
 use crate::game::SoundEffect;
 use crate::game::WorldView;
@@ -83,7 +83,7 @@ pub enum MurphyAnimation {
 
 impl MurphyAnimation {
     /// Returns the exact number of original updates used by this action.
-    pub(super) const fn frame_count(self) -> u8 {
+    pub const fn frame_count(self) -> u8 {
         match self {
             // The original rightward Red Disk table deliberately contains a
             // duplicated ninth coordinate. Retaining it is demo-compatible.
@@ -487,16 +487,6 @@ impl Murphy {
             MurphyPhase::Exiting(frame) => (MurphyAnimation::Exit, frame.index()),
         };
         Some((action, frame))
-    }
-
-    /// Adapts the actor-specific pose for callers still using the old view API.
-    pub(super) fn animation(self) -> Animation {
-        match self.sprite_pose() {
-            Some((action, frame)) => {
-                Animation::view(AnimationKind::Murphy(action), frame, action.frame_count())
-            }
-            None => Animation::idle(),
-        }
     }
 
     /// Advances one player phase; input-sensitive delays and artwork share one state.

@@ -2,8 +2,7 @@
 
 use super::enemy::EnemyPhase;
 use super::{
-    Actor, Animation, AnimationKind, CellWrite, Direction, EnemyTurn, Frame, Position, State,
-    Transition, explode_at,
+    Actor, CellWrite, Direction, EnemyTurn, Frame, Position, State, Transition, explode_at,
 };
 use crate::game::WorldView;
 
@@ -29,18 +28,6 @@ impl Electron {
         }
         self.phase = phase;
         State::new(Actor::Electron(self))
-    }
-
-    /// Derives the correct enemy sprite strip from its legal phase.
-    pub(super) fn animation(self) -> Animation {
-        match self.phase {
-            EnemyPhase::Turning { turn, frame } => {
-                Animation::view(AnimationKind::ElectronTurn(turn), frame.index(), 8)
-            }
-            EnemyPhase::Moving { direction, frame } => {
-                Animation::view(AnimationKind::ElectronMove(direction), frame.index(), 8)
-            }
-        }
     }
 
     /// Advances only this enemy's phases, honoring global freeze and source cleanup.

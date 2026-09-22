@@ -1,6 +1,6 @@
 //! Unoccupied cells and destination-owned collision reservations.
 
-use super::{Animation, AnimationKind, Direction, Position, Transition};
+use super::{Direction, Position, Transition};
 use crate::game::WorldView;
 
 /// Space or a temporary collision marker owned by a neighboring movement.
@@ -55,29 +55,6 @@ impl SourceDuration {
 }
 
 impl Empty {
-    /// Produces the marker's presentation without giving it autonomous timing.
-    pub(super) fn animation(self) -> Animation {
-        let (kind, count) = match self {
-            Self::Space => return Animation::idle(),
-            Self::Reserved(Reservation::Vacating {
-                direction,
-                duration,
-            }) => (AnimationKind::Vacating(direction), duration.frames()),
-            Self::Reserved(Reservation::SnikSnakSource(direction)) => {
-                (AnimationKind::SnikSnakVacating(direction), 1)
-            }
-            Self::Reserved(Reservation::ElectronSource(direction)) => {
-                (AnimationKind::ElectronVacating(direction), 1)
-            }
-            Self::Reserved(Reservation::MurphyDestination) => (AnimationKind::MurphyDestination, 1),
-            Self::Reserved(Reservation::RoundedSide) => (AnimationKind::RoundedSide, 1),
-            Self::Reserved(Reservation::RoundedDestination) => {
-                (AnimationKind::RoundedDestination, 1)
-            }
-        };
-        Animation::view(kind, 0, count)
-    }
-
     /// Leaves markers unchanged; only their owning movement releases them.
     pub(super) fn transition(
         &self,

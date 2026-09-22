@@ -15,11 +15,6 @@ pub struct Terminal {
 }
 
 impl Terminal {
-    /// Derives the retained screen picture without an independent animation clock.
-    pub(super) fn animation(self) -> super::Animation {
-        super::Animation::view(super::AnimationKind::Terminal, self.screen_frame.index(), 7)
-    }
-
     /// Creates an unused panel ready to choose its first randomized delay.
     pub const fn new() -> Self {
         Self {

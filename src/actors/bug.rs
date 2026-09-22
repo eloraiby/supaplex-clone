@@ -1,8 +1,6 @@
 //! Cadence-gated Bug activity and safe intervals selected by the session RNG.
 
-use super::{
-    Actor, Animation, AnimationKind, CellWrite, Frame, GameEvent, Position, State, Transition,
-};
+use super::{Actor, CellWrite, Frame, GameEvent, Position, State, Transition};
 use crate::game::{SoundEffect, WorldView};
 
 /// A safe interval whose private fields preserve `elapsed < duration`.
@@ -12,6 +10,18 @@ pub struct Cooldown {
     elapsed: u8,
     /// Positive length chosen by the original random-delay calculation.
     duration: std::num::NonZeroU8,
+}
+
+impl Cooldown {
+    /// Returns consumed quarter ticks for inspection without exposing mutation.
+    pub const fn elapsed(self) -> u8 {
+        self.elapsed
+    }
+
+    /// Returns the validated positive interval length.
+    pub const fn duration(self) -> u8 {
+        self.duration.get()
+    }
 }
 
 /// The complete set of legal Bug phases.
@@ -37,19 +47,6 @@ impl Bug {
             elapsed: 0,
             duration: std::num::NonZeroU8::new(delay).expect("Bug cooldown must be positive"),
         })
-    }
-
-    /// Derives lethal, safe, or reserved artwork from the current phase.
-    pub(super) fn animation(self) -> Animation {
-        match self {
-            Self::Active(frame) => Animation::view(AnimationKind::Bug, frame.index(), 14),
-            Self::Dormant(cooldown) => Animation::view(
-                AnimationKind::BugDormant,
-                cooldown.elapsed,
-                cooldown.duration.get(),
-            ),
-            Self::Held => Animation::view(AnimationKind::MurphyPushTarget, 0, 1),
-        }
     }
 
     /// Advances on quarter ticks and asks the game to consume RNG in board order.

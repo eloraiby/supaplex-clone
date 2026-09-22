@@ -191,7 +191,8 @@ use supaplex_clone::actors::{Actor, Frame, State, Zonk, rounded::RoundedPhase};
 let falling_rock = State::new(Actor::Zonk(Zonk::from_phase(
     RoundedPhase::Falling(Frame::first()),
 )));
-let picture = falling_rock.animation(); // Computed view; returned by value.
+assert!(matches!(falling_rock.actor(), Actor::Zonk(rock)
+    if matches!(rock.phase(), RoundedPhase::Falling(_))));
 ```
 
 Each concrete actor lives under `src/actors/` and advances through an exhaustive
@@ -211,7 +212,7 @@ Shared responsibilities are separated by concern:
 | `actors/rounded.rs` | Legal Zonk/Infotron phases, roll reservations, and shared falling mechanics |
 | `actors/enemy.rs` | Legal enemy phases and eight-picture turn mapping |
 | `actors/empty.rs` | Explicit source, side, and destination reservations |
-| `actors/animation.rs` | Read-only sprite and interpolation descriptions derived from actor phases |
+| `render.rs` | Direct sprite selection from actor-specific phases and bounded frames |
 | `actors/state.rs` | Complete cell values and level/session construction boundaries |
 | `actors/transition.rs` | Owned atomic cell writes and game-session events |
 
@@ -223,9 +224,12 @@ travel, nine-picture rightward Red Disk travel, and forty-picture exit use
 distinct bounded frame types. The final movement pose is an explicit resumption
 phase, preserving the update between source release and fresh input.
 
-Rendering calls `State::animation()` to obtain a computed `Animation` value.
-Gameplay uses typed phases and collision queries, not sprite-family tags.
-Changing a rendering description cannot change simulation state. `Frame<N>`
+Rendering matches the actual actor and its typed phase directly. There is no
+shared animation-kind enum, generic animation object, or `State::animation()`
+API. Enemy sprite selectors accept `EnemyPhase`; rock selectors accept
+`RoundedPhase`; Bug and explosion tables take their own bounded frames.
+Murphy's own artwork descriptor selects the original composite sprite tables.
+Gameplay and rendering both read actor-owned state. `Frame<N>`
 rejects external indices outside its strip, and its private representation
 prevents unchecked construction. Runtime checks still handle board occupancy,
 bounds, and reservations replaced by earlier actors; these depend on the live
@@ -235,7 +239,7 @@ Actor callbacks take `&self` because they compute owned replacement states from
 an immutable world view. The game applies transitions with exclusive mutable
 access to the board. No `Any`, downcasting, `Cell`, or `RefCell` is needed.
 When adding an actor, define its legal phases and completion behavior in its
-own module, derive its presentation, and wire its identity into dispatch and
+own module, add its typed sprite selector, and wire its identity into dispatch and
 collision queries. Scheduling, shared RNG, and the position-owned planted Red
 Disk fuse remain in `game.rs`.
 
@@ -336,3 +340,7 @@ Format and mapping references:
 
 - [Historical Supaplex file formats](https://www.elmerproductions.com/sp/filefmt.html)
 - [OpenSupaplex tile and level definitions](https://github.com/sergiou87/open-supaplex/blob/master/src/globals.h)
+
+The historical replay fixture encoding lives only in `tests/support/legacy_snapshot.rs`.
+It translates typed state into the original fixture text so the pre-refactor
+fingerprints remain unchanged; production simulation and rendering do not use it.

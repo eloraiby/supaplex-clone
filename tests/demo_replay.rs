@@ -4,12 +4,16 @@
 //! timing, momentum, collision occupancy, counters, toggles, and emitted sounds.
 //! The fingerprints deliberately exclude Rust struct layout and private enums.
 
-use supaplex_clone::{
-    actors::{Actor, AnimationKind},
-    demo::Demo,
-    game::Game,
-    level::LevelSet,
-};
+use supaplex_clone::{actors::Actor, demo::Demo, game::Game, level::LevelSet};
+
+mod snapshots {
+    use supaplex_clone::actors as model;
+    include!(concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/tests/support/legacy_snapshot.rs"
+    ));
+}
+use snapshots::SnapshotExt;
 
 /// Stable FNV-1a accumulator for explicitly ordered semantic bytes.
 struct Fingerprint(u64);
@@ -69,7 +73,7 @@ fn all_original_demo_histories_preserve_actor_and_render_timing() {
         let mut game = Game::with_random_seed(&level, 0).unwrap();
         let mut history = Fingerprint::new();
         // Cache presentation-name hashes so static cells do not allocate on every tick.
-        let mut kinds: Vec<(AnimationKind, u64)> = Vec::new();
+        let mut labels = std::collections::HashMap::<String, u64>::new();
         for input in demo.playback() {
             game.tick(input);
             history.number(game.tick_count());
@@ -82,13 +86,13 @@ fn all_original_demo_histories_preserve_actor_and_render_timing() {
             history.text(&format!("{:?}", game.status()));
             history.text(&format!("{:?}", game.take_sound_effects()));
             for cell in game.board().cells() {
-                let view = cell.animation();
-                let kind = match kinds.iter().find(|(kind, _)| *kind == view.kind()) {
-                    Some((_, hash)) => *hash,
+                let view = cell.snapshot();
+                let kind = match labels.get(view.label()) {
+                    Some(hash) => *hash,
                     None => {
                         let mut hash = Fingerprint::new();
-                        hash.text(&format!("{:?}", view.kind()));
-                        kinds.push((view.kind(), hash.0));
+                        hash.text(view.label());
+                        labels.insert(view.label().to_owned(), hash.0);
                         hash.0
                     }
                 };

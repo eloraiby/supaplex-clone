@@ -3,8 +3,7 @@
 use super::murphy::murphy_is_protected_from_falling_actor;
 use super::rounded::{RoundedActor, RoundedPhase};
 use super::{
-    Actor, Animation, CellWrite, Direction, GameEvent, Horizontal, Position, State, Transition,
-    explode_at,
+    Actor, CellWrite, Direction, GameEvent, Horizontal, Position, State, Transition, explode_at,
 };
 use crate::game::{SoundEffect, WorldView};
 
@@ -30,11 +29,6 @@ impl Infotron {
     pub(super) fn in_phase(mut self, phase: RoundedPhase) -> State {
         self.phase = phase;
         State::new(Actor::Infotron(self))
-    }
-
-    /// Derives the rendering view from the single authoritative phase.
-    pub(super) fn animation(self) -> Animation {
-        self.phase.animation(super::AnimationKind::InfotronPreFall)
     }
 
     /// Creates the momentum-bearing state used by completed falls and pushes.

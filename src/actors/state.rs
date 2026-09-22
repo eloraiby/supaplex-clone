@@ -3,14 +3,14 @@
 //! A cell stores only a complete Actor. Presentation is derived on demand, so
 //! there is no independent animation that could contradict its identity.
 
-use super::{Actor, Animation, Bug, Direction, Electron, Empty, EnemyTurn, RedDisk, SnikSnak};
+use super::{Actor, Bug, Direction, Electron, Empty, EnemyTurn, RedDisk, SnikSnak};
 
 /// Complete content of one board cell, with no independent animation storage.
 ///
 /// An arbitrary actor/animation pair cannot be installed in a cell.
 /// ```compile_fail
-/// use supaplex_clone::actors::{Actor, Animation, State, Zonk};
-/// let cell = State::animated(Actor::Zonk(Zonk::resting()), Animation::idle());
+/// use supaplex_clone::actors::{Actor, State, Zonk};
+/// let cell = State::animated(Actor::Zonk(Zonk::resting()), 0);
 /// ```
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct State {
@@ -68,11 +68,6 @@ impl State {
     /// Returns the complete actor, including its actor-specific phase.
     pub fn actor(&self) -> &Actor {
         &self.actor
-    }
-
-    /// Derives a read-only rendering description from this actor's current phase.
-    pub fn animation(&self) -> Animation {
-        self.actor.animation()
     }
 
     /// Restores the session-owned planted fuse from its serialized countdown.

@@ -1,8 +1,7 @@
 //! OrangeDisk identity and scheduled behavior.
 
 use super::{
-    Actor, Animation, AnimationKind, CellWrite, Direction, Frame, GameEvent, Position, State,
-    Transition, explode_at,
+    Actor, CellWrite, Direction, Frame, GameEvent, Position, State, Transition, explode_at,
 };
 use crate::game::WorldView;
 
@@ -58,23 +57,6 @@ impl OrangeDisk {
     pub(super) fn in_phase(mut self, phase: OrangePhase) -> State {
         self.phase = phase;
         State::new(Actor::OrangeDisk(self))
-    }
-
-    /// Derives the visible sprite without storing a parallel animation state.
-    pub(super) fn animation(self) -> Animation {
-        match self.phase {
-            OrangePhase::Resting => Animation::idle(),
-            OrangePhase::AwaitingFall(frame) => {
-                Animation::view(AnimationKind::OrangePreFall, frame.index(), 2)
-            }
-            OrangePhase::Falling(frame) => {
-                Animation::view(AnimationKind::OrangeFalling, frame.index(), 8)
-            }
-            OrangePhase::Fuse(frame) => {
-                Animation::view(AnimationKind::OrangeDiskFuse, frame.index(), 6)
-            }
-            OrangePhase::Held => Animation::view(AnimationKind::MurphyPushTarget, 0, 1),
-        }
     }
 
     /// Advances the disk's exhaustive state machine once in row-major order.

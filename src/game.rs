@@ -1150,12 +1150,21 @@ fn state_from_tile(tile: u8) -> Result<State, BoardError> {
 mod tests {
     //! Focused simulations proving indexing, animation occupancy, and mechanics.
 
+    mod snapshots {
+        use crate::actors as model;
+        include!(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/tests/support/legacy_snapshot.rs"
+        ));
+    }
+    use snapshots::SnapshotExt;
+
     use super::{Board, Game, GameStatus, Input, PlantedRedDisk, SoundEffect};
     use crate::actors::{
-        Actor, AnimationKind, Base, Bug, CHAIN_REACTION_FRAMES, Direction, Electron, Empty,
-        EnemyTurn, Exit, Explosion, ExplosionResidue, Hardware, Infotron, InvisibleWall, Murphy,
-        MurphyAnimation, OrangeDisk, Port, PortDirections, Position, RedDisk, SnikSnak, State,
-        Terminal, YellowDisk, Zonk,
+        Actor, Base, Bug, CHAIN_REACTION_FRAMES, Direction, Electron, Empty, EnemyTurn, Exit,
+        Explosion, ExplosionResidue, Hardware, Infotron, InvisibleWall, Murphy, MurphyAnimation,
+        OrangeDisk, Port, PortDirections, Position, RedDisk, SnikSnak, State, Terminal, YellowDisk,
+        Zonk,
     };
     use crate::level::{LEVEL_RECORD_SIZE, LEVEL_WIDTH, LevelSet, SpecialPort};
 
@@ -1296,10 +1305,10 @@ mod tests {
             .state(Position::new(3, 5))
             .expect("bottom-edge destination should exist");
         assert_eq!(
-            bottom_enemy.animation().kind(),
-            AnimationKind::SnikSnakMove(Direction::Down)
+            bottom_enemy.snapshot().label(),
+            format!("SnikSnakMove({:?})", Direction::Down)
         );
-        assert_eq!(bottom_enemy.animation().frame(), 0);
+        assert_eq!(bottom_enemy.snapshot().frame(), 0);
 
         for _ in 0..4 {
             game.tick(Input::default());
@@ -1308,7 +1317,7 @@ mod tests {
             game.board()
                 .state(Position::new(3, 5))
                 .expect("excluded bottom-edge enemy should remain present")
-                .animation()
+                .snapshot()
                 .frame(),
             0
         );
@@ -1336,8 +1345,8 @@ mod tests {
             .expect("source should exist");
         assert!(matches!(source.actor(), Actor::Empty(_)));
         assert_eq!(
-            source.animation().kind(),
-            AnimationKind::Vacating(Direction::Right)
+            source.snapshot().label(),
+            format!("Vacating({:?})", Direction::Right)
         );
         assert!(!source.is_empty());
         let destination = game
@@ -1346,12 +1355,15 @@ mod tests {
             .expect("destination should exist");
         assert!(matches!(destination.actor(), Actor::Murphy(_)));
         assert_eq!(
-            destination.animation().kind(),
-            AnimationKind::Murphy(MurphyAnimation::Move {
-                direction: Direction::Right,
-                target: crate::actors::MurphyMoveTarget::Empty,
-                looking_left: false,
-            })
+            destination.snapshot().label(),
+            format!(
+                "Murphy({:?})",
+                MurphyAnimation::Move {
+                    direction: Direction::Right,
+                    target: crate::actors::MurphyMoveTarget::Empty,
+                    looking_left: false,
+                }
+            )
         );
 
         // The initiating update already consumes frame zero. Seven following
@@ -1364,14 +1376,17 @@ mod tests {
             .board()
             .state(Position::new(3, 2))
             .expect("destination should exist")
-            .animation();
+            .snapshot();
         assert_eq!(
-            completed.kind(),
-            AnimationKind::Murphy(MurphyAnimation::Move {
-                direction: Direction::Right,
-                target: crate::actors::MurphyMoveTarget::Empty,
-                looking_left: false,
-            })
+            completed.label(),
+            format!(
+                "Murphy({:?})",
+                MurphyAnimation::Move {
+                    direction: Direction::Right,
+                    target: crate::actors::MurphyMoveTarget::Empty,
+                    looking_left: false,
+                }
+            )
         );
         assert_eq!(completed.frame(), 7);
         assert!(
@@ -1387,9 +1402,9 @@ mod tests {
             game.board()
                 .state(Position::new(3, 2))
                 .expect("destination should remain occupied")
-                .animation()
-                .kind(),
-            AnimationKind::Idle
+                .snapshot()
+                .label(),
+            "Idle"
         );
     }
 
@@ -1562,7 +1577,7 @@ mod tests {
             .state(Position::new(4, 2))
             .expect("pushed Zonk destination should exist");
         assert!(matches!(pushed.actor(), Actor::Zonk(_)));
-        assert_eq!(pushed.animation().kind(), AnimationKind::ZonkPreFall);
+        assert_eq!(pushed.snapshot().label(), "ZonkPreFall");
     }
 
     /// Confirms releasing a prepared push restores both reserved board cells.
@@ -1627,12 +1642,15 @@ mod tests {
             game.board()
                 .state(Position::new(2, 2))
                 .expect("Murphy should remain in place")
-                .animation()
-                .kind(),
-            AnimationKind::Murphy(MurphyAnimation::Snap {
-                direction: Direction::Right,
-                target: crate::actors::MurphySnapTarget::Infotron,
-            })
+                .snapshot()
+                .label(),
+            format!(
+                "Murphy({:?})",
+                MurphyAnimation::Snap {
+                    direction: Direction::Right,
+                    target: crate::actors::MurphySnapTarget::Infotron,
+                }
+            )
         );
 
         for _ in 0..6 {
@@ -1681,10 +1699,10 @@ mod tests {
                     .state(target)
                     .expect("the falling Infotron should occupy its destination");
                 assert_eq!(
-                    moving.animation().kind(),
-                    AnimationKind::Moving(Direction::Down)
+                    moving.snapshot().label(),
+                    format!("Moving({:?})", Direction::Down)
                 );
-                assert_eq!(moving.animation().frame(), 0);
+                assert_eq!(moving.snapshot().frame(), 0);
 
                 game.tick(Input {
                     direction: Some(direction),
@@ -1703,8 +1721,8 @@ mod tests {
                     "direction {direction:?}, action {action}"
                 );
                 assert_eq!(
-                    murphy.animation().kind(),
-                    AnimationKind::Idle,
+                    murphy.snapshot().label(),
+                    "Idle",
                     "direction {direction:?}, action {action}"
                 );
                 assert_eq!(game.remaining_infotrons(), 1);
@@ -1714,10 +1732,10 @@ mod tests {
                     .expect("the refused Infotron should remain scheduled");
                 assert!(matches!(moving.actor(), Actor::Infotron(_)));
                 assert_eq!(
-                    moving.animation().kind(),
-                    AnimationKind::Moving(Direction::Down)
+                    moving.snapshot().label(),
+                    format!("Moving({:?})", Direction::Down)
                 );
-                assert_eq!(moving.animation().frame(), 1);
+                assert_eq!(moving.snapshot().frame(), 1);
 
                 // Destination-owned cleanup must still run at original state
                 // 0x16 now that Murphy no longer removes its updater.
@@ -1762,9 +1780,9 @@ mod tests {
             game.board()
                 .state(target)
                 .expect("the rounded Infotron should retain its cell")
-                .animation()
-                .kind(),
-            AnimationKind::RoundedPreRoll(Direction::Left)
+                .snapshot()
+                .label(),
+            format!("RoundedPreRoll({:?})", Direction::Left)
         );
 
         game.tick(Input {
@@ -1776,13 +1794,16 @@ mod tests {
             game.board()
                 .state(target)
                 .expect("Murphy should begin the downward eating strip")
-                .animation()
-                .kind(),
-            AnimationKind::Murphy(MurphyAnimation::Move {
-                direction: Direction::Down,
-                target: crate::actors::MurphyMoveTarget::Infotron,
-                looking_left: false,
-            })
+                .snapshot()
+                .label(),
+            format!(
+                "Murphy({:?})",
+                MurphyAnimation::Move {
+                    direction: Direction::Down,
+                    target: crate::actors::MurphyMoveTarget::Infotron,
+                    looking_left: false,
+                }
+            )
         );
     }
 
@@ -1811,7 +1832,7 @@ mod tests {
             .state(Position::new(3, 1))
             .expect("armed Zonk cell should exist");
         assert!(matches!(armed.actor(), Actor::Zonk(zonk) if !zonk.is_falling()));
-        assert_eq!(armed.animation().kind(), AnimationKind::ZonkPreFall);
+        assert_eq!(armed.snapshot().label(), "ZonkPreFall");
         assert!(matches!(actor_at(&game, 3, 2), Actor::Empty(_)));
 
         // The next captured callback starts exactly one transfer. The new
@@ -1825,10 +1846,10 @@ mod tests {
             .expect("fall destination should exist");
         assert!(matches!(falling.actor(), Actor::Zonk(zonk) if zonk.is_falling()));
         assert_eq!(
-            falling.animation().kind(),
-            AnimationKind::Moving(Direction::Down)
+            falling.snapshot().label(),
+            format!("Moving({:?})", Direction::Down)
         );
-        assert_eq!(falling.animation().frame(), 0);
+        assert_eq!(falling.snapshot().frame(), 0);
         assert!(matches!(actor_at(&game, 3, 3), Actor::Empty(_)));
     }
 
@@ -1854,7 +1875,7 @@ mod tests {
             .board()
             .state(Position::new(3, 1))
             .expect("armed Infotron should remain in its source cell");
-        assert_eq!(armed.animation().kind(), AnimationKind::InfotronPreFall);
+        assert_eq!(armed.snapshot().label(), "InfotronPreFall");
 
         game.tick(Input::default());
         let falling = game
@@ -1863,8 +1884,8 @@ mod tests {
             .expect("Infotron fall destination should exist");
         assert!(matches!(falling.actor(), Actor::Infotron(infotron) if infotron.is_falling()));
         assert_eq!(
-            falling.animation().kind(),
-            AnimationKind::Moving(Direction::Down)
+            falling.snapshot().label(),
+            format!("Moving({:?})", Direction::Down)
         );
     }
 
@@ -1899,7 +1920,7 @@ mod tests {
             game.board()
                 .state(zonk_destination)
                 .expect("moving Zonk should occupy its destination")
-                .animation()
+                .snapshot()
                 .frame(),
             5
         );
@@ -1907,7 +1928,7 @@ mod tests {
             game.board()
                 .state(infotron_destination)
                 .expect("moving Infotron should occupy its destination")
-                .animation()
+                .snapshot()
                 .frame(),
             5
         );
@@ -1931,7 +1952,7 @@ mod tests {
             game.board()
                 .state(zonk_destination)
                 .expect("Zonk should retain its destination")
-                .animation()
+                .snapshot()
                 .frame(),
             6
         );
@@ -1939,7 +1960,7 @@ mod tests {
             game.board()
                 .state(infotron_destination)
                 .expect("Infotron should retain its destination")
-                .animation()
+                .snapshot()
                 .frame(),
             6
         );
@@ -1985,17 +2006,17 @@ mod tests {
             .expect("continued fall destination should exist");
         assert!(matches!(continued.actor(), Actor::Zonk(zonk) if zonk.is_falling()));
         assert_eq!(
-            continued.animation().kind(),
-            AnimationKind::Moving(Direction::Down)
+            continued.snapshot().label(),
+            format!("Moving({:?})", Direction::Down)
         );
-        assert_eq!(continued.animation().frame(), 0);
+        assert_eq!(continued.snapshot().frame(), 0);
         let prior_cell = game
             .board()
             .state(Position::new(3, 2))
             .expect("continued fall source should remain reserved");
         assert_eq!(
-            prior_cell.animation().kind(),
-            AnimationKind::Vacating(Direction::Down)
+            prior_cell.snapshot().label(),
+            format!("Vacating({:?})", Direction::Down)
         );
         assert!(!prior_cell.is_empty());
     }
@@ -2105,7 +2126,7 @@ mod tests {
                 .board()
                 .state(Position::new(3, 2))
                 .expect("fall destination should exist")
-                .animation();
+                .snapshot();
             assert_eq!(destination.frame(), expected_frame);
             let source = game
                 .board()
@@ -2113,8 +2134,8 @@ mod tests {
                 .expect("fall source should remain addressable");
             if expected_frame < 6 {
                 assert_eq!(
-                    source.animation().kind(),
-                    AnimationKind::Vacating(Direction::Down)
+                    source.snapshot().label(),
+                    format!("Vacating({:?})", Direction::Down)
                 );
                 assert!(!source.is_empty());
             } else {
@@ -2209,7 +2230,7 @@ mod tests {
             .board()
             .state(Position::new(3, 1))
             .expect("armed Zonk cell should exist");
-        assert_eq!(armed.animation().kind(), AnimationKind::ZonkPreFall);
+        assert_eq!(armed.snapshot().label(), "ZonkPreFall");
 
         // Murphy is processed first and occupies the lower cell. The Zonk then
         // observes that live write and retains its pre-fall promise in place.
@@ -2225,7 +2246,7 @@ mod tests {
             .state(Position::new(3, 1))
             .expect("blocked pre-fall Zonk should remain in place");
         assert!(matches!(still_armed.actor(), Actor::Zonk(_)));
-        assert_eq!(still_armed.animation().kind(), AnimationKind::ZonkPreFall);
+        assert_eq!(still_armed.snapshot().label(), "ZonkPreFall");
         assert!(
             !game
                 .board()
@@ -2262,7 +2283,7 @@ mod tests {
             .state(Position::new(3, 2))
             .expect("falling Zonk destination should exist");
         assert!(matches!(falling.actor(), Actor::Zonk(zonk) if zonk.is_falling()));
-        assert_eq!(falling.animation().frame(), 7);
+        assert_eq!(falling.snapshot().frame(), 7);
 
         // Murphy's earlier Right move changes the would-be crush into
         // a stable landing above his collision-reserved source cell.
@@ -2278,21 +2299,24 @@ mod tests {
             .expect("Murphy's escaped destination should exist");
         assert!(matches!(murphy.actor(), Actor::Murphy(_)));
         assert_eq!(
-            murphy.animation().kind(),
-            AnimationKind::Murphy(MurphyAnimation::Move {
-                direction: Direction::Right,
-                target: crate::actors::MurphyMoveTarget::Empty,
-                looking_left: false,
-            })
+            murphy.snapshot().label(),
+            format!(
+                "Murphy({:?})",
+                MurphyAnimation::Move {
+                    direction: Direction::Right,
+                    target: crate::actors::MurphyMoveTarget::Empty,
+                    looking_left: false,
+                }
+            )
         );
-        assert_eq!(murphy.animation().frame(), 0);
+        assert_eq!(murphy.snapshot().frame(), 0);
         let source = game
             .board()
             .state(Position::new(3, 3))
             .expect("Murphy's reserved source should exist");
         assert_eq!(
-            source.animation().kind(),
-            AnimationKind::Vacating(Direction::Right)
+            source.snapshot().label(),
+            format!("Vacating({:?})", Direction::Right)
         );
         assert!(!source.is_empty());
         assert!(matches!(
@@ -2334,14 +2358,17 @@ mod tests {
             .expect("completed Murphy destination should exist");
         assert!(matches!(ready.actor(), Actor::Murphy(_)));
         assert_eq!(
-            ready.animation().kind(),
-            AnimationKind::Murphy(MurphyAnimation::Move {
-                direction: Direction::Down,
-                target: crate::actors::MurphyMoveTarget::Empty,
-                looking_left: false,
-            })
+            ready.snapshot().label(),
+            format!(
+                "Murphy({:?})",
+                MurphyAnimation::Move {
+                    direction: Direction::Down,
+                    target: crate::actors::MurphyMoveTarget::Empty,
+                    looking_left: false,
+                }
+            )
         );
-        assert_eq!(ready.animation().frame(), 7);
+        assert_eq!(ready.snapshot().frame(), 7);
         assert!(
             game.board()
                 .state(Position::new(3, 2))
@@ -2353,8 +2380,8 @@ mod tests {
             .state(Position::new(3, 1))
             .expect("pre-fall trailing Zonk should remain in place");
         assert!(matches!(trailing.actor(), Actor::Zonk(zonk) if !zonk.is_falling()));
-        assert_eq!(trailing.animation().kind(), AnimationKind::ZonkPreFall);
-        assert_eq!(trailing.animation().frame(), 0);
+        assert_eq!(trailing.snapshot().label(), "ZonkPreFall");
+        assert_eq!(trailing.snapshot().frame(), 0);
 
         // The following update resumes held input first. Only afterward does
         // the armed Zonk begin entering the older, now-safe source cell.
@@ -2366,14 +2393,17 @@ mod tests {
             .board()
             .state(Position::new(3, 4))
             .expect("Murphy destination should exist")
-            .animation();
+            .snapshot();
         assert_eq!(
-            moving.kind(),
-            AnimationKind::Murphy(MurphyAnimation::Move {
-                direction: Direction::Down,
-                target: crate::actors::MurphyMoveTarget::Empty,
-                looking_left: false,
-            })
+            moving.label(),
+            format!(
+                "Murphy({:?})",
+                MurphyAnimation::Move {
+                    direction: Direction::Down,
+                    target: crate::actors::MurphyMoveTarget::Empty,
+                    looking_left: false,
+                }
+            )
         );
         assert_eq!(moving.frame(), 0);
         let trailing = game
@@ -2382,10 +2412,10 @@ mod tests {
             .expect("trailing Zonk should enter the older source");
         assert!(matches!(trailing.actor(), Actor::Zonk(zonk) if zonk.is_falling()));
         assert_eq!(
-            trailing.animation().kind(),
-            AnimationKind::Moving(Direction::Down)
+            trailing.snapshot().label(),
+            format!("Moving({:?})", Direction::Down)
         );
-        assert_eq!(trailing.animation().frame(), 0);
+        assert_eq!(trailing.snapshot().frame(), 0);
     }
 
     /// Confirms a turn happens before a trailing pre-fall Zonk transfers.
@@ -2424,14 +2454,17 @@ mod tests {
             .expect("completed Murphy destination should exist");
         assert!(matches!(ready.actor(), Actor::Murphy(_)));
         assert_eq!(
-            ready.animation().kind(),
-            AnimationKind::Murphy(MurphyAnimation::Move {
-                direction: Direction::Down,
-                target: crate::actors::MurphyMoveTarget::Empty,
-                looking_left: false,
-            })
+            ready.snapshot().label(),
+            format!(
+                "Murphy({:?})",
+                MurphyAnimation::Move {
+                    direction: Direction::Down,
+                    target: crate::actors::MurphyMoveTarget::Empty,
+                    looking_left: false,
+                }
+            )
         );
-        assert_eq!(ready.animation().frame(), 7);
+        assert_eq!(ready.snapshot().frame(), 7);
         assert!(
             game.board()
                 .state(Position::new(3, 2))
@@ -2443,8 +2476,8 @@ mod tests {
             .state(Position::new(3, 1))
             .expect("pre-fall trailing Zonk should remain in place");
         assert!(matches!(trailing.actor(), Actor::Zonk(zonk) if !zonk.is_falling()));
-        assert_eq!(trailing.animation().kind(), AnimationKind::ZonkPreFall);
-        assert_eq!(trailing.animation().frame(), 0);
+        assert_eq!(trailing.snapshot().label(), "ZonkPreFall");
+        assert_eq!(trailing.snapshot().frame(), 0);
 
         // The next update consumes Right and reserves Murphy's current source
         // before the armed Zonk transfers into the older released source.
@@ -2458,10 +2491,10 @@ mod tests {
             .expect("trailing Zonk should enter the older source");
         assert!(matches!(trailing.actor(), Actor::Zonk(zonk) if zonk.is_falling()));
         assert_eq!(
-            trailing.animation().kind(),
-            AnimationKind::Moving(Direction::Down)
+            trailing.snapshot().label(),
+            format!("Moving({:?})", Direction::Down)
         );
-        assert_eq!(trailing.animation().frame(), 0);
+        assert_eq!(trailing.snapshot().frame(), 0);
         assert!(
             !game
                 .board()
@@ -2473,14 +2506,17 @@ mod tests {
             .board()
             .state(Position::new(4, 3))
             .expect("turned Murphy destination should exist")
-            .animation();
+            .snapshot();
         assert_eq!(
-            moving.kind(),
-            AnimationKind::Murphy(MurphyAnimation::Move {
-                direction: Direction::Right,
-                target: crate::actors::MurphyMoveTarget::Empty,
-                looking_left: false,
-            })
+            moving.label(),
+            format!(
+                "Murphy({:?})",
+                MurphyAnimation::Move {
+                    direction: Direction::Right,
+                    target: crate::actors::MurphyMoveTarget::Empty,
+                    looking_left: false,
+                }
+            )
         );
         assert_eq!(moving.frame(), 0);
     }
@@ -2512,8 +2548,8 @@ mod tests {
             .expect("fall source should exist");
         assert!(matches!(source.actor(), Actor::Empty(_)));
         assert_eq!(
-            source.animation().kind(),
-            AnimationKind::Vacating(Direction::Down)
+            source.snapshot().label(),
+            format!("Vacating({:?})", Direction::Down)
         );
         assert!(!source.is_empty());
 
@@ -2568,7 +2604,7 @@ mod tests {
             .state(Position::new(4, 2))
             .expect("pushed Orange Disk should remain at its source during pre-fall");
         assert!(matches!(orange.actor(), Actor::OrangeDisk(_)));
-        assert_eq!(orange.animation().kind(), AnimationKind::OrangePreFall);
+        assert_eq!(orange.snapshot().label(), "OrangePreFall");
         assert!(
             !game
                 .board()
@@ -2605,8 +2641,8 @@ mod tests {
             .state(Position::new(3, 1))
             .expect("rounded actor source should exist");
         assert_eq!(
-            preparing.animation().kind(),
-            AnimationKind::RoundedPreRoll(Direction::Left)
+            preparing.snapshot().label(),
+            format!("RoundedPreRoll({:?})", Direction::Left)
         );
 
         game.tick(Input::default());
@@ -2617,8 +2653,8 @@ mod tests {
             .expect("horizontal slide cell should exist");
         assert!(matches!(rolled.actor(), Actor::Zonk(_)));
         assert_eq!(
-            rolled.animation().kind(),
-            AnimationKind::Rolling(Direction::Left)
+            rolled.snapshot().label(),
+            format!("Rolling({:?})", Direction::Left)
         );
     }
 
@@ -2653,7 +2689,7 @@ mod tests {
                 .board()
                 .state(Position::new(2, 1))
                 .expect("horizontal slide cell should exist")
-                .animation();
+                .snapshot();
             assert_eq!(sliding.frame(), expected_frame);
             assert!(
                 !game
@@ -2673,9 +2709,9 @@ mod tests {
             game.board()
                 .state(Position::new(2, 2))
                 .expect("vertical roll destination should exist")
-                .animation()
-                .kind(),
-            AnimationKind::Moving(Direction::Down)
+                .snapshot()
+                .label(),
+            format!("Moving({:?})", Direction::Down)
         );
 
         for _ in 0..8 {
@@ -2722,8 +2758,8 @@ mod tests {
             .expect("right-hand pre-roll source should exist");
         assert!(matches!(preparing.actor(), Actor::Zonk(_)));
         assert_eq!(
-            preparing.animation().kind(),
-            AnimationKind::RoundedPreRoll(Direction::Right)
+            preparing.snapshot().label(),
+            format!("RoundedPreRoll({:?})", Direction::Right)
         );
         assert!(
             !game
@@ -2767,10 +2803,13 @@ mod tests {
             .expect("port entrance should retain Murphy during traversal");
         assert!(matches!(murphy.actor(), Actor::Murphy(_)));
         assert_eq!(
-            murphy.animation().kind(),
-            AnimationKind::Murphy(MurphyAnimation::Port {
-                direction: Direction::Right,
-            })
+            murphy.snapshot().label(),
+            format!(
+                "Murphy({:?})",
+                MurphyAnimation::Port {
+                    direction: Direction::Right,
+                }
+            )
         );
         assert!(
             !game
@@ -2856,9 +2895,9 @@ mod tests {
             game.board()
                 .state(origin)
                 .expect("reserved planted position should exist")
-                .animation()
-                .kind(),
-            AnimationKind::Vacating(Direction::Right)
+                .snapshot()
+                .label(),
+            format!("Vacating({:?})", Direction::Right)
         );
 
         // The disk materializes only after Murphy's collision reservation has
@@ -2872,7 +2911,7 @@ mod tests {
             .state(origin)
             .expect("planted position should exist");
         assert!(matches!(planted.actor(), Actor::RedDisk(_)));
-        assert_eq!(planted.animation().kind(), AnimationKind::RedDiskFuse);
+        assert_eq!(planted.snapshot().label(), "RedDiskFuse");
         assert_eq!(
             game.planted_red_disk.map(|disk| disk.position),
             Some(origin)
@@ -2898,13 +2937,16 @@ mod tests {
             game.board()
                 .state(origin)
                 .expect("Murphy should animate over the planted disk")
-                .animation()
-                .kind(),
-            AnimationKind::Murphy(MurphyAnimation::Move {
-                direction: Direction::Left,
-                target: crate::actors::MurphyMoveTarget::PlantedRedDisk,
-                looking_left: true,
-            })
+                .snapshot()
+                .label(),
+            format!(
+                "Murphy({:?})",
+                MurphyAnimation::Move {
+                    direction: Direction::Left,
+                    target: crate::actors::MurphyMoveTarget::PlantedRedDisk,
+                    looking_left: true,
+                }
+            )
         );
         assert_eq!(game.red_disks(), 1);
         assert!(game.planted_red_disk.is_some());
@@ -2932,9 +2974,9 @@ mod tests {
             game.board()
                 .state(origin)
                 .expect("Murphy's cell should remain present")
-                .animation()
-                .kind(),
-            AnimationKind::Idle
+                .snapshot()
+                .label(),
+            "Idle"
         );
     }
 
@@ -2971,7 +3013,7 @@ mod tests {
             .board()
             .state(Position::new(3, 3))
             .expect("Orange Disk cell should exist");
-        assert_eq!(orange.animation().kind(), AnimationKind::OrangeDiskFuse);
+        assert_eq!(orange.snapshot().label(), "OrangeDiskFuse");
         assert!(matches!(actor_at(&game, 3, 2), Actor::Zonk(_)));
 
         for _ in 0..6 {
@@ -3051,17 +3093,17 @@ mod tests {
                 game.board()
                     .state(destination)
                     .expect("the falling owner should occupy its destination")
-                    .animation()
-                    .kind(),
-                AnimationKind::Moving(Direction::Down)
+                    .snapshot()
+                    .label(),
+                format!("Moving({:?})", Direction::Down)
             );
             assert_eq!(
                 game.board()
                     .state(source)
                     .expect("the falling source should remain reserved")
-                    .animation()
-                    .kind(),
-                AnimationKind::Vacating(Direction::Down)
+                    .snapshot()
+                    .label(),
+                format!("Vacating({:?})", Direction::Down)
             );
 
             // This wave reaches the destination at its upper-left corner, but
@@ -3117,9 +3159,9 @@ mod tests {
                         game.board()
                             .state(origin)
                             .expect("the rounded owner should retain its source")
-                            .animation()
-                            .kind(),
-                        AnimationKind::RoundedPreRoll(direction)
+                            .snapshot()
+                            .label(),
+                        format!("RoundedPreRoll({:?})", direction)
                     );
 
                     let (owner, reservation, blast_center, expected_kind) = if rolling {
@@ -3129,13 +3171,13 @@ mod tests {
                                 Position::new(2, 2),
                                 Position::new(2, 3),
                                 Position::new(1, 1),
-                                AnimationKind::Rolling(Direction::Left),
+                                format!("Rolling({:?})", Direction::Left),
                             ),
                             Direction::Right => (
                                 Position::new(4, 2),
                                 Position::new(4, 3),
                                 Position::new(5, 1),
-                                AnimationKind::Rolling(Direction::Right),
+                                format!("Rolling({:?})", Direction::Right),
                             ),
                             _ => unreachable!("the fixture uses horizontal rolls only"),
                         }
@@ -3145,13 +3187,13 @@ mod tests {
                                 origin,
                                 Position::new(2, 2),
                                 Position::new(4, 1),
-                                AnimationKind::RoundedPreRoll(Direction::Left),
+                                format!("RoundedPreRoll({:?})", Direction::Left),
                             ),
                             Direction::Right => (
                                 origin,
                                 Position::new(4, 2),
                                 Position::new(2, 1),
-                                AnimationKind::RoundedPreRoll(Direction::Right),
+                                format!("RoundedPreRoll({:?})", Direction::Right),
                             ),
                             _ => unreachable!("the fixture uses horizontal rolls only"),
                         }
@@ -3160,8 +3202,8 @@ mod tests {
                         game.board()
                             .state(owner)
                             .expect("the rounded owner should occupy its phase cell")
-                            .animation()
-                            .kind(),
+                            .snapshot()
+                            .label(),
                         expected_kind
                     );
                     assert!(
@@ -3551,9 +3593,9 @@ mod tests {
             open.board()
                 .state(Position::new(2, 2))
                 .expect("Exit animation should remain at Murphy's source")
-                .animation()
-                .kind(),
-            AnimationKind::Murphy(MurphyAnimation::Exit)
+                .snapshot()
+                .label(),
+            format!("Murphy({:?})", MurphyAnimation::Exit)
         );
         // The terminal status does not freeze the disappearance sequence.
         for _ in 0..39 {
@@ -3637,7 +3679,7 @@ mod tests {
             .board()
             .state(Position::new(2, 2))
             .expect("blast cell should exist")
-            .animation()
+            .snapshot()
             .frame();
         // Explosion pictures advance only on global ticks divisible by four.
         game.tick(Input::default());
@@ -3645,7 +3687,7 @@ mod tests {
             .board()
             .state(Position::new(2, 2))
             .expect("blast cell should exist")
-            .animation()
+            .snapshot()
             .frame();
         assert_eq!(second_frame, first_frame);
         for _ in 0..3 {
@@ -3655,7 +3697,7 @@ mod tests {
             .board()
             .state(Position::new(2, 2))
             .expect("blast cell should survive through its next quarter tick")
-            .animation()
+            .snapshot()
             .frame();
         assert!(quarter_frame > second_frame);
     }
@@ -3697,7 +3739,7 @@ mod tests {
                 .board()
                 .state(target)
                 .expect("the mature explosion should remain present")
-                .animation()
+                .snapshot()
                 .frame(),
             4
         );
@@ -3743,9 +3785,9 @@ mod tests {
             game.board()
                 .state(wall)
                 .expect("invisible wall should remain addressable")
-                .animation()
-                .kind(),
-            AnimationKind::Idle
+                .snapshot()
+                .label(),
+            "Idle"
         );
     }
 
@@ -3786,9 +3828,9 @@ mod tests {
             game.board()
                 .state(left_destination)
                 .expect("moving Snik Snak destination should exist")
-                .animation()
-                .kind(),
-            AnimationKind::SnikSnakMove(Direction::Left)
+                .snapshot()
+                .label(),
+            format!("SnikSnakMove({:?})", Direction::Left)
         );
 
         for _ in 0..6 {
@@ -3869,9 +3911,9 @@ mod tests {
             game.board()
                 .state(left_destination)
                 .expect("moving Electron destination should exist")
-                .animation()
-                .kind(),
-            AnimationKind::ElectronMove(Direction::Left)
+                .snapshot()
+                .label(),
+            format!("ElectronMove({:?})", Direction::Left)
         );
 
         for _ in 0..6 {
@@ -3881,9 +3923,9 @@ mod tests {
             game.board()
                 .state(source)
                 .expect("Electron source reservation should exist")
-                .animation()
-                .kind(),
-            AnimationKind::ElectronVacating(Direction::Left)
+                .snapshot()
+                .label(),
+            format!("ElectronVacating({:?})", Direction::Left)
         );
         game.tick(Input::default());
         assert!(
@@ -3978,11 +4020,14 @@ mod tests {
             game.board()
                 .state(Position::new(2, 2))
                 .expect("port source should retain Murphy")
-                .animation()
-                .kind(),
-            AnimationKind::Murphy(MurphyAnimation::Port {
-                direction: Direction::Right,
-            })
+                .snapshot()
+                .label(),
+            format!(
+                "Murphy({:?})",
+                MurphyAnimation::Port {
+                    direction: Direction::Right,
+                }
+            )
         );
         assert!(!game.gravity());
         assert!(!game.freeze_zonks());
@@ -4292,7 +4337,7 @@ mod tests {
             .state(pending_position)
             .expect("secondary center should exist");
         assert!(matches!(emitted.actor(), Actor::Explosion(_)));
-        assert_eq!(emitted.animation().frame_count(), 8);
+        assert_eq!(emitted.snapshot().frame_count(), 8);
     }
 
     /// Confirms the engine's explicit empty actor is available for fixtures.
@@ -4326,8 +4371,8 @@ mod tests {
 
         for position in [Position::new(2, 2), Position::new(4, 2)] {
             let state = game.board().state(position).expect("Bug should exist");
-            assert_eq!(state.animation().kind(), AnimationKind::Bug);
-            assert_eq!(state.animation().frame(), 0);
+            assert_eq!(state.snapshot().label(), "Bug");
+            assert_eq!(state.snapshot().frame(), 0);
         }
 
         // Global frame zero is eligible, while frames one through three hold.
@@ -4340,7 +4385,7 @@ mod tests {
                 game.board()
                     .state(position)
                     .expect("Bug should remain present")
-                    .animation()
+                    .snapshot()
                     .frame(),
                 1
             );
@@ -4352,7 +4397,7 @@ mod tests {
                 game.board()
                     .state(position)
                     .expect("Bug should remain present")
-                    .animation()
+                    .snapshot()
                     .frame(),
                 2
             );
@@ -4385,14 +4430,14 @@ mod tests {
             .board()
             .state(Position::new(2, 2))
             .expect("first Bug should exist")
-            .animation();
+            .snapshot();
         let second = game
             .board()
             .state(Position::new(4, 2))
             .expect("second Bug should exist")
-            .animation();
-        assert_eq!(first.kind(), AnimationKind::BugDormant);
-        assert_eq!(second.kind(), AnimationKind::BugDormant);
+            .snapshot();
+        assert_eq!(first.label(), "BugDormant");
+        assert_eq!(second.label(), "BugDormant");
         assert_eq!(first.frame_count(), 56);
         assert_eq!(second.frame_count(), 35);
     }
@@ -4418,8 +4463,8 @@ mod tests {
             .board()
             .state(Position::new(2, 2))
             .expect("Bug should exist before cooldown");
-        assert_eq!(bug.animation().kind(), AnimationKind::Bug);
-        assert_eq!(bug.animation().frame(), 13);
+        assert_eq!(bug.snapshot().label(), "Bug");
+        assert_eq!(bug.snapshot().frame(), 13);
 
         // Murphy updates first on the due tick and therefore still collides
         // with active frame 13 before the Bug randomizes its safe interval.
@@ -4465,8 +4510,8 @@ mod tests {
             .board()
             .state(Position::new(2, 2))
             .expect("Bug should reactivate in place");
-        assert_eq!(active.animation().kind(), AnimationKind::Bug);
-        assert_eq!(active.animation().frame(), 0);
+        assert_eq!(active.snapshot().label(), "Bug");
+        assert_eq!(active.snapshot().frame(), 0);
     }
 
     /// Confirms every supplied tile code maps to a typed actor in all 111 levels.
@@ -4529,28 +4574,28 @@ mod tests {
             .expect("the stationary Snik Snak should remain at its source");
         assert!(matches!(snik_turn_state.actor(), Actor::SnikSnak(_)));
         assert_eq!(
-            snik_turn_state.animation().kind(),
-            AnimationKind::SnikSnakTurn(EnemyTurn::Left)
+            snik_turn_state.snapshot().label(),
+            format!("SnikSnakTurn({:?})", EnemyTurn::Left)
         );
-        assert_eq!(snik_turn_state.animation().frame(), 1);
+        assert_eq!(snik_turn_state.snapshot().frame(), 1);
 
         let blocked_state = board
             .state(electron_blocked)
             .expect("the blocked Electron should remain at its source");
         assert!(matches!(blocked_state.actor(), Actor::Electron(_)));
         assert_eq!(
-            blocked_state.animation().kind(),
-            AnimationKind::ElectronTurn(EnemyTurn::Left)
+            blocked_state.snapshot().label(),
+            format!("ElectronTurn({:?})", EnemyTurn::Left)
         );
-        assert_eq!(blocked_state.animation().frame(), 0);
+        assert_eq!(blocked_state.snapshot().frame(), 0);
 
         let snik_source_state = board
             .state(snik_source)
             .expect("the Snik Snak source reservation should remain in bounds");
         assert!(matches!(snik_source_state.actor(), Actor::Empty(_)));
         assert_eq!(
-            snik_source_state.animation().kind(),
-            AnimationKind::SnikSnakVacating(Direction::Up)
+            snik_source_state.snapshot().label(),
+            format!("SnikSnakVacating({:?})", Direction::Up)
         );
         let snik_destination_state = board
             .state(snik_destination)
@@ -4560,18 +4605,18 @@ mod tests {
             Actor::SnikSnak(enemy) if enemy.heading() == Direction::Up
         ));
         assert_eq!(
-            snik_destination_state.animation().kind(),
-            AnimationKind::SnikSnakMove(Direction::Up)
+            snik_destination_state.snapshot().label(),
+            format!("SnikSnakMove({:?})", Direction::Up)
         );
-        assert_eq!(snik_destination_state.animation().frame(), 0);
+        assert_eq!(snik_destination_state.snapshot().frame(), 0);
 
         let electron_source_state = board
             .state(electron_source)
             .expect("the Electron source reservation should remain in bounds");
         assert!(matches!(electron_source_state.actor(), Actor::Empty(_)));
         assert_eq!(
-            electron_source_state.animation().kind(),
-            AnimationKind::ElectronVacating(Direction::Right)
+            electron_source_state.snapshot().label(),
+            format!("ElectronVacating({:?})", Direction::Right)
         );
         let electron_destination_state = board
             .state(electron_destination)
@@ -4581,10 +4626,10 @@ mod tests {
             Actor::Electron(enemy) if enemy.heading() == Direction::Right
         ));
         assert_eq!(
-            electron_destination_state.animation().kind(),
-            AnimationKind::ElectronMove(Direction::Right)
+            electron_destination_state.snapshot().label(),
+            format!("ElectronMove({:?})", Direction::Right)
         );
-        assert_eq!(electron_destination_state.animation().frame(), 0);
+        assert_eq!(electron_destination_state.snapshot().frame(), 0);
     }
 
     /// Replays the original successful level-one attract demo to its Exit.

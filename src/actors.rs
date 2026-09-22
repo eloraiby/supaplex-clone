@@ -1,8 +1,8 @@
 //! Actor-owned behavior, animation phases, and immediate atomic transitions.
 //!
 //! Every cell stores one complete [`Actor`]. Concrete actors own their legal
-//! phases and bounded progress values; [`Animation`] is a read-only presentation
-//! computed from those phases and cannot be assigned back to simulation state.
+//! phases and bounded progress values. Rendering consumes those same typed phases
+//! directly; there is no parallel animation-kind enum or assignable view.
 //!
 //! This module only dispatches by actor identity. Each actor's exhaustive match
 //! owns timing and completion behavior. Shared rounded physics and enemy turn
@@ -14,7 +14,6 @@
 
 #![warn(missing_docs)]
 
-mod animation;
 pub mod enemy;
 mod frame;
 mod geometry;
@@ -22,7 +21,6 @@ pub mod rounded;
 mod state;
 mod transition;
 
-pub use animation::{Animation, AnimationKind};
 pub use enemy::EnemyTurn;
 pub use frame::Frame;
 pub use geometry::{Direction, Horizontal, Position};
@@ -201,30 +199,6 @@ impl Actor {
             | Self::Electron(_)
             | Self::InvisibleWall(_)
             | Self::Explosion(_) => false,
-        }
-    }
-
-    /// Computes presentation; the returned value has no simulation write-back API.
-    pub fn animation(&self) -> Animation {
-        match self {
-            Self::Empty(actor) => actor.animation(),
-            Self::Zonk(actor) => actor.animation(),
-            Self::Base(actor) => actor.animation(),
-            Self::Murphy(actor) => actor.animation(),
-            Self::Infotron(actor) => actor.animation(),
-            Self::RamChip(_) => Animation::idle(),
-            Self::Hardware(_) => Animation::idle(),
-            Self::Exit(_) => Animation::idle(),
-            Self::OrangeDisk(actor) => actor.animation(),
-            Self::Port(_) => Animation::idle(),
-            Self::SnikSnak(actor) => actor.animation(),
-            Self::YellowDisk(actor) => actor.animation(),
-            Self::Terminal(actor) => actor.animation(),
-            Self::RedDisk(actor) => actor.animation(),
-            Self::Electron(actor) => actor.animation(),
-            Self::Bug(actor) => actor.animation(),
-            Self::InvisibleWall(_) => Animation::idle(),
-            Self::Explosion(actor) => actor.animation(),
         }
     }
 

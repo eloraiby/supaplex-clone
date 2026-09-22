@@ -14,14 +14,6 @@ pub enum YellowDisk {
 }
 
 impl YellowDisk {
-    /// Derives the static or reserved presentation from this actor's own state.
-    pub(super) fn animation(self) -> super::Animation {
-        match self {
-            Self::Resting => super::Animation::idle(),
-            Self::Held => super::Animation::view(super::AnimationKind::MurphyPushTarget, 0, 1),
-        }
-    }
-
     /// Remains stationary until Murphy pushes it or a Terminal detonates it.
     pub(super) fn transition(
         &self,

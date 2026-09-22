@@ -14,14 +14,6 @@ pub enum Base {
 }
 
 impl Base {
-    /// Derives the static or reserved presentation from this actor's own state.
-    pub(super) fn animation(self) -> super::Animation {
-        match self {
-            Self::Resting => super::Animation::idle(),
-            Self::Held => super::Animation::view(super::AnimationKind::MurphyPushTarget, 0, 1),
-        }
-    }
-
     /// Remains in place until Murphy or an explosion replaces it atomically.
     pub(super) fn transition(
         &self,

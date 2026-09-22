@@ -1,8 +1,6 @@
 //! Explosion residue and ordered blast propagation with reservation cleanup.
 
-use super::{
-    Actor, Animation, AnimationKind, CellWrite, Direction, GameEvent, Position, State, Transition,
-};
+use super::{Actor, CellWrite, Direction, GameEvent, Position, State, Transition};
 use crate::game::SoundEffect;
 use crate::game::WorldView;
 
@@ -46,15 +44,6 @@ impl Explosion {
     /// Reports the original safe tail of a normal explosion for Murphy movement.
     pub const fn is_harmless(self) -> bool {
         matches!(self.residue, ExplosionResidue::Empty) && self.frame.index() >= 4
-    }
-
-    /// Selects normal or Electron artwork from the same residue used at completion.
-    pub(super) fn animation(self) -> Animation {
-        let kind = match self.residue {
-            ExplosionResidue::Empty => AnimationKind::Explosion,
-            ExplosionResidue::Infotron => AnimationKind::ElectronExplosion,
-        };
-        Animation::view(kind, self.frame.index(), 8)
     }
 
     /// Advances the blast on quarter ticks and installs its typed residue at completion.

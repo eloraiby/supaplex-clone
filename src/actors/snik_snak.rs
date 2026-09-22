@@ -3,8 +3,7 @@
 use super::enemy::EnemyPhase;
 use super::murphy::murphy_is_crossing_port;
 use super::{
-    Actor, Animation, AnimationKind, CellWrite, Direction, EnemyTurn, Frame, Position, State,
-    Transition, explode_at,
+    Actor, CellWrite, Direction, EnemyTurn, Frame, Position, State, Transition, explode_at,
 };
 use crate::game::WorldView;
 
@@ -30,18 +29,6 @@ impl SnikSnak {
         }
         self.phase = phase;
         State::new(Actor::SnikSnak(self))
-    }
-
-    /// Derives the correct enemy sprite strip from its legal phase.
-    pub(super) fn animation(self) -> Animation {
-        match self.phase {
-            EnemyPhase::Turning { turn, frame } => {
-                Animation::view(AnimationKind::SnikSnakTurn(turn), frame.index(), 8)
-            }
-            EnemyPhase::Moving { direction, frame } => {
-                Animation::view(AnimationKind::SnikSnakMove(direction), frame.index(), 8)
-            }
-        }
     }
 
     /// Advances only this enemy's phases, honoring global freeze and source cleanup.

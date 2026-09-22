@@ -4,8 +4,7 @@
 //! in their own modules; the shared enum admits no Murphy, enemy, or fuse state.
 
 use super::{
-    Actor, Animation, AnimationKind, CellWrite, Direction, Frame, Horizontal, Infotron, Position,
-    State, Transition, Zonk,
+    Actor, CellWrite, Direction, Frame, Horizontal, Infotron, Position, State, Transition, Zonk,
 };
 use crate::game::WorldView;
 
@@ -211,26 +210,6 @@ impl RoundedActor {
 }
 
 impl RoundedPhase {
-    /// Derives a sprite description; arming artwork differs between the two actors.
-    pub(super) fn animation(self, pre_fall: AnimationKind) -> Animation {
-        match self {
-            Self::Resting | Self::Momentum => Animation::idle(),
-            Self::AwaitingFall => Animation::view(pre_fall, 0, 1),
-            Self::PreparingRoll(direction) => {
-                Animation::view(AnimationKind::RoundedPreRoll(direction.direction()), 0, 1)
-            }
-            Self::Rolling { direction, frame } => Animation::view(
-                AnimationKind::Rolling(direction.direction()),
-                frame.index(),
-                8,
-            ),
-            Self::Falling(frame) => {
-                Animation::view(AnimationKind::Moving(Direction::Down), frame.index(), 8)
-            }
-            Self::Held => Animation::view(AnimationKind::MurphyPushTarget, 0, 1),
-        }
-    }
-
     /// Reports momentum without storing a second, potentially conflicting flag.
     pub(super) const fn is_falling(self) -> bool {
         matches!(
