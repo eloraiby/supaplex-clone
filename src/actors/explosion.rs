@@ -20,12 +20,17 @@ pub enum ExplosionResidue {
 pub struct Explosion {
     /// Actor that replaces this cell after the visual explosion finishes.
     residue: ExplosionResidue,
+    /// Bounded progress through the eight quarter-rate pictures.
+    frame: super::Frame<8>,
 }
 
 impl Explosion {
     /// Creates one explosion cell with an explicit terminal residue.
     pub const fn new(residue: ExplosionResidue) -> Self {
-        Self { residue }
+        Self {
+            residue,
+            frame: super::Frame::first(),
+        }
     }
 
     /// Returns what this explosion cell will become after its final frame.
@@ -33,20 +38,49 @@ impl Explosion {
         self.residue
     }
 
-    /// Defers behavior to the finite animation resolved before actor dispatch.
+    /// Selects normal or Electron artwork from the same residue used at completion.
+    pub(super) fn animation(self) -> Animation {
+        let kind = match self.residue {
+            ExplosionResidue::Empty => AnimationKind::Explosion,
+            ExplosionResidue::Infotron => AnimationKind::ElectronExplosion,
+        };
+        Animation::view(kind, self.frame.index(), 8)
+    }
+
+    /// Advances the blast on quarter ticks and installs its typed residue at completion.
     pub(super) fn transition(
         &self,
-        _position: Position,
-        _world: &WorldView<'_>,
+        position: Position,
+        world: &WorldView<'_>,
     ) -> Option<Transition> {
-        None
+        if !world.tick_count().is_multiple_of(4) {
+            return None;
+        }
+        Some(match self.frame.next() {
+            Some(frame) => Transition::replace(
+                position,
+                State::new(Actor::Explosion(Self { frame, ..*self })),
+            ),
+            None => {
+                let state = match self.residue {
+                    ExplosionResidue::Empty => State::empty(),
+                    ExplosionResidue::Infotron => {
+                        State::new(Actor::Infotron(super::Infotron::resting()))
+                    }
+                };
+                Transition::new(
+                    vec![CellWrite::new(position, state)],
+                    vec![GameEvent::ExplosionFinished],
+                )
+            }
+        })
     }
 }
 
 /// Creates one visual explosion cell independently of all secondary-wave timers.
 fn explosion_state(residue: ExplosionResidue) -> State {
     let actor = Actor::Explosion(Explosion::new(residue));
-    State::animated(actor, Animation::explosion(residue))
+    State::new(actor)
 }
 
 /// Finds the temporary cell owned by one moving Zonk or Infotron phase.

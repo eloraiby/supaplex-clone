@@ -1,29 +1,54 @@
 //! Zonk gravity, delayed falls, and left-first rounded-support rolls.
 
-use super::{Actor, Animation, Direction, Position, State, Transition};
-use crate::game::WorldView;
+use super::murphy::murphy_is_protected_from_falling_actor;
+use super::rounded::{RoundedActor, RoundedPhase};
+use super::{
+    Actor, Animation, CellWrite, Direction, Frame, GameEvent, Horizontal, OrangeDisk, Position,
+    State, Transition, explode_at,
+};
+use crate::game::{SoundEffect, WorldView};
 
 /// A rounded rock that falls, rolls, can be pushed, and can crush actors.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct Zonk {
-    /// Whether this Zonk has downward momentum from an earlier fall.
-    falling: bool,
+    /// The complete legal physical phase; momentum is derived from this value.
+    phase: RoundedPhase,
 }
 
 impl Zonk {
+    /// Returns the physical state for typed dispatch and collision queries.
+    pub const fn phase(self) -> RoundedPhase {
+        self.phase
+    }
+
+    /// Replaces only this concrete actor's physical phase.
+    pub(super) fn in_phase(mut self, phase: RoundedPhase) -> State {
+        self.phase = phase;
+        State::new(Actor::Zonk(self))
+    }
+
+    /// Derives the rendering view from the single authoritative phase.
+    pub(super) fn animation(self) -> Animation {
+        self.phase.animation(super::AnimationKind::ZonkPreFall)
+    }
+
     /// Creates the momentum-bearing state used by completed falls and pushes.
     pub(super) const fn falling() -> Self {
-        Self { falling: true }
+        Self {
+            phase: RoundedPhase::Momentum,
+        }
     }
 
     /// Creates a stationary Zonk as read from a level record.
     pub const fn resting() -> Self {
-        Self { falling: false }
+        Self {
+            phase: RoundedPhase::Resting,
+        }
     }
 
     /// Reports whether this Zonk currently carries falling momentum.
     pub const fn is_falling(self) -> bool {
-        self.falling
+        self.phase.is_falling()
     }
 
     /// Chooses a fall or roll from the full states of neighboring cells.
@@ -39,15 +64,14 @@ impl Zonk {
 
         let below = world.offset(position, Direction::Down)?;
         if world.is_empty(below) {
-            if self.falling {
+            if self.phase.is_falling() {
                 // Momentum from a completed fall continues directly into the
                 // next cell. The one-update arming delay belongs only to a
                 // stable Zonk beginning a new fall from rest.
                 return Some(Transition::move_actor(
                     position,
                     below,
-                    Actor::Zonk(*self),
-                    Direction::Down,
+                    RoundedActor::Zonk(*self),
                 ));
             }
 
@@ -57,7 +81,7 @@ impl Zonk {
             // source opens directly below a trailing Zonk.
             return Some(Transition::replace(
                 position,
-                State::animated(Actor::Zonk(*self), Animation::zonk_pre_fall()),
+                self.in_phase(RoundedPhase::AwaitingFall),
             ));
         }
 
@@ -67,14 +91,14 @@ impl Zonk {
             return None;
         }
 
-        for direction in [Direction::Left, Direction::Right] {
-            let side = world.offset(position, direction)?;
+        for direction in [Horizontal::Left, Horizontal::Right] {
+            let side = world.offset(position, direction.direction())?;
             let diagonal = world.offset(side, Direction::Down)?;
             if world.is_empty(side) && world.is_empty(diagonal) {
                 return Some(Transition::prepare_rounded_roll(
                     position,
                     side,
-                    Actor::Zonk(*self),
+                    RoundedActor::Zonk(*self),
                     direction,
                 ));
             }
@@ -100,8 +124,78 @@ impl Zonk {
         Some(Transition::move_actor(
             position,
             below,
-            Actor::Zonk(Self { falling: true }),
-            Direction::Down,
+            RoundedActor::Zonk(Self {
+                phase: RoundedPhase::Momentum,
+            }),
         ))
+    }
+}
+
+impl Zonk {
+    /// Land: resolve this actor-owned phase against the live board.
+    pub(super) fn land(&self, position: Position, world: &WorldView<'_>) -> Transition {
+        if world.freeze_zonks() {
+            return Transition::replace(position, State::new(Actor::Zonk(Self::resting())));
+        }
+        if let Some(below) = world.offset(position, Direction::Down) {
+            if let Some(target) = world.state(below) {
+                match target.actor() {
+                    Actor::Murphy(_) if murphy_is_protected_from_falling_actor(target) => {
+                        // Horizontal push states 0x0e/0x0f/0x25/
+                        // 0x26/0x28/0x29 are explicit original crush
+                        // exceptions. The DOS routine returns before
+                        // its later Fall-sound call on this path.
+                        return Transition::replace(
+                            position,
+                            State::new(Actor::Zonk(Zonk::resting())),
+                        );
+                    }
+                    Actor::Murphy(_) => {
+                        // Murphy has already taken his player-first
+                        // update this tick. Remaining here therefore
+                        // means the falling Zonk genuinely crushes him.
+                        return explode_at(world, below, false);
+                    }
+                    Actor::SnikSnak(_) | Actor::Electron(_) => {
+                        return explode_at(world, below, false);
+                    }
+                    Actor::OrangeDisk(_) if target.is_idle() => {
+                        // A Zonk arms an otherwise stable Orange Disk
+                        // after a short delay while itself comes to rest.
+                        let orange = OrangeDisk::resting()
+                            .in_phase(super::orange_disk::OrangePhase::Fuse(Frame::first()));
+                        return Transition::new(
+                            vec![
+                                CellWrite::new(position, State::new(Actor::Zonk(Zonk::resting()))),
+                                CellWrite::new(below, orange),
+                            ],
+                            Vec::new(),
+                        );
+                    }
+                    _ => {}
+                }
+            }
+            if world.is_empty(below) {
+                // Retained momentum begins the next cell transfer on
+                // this completion callback. Only the first unsupported
+                // resting state uses `ZonkPreFall`; inserting an idle
+                // update here would make a long fall visibly stutter.
+                return Transition::move_actor(
+                    position,
+                    below,
+                    RoundedActor::Zonk(Zonk::falling()),
+                );
+            }
+            // Landing on a non-reactive occupant is the one safe Zonk
+            // terminal path that selects the original Fall effect.
+            return Transition::new(
+                vec![CellWrite::new(
+                    position,
+                    State::new(Actor::Zonk(Zonk::resting())),
+                )],
+                vec![GameEvent::PlaySound(SoundEffect::Fall)],
+            );
+        }
+        Transition::replace(position, self.in_phase(RoundedPhase::Momentum))
     }
 }

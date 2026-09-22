@@ -58,3 +58,22 @@ impl EnemyTurn {
         self.candidate_frame(direction).wrapping_add(7) & 7
     }
 }
+
+/// Legal wall-following phases shared by Snik Snaks and Electrons.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum EnemyPhase {
+    /// Cadence-gated eight-picture candidate scan.
+    Turning {
+        /// Clockwise or counter-clockwise candidate ordering.
+        turn: EnemyTurn,
+        /// Current original low-three-bit picture.
+        frame: super::Frame<8>,
+    },
+    /// Eight-update transfer with a destination-owned source reservation.
+    Moving {
+        /// Cardinal direction of the transfer.
+        direction: Direction,
+        /// Current picture, including the source-release boundary at six.
+        frame: super::Frame<8>,
+    },
+}

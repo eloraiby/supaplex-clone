@@ -11,16 +11,21 @@ pub struct Terminal {
     /// Signed original-style counter incremented once per simulation update.
     delay: i8,
     /// FIXED.DAT scanline phase representing the screen's current scroll offset.
-    screen_frame: u8,
+    screen_frame: super::Frame<7>,
 }
 
 impl Terminal {
+    /// Derives the retained screen picture without an independent animation clock.
+    pub(super) fn animation(self) -> super::Animation {
+        super::Animation::view(super::AnimationKind::Terminal, self.screen_frame.index(), 7)
+    }
+
     /// Creates an unused panel ready to choose its first randomized delay.
     pub const fn new() -> Self {
         Self {
             activated: false,
             delay: 0,
-            screen_frame: 0,
+            screen_frame: super::Frame::first(),
         }
     }
 
@@ -42,7 +47,7 @@ impl Terminal {
 
     /// Returns the current FIXED.DAT scanline phase of the scrolling screen.
     pub const fn screen_frame(self) -> u8 {
-        self.screen_frame
+        self.screen_frame.index()
     }
 
     /// Replaces the signed delay and advances the displayed scroll position.
@@ -53,7 +58,7 @@ impl Terminal {
     pub(crate) const fn after_scroll(self, delay: i8) -> Self {
         Self {
             delay,
-            screen_frame: (self.screen_frame + 1) % 7,
+            screen_frame: self.screen_frame.wrapping_next(),
             ..self
         }
     }

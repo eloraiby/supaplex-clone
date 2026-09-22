@@ -81,6 +81,15 @@ pub enum Horizontal {
 }
 
 impl Horizontal {
+    /// Rejects vertical player input before constructing a horizontal action.
+    pub const fn from_direction(direction: Direction) -> Option<Self> {
+        match direction {
+            Direction::Left => Some(Self::Left),
+            Direction::Right => Some(Self::Right),
+            Direction::Up | Direction::Down => None,
+        }
+    }
+
     /// Converts a restricted direction for board-neighbor lookup.
     pub const fn direction(self) -> Direction {
         match self {

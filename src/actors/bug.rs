@@ -1,19 +1,100 @@
-//! Bug identity and scheduled behavior.
+//! Cadence-gated Bug activity and safe intervals selected by the session RNG.
 
-use super::{Position, Transition};
-use crate::game::WorldView;
+use super::{
+    Actor, Animation, AnimationKind, CellWrite, Frame, GameEvent, Position, State, Transition,
+};
+use crate::game::{SoundEffect, WorldView};
 
-/// A Base-like hazard whose animation alternates safe and active frames.
-#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
-pub struct Bug;
+/// A safe interval whose private fields preserve `elapsed < duration`.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct Cooldown {
+    /// Number of quarter ticks already consumed.
+    elapsed: u8,
+    /// Positive length chosen by the original random-delay calculation.
+    duration: std::num::NonZeroU8,
+}
+
+/// The complete set of legal Bug phases.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum Bug {
+    /// Fourteen lethal pictures, advanced only on quarter ticks.
+    Active(Frame<14>),
+    /// Safe interval whose expiry returns to active picture zero.
+    Dormant(Cooldown),
+    /// Safe Bug retained while Murphy completes an adjacent snap.
+    Held,
+}
 
 impl Bug {
-    /// Has no movement; its repeating animation controls Murphy interactions.
+    /// Creates the synchronized active phase used by newly loaded levels.
+    pub const fn new() -> Self {
+        Self::Active(Frame::first())
+    }
+
+    /// Starts an independently randomized, strictly positive safe interval.
+    pub(super) fn dormant(delay: u8) -> Self {
+        Self::Dormant(Cooldown {
+            elapsed: 0,
+            duration: std::num::NonZeroU8::new(delay).expect("Bug cooldown must be positive"),
+        })
+    }
+
+    /// Derives lethal, safe, or reserved artwork from the current phase.
+    pub(super) fn animation(self) -> Animation {
+        match self {
+            Self::Active(frame) => Animation::view(AnimationKind::Bug, frame.index(), 14),
+            Self::Dormant(cooldown) => Animation::view(
+                AnimationKind::BugDormant,
+                cooldown.elapsed,
+                cooldown.duration.get(),
+            ),
+            Self::Held => Animation::view(AnimationKind::MurphyPushTarget, 0, 1),
+        }
+    }
+
+    /// Advances on quarter ticks and asks the game to consume RNG in board order.
     pub(super) fn transition(
         &self,
-        _position: Position,
-        _world: &WorldView<'_>,
+        position: Position,
+        world: &WorldView<'_>,
     ) -> Option<Transition> {
-        None
+        if !world.tick_count().is_multiple_of(4) {
+            return None;
+        }
+        let next = match *self {
+            Self::Held => return None,
+            Self::Active(frame) => match frame.next() {
+                Some(frame) => Self::Active(frame),
+                None => {
+                    return Some(Transition::new(
+                        Vec::new(),
+                        vec![GameEvent::RandomizeBug(position)],
+                    ));
+                }
+            },
+            Self::Dormant(mut cooldown) => {
+                cooldown.elapsed += 1;
+                match cooldown.elapsed < cooldown.duration.get() {
+                    true => Self::Dormant(cooldown),
+                    false => Self::new(),
+                }
+            }
+        };
+        // Activation at picture zero chirps too; deferring to picture one loses a sound.
+        let events = (matches!(next, Self::Active(_)) && world.has_neighboring_murphy(position))
+            .then_some(GameEvent::PlaySound(SoundEffect::Bug))
+            .into_iter()
+            .collect();
+        Some(Transition::new(
+            vec![CellWrite::new(position, State::new(Actor::Bug(next)))],
+            events,
+        ))
+    }
+}
+
+impl Default for Bug {
+    /// Starts at the canonical active picture zero.
+    fn default() -> Self {
+        Self::new()
     }
 }

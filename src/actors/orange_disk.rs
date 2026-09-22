@@ -1,60 +1,213 @@
 //! OrangeDisk identity and scheduled behavior.
 
-use super::{Actor, Animation, CellWrite, Direction, Position, State, Transition, explode_at};
+use super::{
+    Actor, Animation, AnimationKind, CellWrite, Direction, Frame, GameEvent, Position, State,
+    Transition, explode_at,
+};
 use crate::game::WorldView;
 
-/// Falling explosive disk that detonates when a fall reaches an obstruction.
+/// Legal phases of an Orange Disk's source-retained fall or triggered fuse.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum OrangePhase {
+    /// Stationary and available for a horizontal push.
+    Resting,
+    /// Two original updates before the first visible falling picture.
+    AwaitingFall(Frame<2>),
+    /// Eight-picture fall whose logical owner remains in the source cell.
+    Falling(Frame<8>),
+    /// Six-update delay after being struck by a falling Zonk.
+    Fuse(Frame<6>),
+    /// Reserved by Murphy until push completion or cancellation.
+    Held,
+}
+
+/// Falling explosive disk with only its own legal phases.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct OrangeDisk {
-    /// Whether the disk has moved downward and is armed to explode on landing.
-    falling: bool,
+    /// Sole authoritative phase, including any bounded progress counter.
+    phase: OrangePhase,
 }
 
 impl OrangeDisk {
-    /// Creates the momentum-bearing state used by completed falls and pushes.
-    pub(super) const fn falling() -> Self {
-        Self { falling: true }
-    }
-
-    /// Creates a stable disk that has not begun a fall.
+    /// Creates a stationary disk loaded from a level.
     pub const fn resting() -> Self {
-        Self { falling: false }
+        Self {
+            phase: OrangePhase::Resting,
+        }
     }
 
-    /// Reports whether the disk has begun its irreversible fall.
+    /// Reports whether a downward transfer has been armed or started.
     pub const fn is_falling(self) -> bool {
-        self.falling
+        matches!(
+            self.phase,
+            OrangePhase::AwaitingFall(_) | OrangePhase::Falling(_)
+        )
     }
 
-    /// Falls through empty space or explodes after reaching an obstruction.
+    /// Exposes the typed phase for collision and diagnostic inspection.
+    pub const fn phase(self) -> OrangePhase {
+        self.phase
+    }
+
+    /// Constructs a complete Orange Disk cell from an Orange-only phase.
+    pub(super) fn in_phase(mut self, phase: OrangePhase) -> State {
+        self.phase = phase;
+        State::new(Actor::OrangeDisk(self))
+    }
+
+    /// Derives the visible sprite without storing a parallel animation state.
+    pub(super) fn animation(self) -> Animation {
+        match self.phase {
+            OrangePhase::Resting => Animation::idle(),
+            OrangePhase::AwaitingFall(frame) => {
+                Animation::view(AnimationKind::OrangePreFall, frame.index(), 2)
+            }
+            OrangePhase::Falling(frame) => {
+                Animation::view(AnimationKind::OrangeFalling, frame.index(), 8)
+            }
+            OrangePhase::Fuse(frame) => {
+                Animation::view(AnimationKind::OrangeDiskFuse, frame.index(), 6)
+            }
+            OrangePhase::Held => Animation::view(AnimationKind::MurphyPushTarget, 0, 1),
+        }
+    }
+
+    /// Advances the disk's exhaustive state machine once in row-major order.
     pub(super) fn transition(
         &self,
         position: Position,
         world: &WorldView<'_>,
     ) -> Option<Transition> {
-        let below = world.offset(position, Direction::Down)?;
-        if world.is_empty(below) {
-            // A resting Orange Disk installs the original state-0x20 delay and
-            // reserves the cell below before any falling artwork is shown.
+        match self.phase {
+            OrangePhase::Resting => {
+                let below = world.offset(position, Direction::Down)?;
+                world.is_empty(below).then(|| {
+                    Transition::new(
+                        vec![
+                            CellWrite::new(
+                                position,
+                                self.in_phase(OrangePhase::AwaitingFall(Frame::first())),
+                            ),
+                            CellWrite::new(below, State::rounded_destination()),
+                        ],
+                        Vec::new(),
+                    )
+                })
+            }
+            OrangePhase::Held => None,
+            OrangePhase::AwaitingFall(frame) => match frame.next() {
+                Some(frame) => Some(Transition::replace(
+                    position,
+                    self.in_phase(OrangePhase::AwaitingFall(frame)),
+                )),
+                None => self.begin_fall(position, world),
+            },
+            OrangePhase::Falling(frame) => match frame.next() {
+                Some(frame) => Some(Transition::replace(
+                    position,
+                    self.in_phase(OrangePhase::Falling(frame)),
+                )),
+                None => self.finish_fall(position, world),
+            },
+            OrangePhase::Fuse(frame) => Some(match frame.next() {
+                Some(frame) => {
+                    Transition::replace(position, self.in_phase(OrangePhase::Fuse(frame)))
+                }
+                None => explode_at(world, position, false),
+            }),
+        }
+    }
+
+    /// Begin fall: resolve this actor-owned phase against the live board.
+    fn begin_fall(&self, position: Position, world: &WorldView<'_>) -> Option<Transition> {
+        let Some(destination) = world.offset(position, Direction::Down) else {
+            return Some(Transition::replace(
+                position,
+                self.in_phase(OrangePhase::Resting),
+            ));
+        };
+        if !world.state(destination).is_some_and(|state| {
+            matches!(state.actor(), Actor::Empty(_))
+                && state.animation().kind() == AnimationKind::RoundedDestination
+        }) {
+            return Some(Transition::replace(
+                position,
+                State::new(Actor::OrangeDisk(OrangeDisk::resting())),
+            ));
+        }
+        Some(Transition::replace(
+            position,
+            self.in_phase(OrangePhase::Falling(Frame::first())),
+        ))
+    }
+
+    /// Finish fall: resolve this actor-owned phase against the live board.
+    fn finish_fall(&self, position: Position, world: &WorldView<'_>) -> Option<Transition> {
+        let Some(destination) = world.offset(position, Direction::Down) else {
+            return Some(Transition::replace(
+                position,
+                State::new(Actor::OrangeDisk(OrangeDisk::resting())),
+            ));
+        };
+        let destination_reserved = world.state(destination).is_some_and(|state| {
+            matches!(state.actor(), Actor::Empty(_))
+                && state.animation().kind() == AnimationKind::RoundedDestination
+        });
+        if !destination_reserved {
+            return Some(explode_at(world, position, false));
+        }
+
+        let landing_cell = world.offset(destination, Direction::Down);
+        if landing_cell.is_some_and(|cell| world.is_empty(cell)) {
+            let landing_cell = landing_cell.expect("validated landing cell exists");
             return Some(Transition::new(
                 vec![
+                    CellWrite::new(position, State::empty()),
                     CellWrite::new(
-                        position,
-                        State::animated(
-                            Actor::OrangeDisk(Self { falling: true }),
-                            Animation::orange_pre_fall(),
-                        ),
+                        destination,
+                        self.in_phase(OrangePhase::Falling(Frame::first())),
                     ),
-                    CellWrite::new(below, State::rounded_destination()),
+                    CellWrite::new(landing_cell, State::rounded_destination()),
                 ],
                 Vec::new(),
             ));
         }
 
-        if self.falling {
-            return Some(explode_at(world, position, false));
+        if landing_cell
+            .and_then(|cell| world.state(cell))
+            .is_some_and(|state| matches!(state.actor(), Actor::Explosion(_)))
+        {
+            return Some(Transition::new(
+                vec![
+                    CellWrite::new(position, State::empty()),
+                    CellWrite::new(
+                        destination,
+                        State::new(Actor::OrangeDisk(OrangeDisk::resting())),
+                    ),
+                ],
+                Vec::new(),
+            ));
         }
 
-        None
+        let mut explosion = explode_at(world, destination, false);
+        // The DOS routine clears the old falling source before it
+        // detonates the newly occupied destination. Our immutable
+        // WorldView still exposes the Orange Disk at that source, so
+        // discard only the spurious delayed timer it would otherwise
+        // receive as a reactive neighbor. The immediate blast write at
+        // the source remains: the new 3x3 wave legitimately covers it.
+        explosion.events.retain(|event| {
+            !matches!(
+                event,
+                GameEvent::ScheduleExplosion {
+                    position: scheduled,
+                    ..
+                } if *scheduled == position
+            )
+        });
+        explosion
+            .writes
+            .insert(0, CellWrite::new(position, State::empty()));
+        Some(explosion)
     }
 }

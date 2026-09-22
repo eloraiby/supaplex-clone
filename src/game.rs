@@ -619,7 +619,7 @@ impl Game {
             self.tick,
             &self.special_ports,
         );
-        state.actor().transition(&state, position, &world)
+        state.actor().transition(position, &world)
     }
 
     /// Commits every write, then applies events before the next scheduled cell.
@@ -1105,9 +1105,9 @@ impl<'board> WorldView<'board> {
 /// Maps one serialized level byte to a typed actor and default animation.
 fn state_from_tile(tile: u8) -> Result<State, BoardError> {
     let actor = match tile {
-        0 => Actor::Empty(Empty),
+        0 => Actor::Empty(Empty::Space),
         1 => Actor::Zonk(Zonk::resting()),
-        2 => Actor::Base(Base),
+        2 => Actor::Base(Base::Resting),
         3 => Actor::Murphy(Murphy::new()),
         4 => Actor::Infotron(Infotron::resting()),
         5 => Actor::RamChip(RamChip::new(RamChipShape::Center)),
@@ -1125,16 +1125,16 @@ fn state_from_tile(tile: u8) -> Result<State, BoardError> {
         // Heading Right makes the left-hand wall-following preference test Up
         // first, matching the original serialized state-zero Snik Snak.
         17 => Actor::SnikSnak(SnikSnak::new(Direction::Right)),
-        18 => Actor::YellowDisk(YellowDisk),
+        18 => Actor::YellowDisk(YellowDisk::Resting),
         19 => Actor::Terminal(Terminal::new()),
-        20 => Actor::RedDisk(RedDisk),
+        20 => Actor::RedDisk(RedDisk::Collectible),
         21 => Actor::Port(Port::new(PortDirections::Vertical, false)),
         22 => Actor::Port(Port::new(PortDirections::Horizontal, false)),
         23 => Actor::Port(Port::new(PortDirections::Any, false)),
         // Electrons begin in the same original state-zero left-turn cycle as
         // Snik Snaks; a rightward prior heading makes its first candidate Up.
         24 => Actor::Electron(Electron::new(Direction::Right)),
-        25 => Actor::Bug(Bug),
+        25 => Actor::Bug(Bug::new()),
         26 => Actor::RamChip(RamChip::new(RamChipShape::Left)),
         27 => Actor::RamChip(RamChip::new(RamChipShape::Right)),
         28..=37 => Actor::Hardware(Hardware::new(tile - 27)),
@@ -1256,7 +1256,7 @@ mod tests {
     #[test]
     fn board_is_a_single_row_major_vector() {
         let cells = (0..6)
-            .map(|_| State::new(Actor::Base(Base)))
+            .map(|_| State::new(Actor::Base(Base::Resting)))
             .collect::<Vec<_>>();
         let board = Board::new(3, 2, cells).expect("shape should be valid");
 
@@ -1441,7 +1441,7 @@ mod tests {
         let mut base = game_with(
             &[
                 murphy.clone(),
-                (Position::new(3, 2), State::new(Actor::Base(Base))),
+                (Position::new(3, 2), State::new(Actor::Base(Base::Resting))),
             ],
             0,
         );
@@ -1505,7 +1505,7 @@ mod tests {
                     Position::new(1, 1),
                     State::new(Actor::Murphy(Murphy::new())),
                 ),
-                (Position::new(2, 2), State::new(Actor::Bug(Bug))),
+                (Position::new(2, 2), State::new(Actor::Bug(Bug::new()))),
             ],
             0,
         );
@@ -1520,7 +1520,7 @@ mod tests {
                     Position::new(1, 4),
                     State::new(Actor::Murphy(Murphy::new())),
                 ),
-                (Position::new(4, 1), State::new(Actor::Bug(Bug))),
+                (Position::new(4, 1), State::new(Actor::Bug(Bug::new()))),
             ],
             0,
         );
@@ -2171,7 +2171,7 @@ mod tests {
                     Position::new(2, 2),
                     State::new(Actor::Murphy(Murphy::new())),
                 ),
-                (Position::new(3, 2), State::new(Actor::Base(Base))),
+                (Position::new(3, 2), State::new(Actor::Base(Base::Resting))),
             ],
             0,
         );
@@ -3263,7 +3263,10 @@ mod tests {
                     Position::new(3, 1),
                     State::new(Actor::Infotron(Infotron::resting())),
                 ),
-                (Position::new(3, 3), State::new(Actor::RedDisk(RedDisk))),
+                (
+                    Position::new(3, 3),
+                    State::new(Actor::RedDisk(RedDisk::Collectible)),
+                ),
             ],
             0,
         );
@@ -3573,7 +3576,7 @@ mod tests {
         let mut game = game_with(
             &[
                 (murphy_position, State::new(Actor::Murphy(Murphy::new()))),
-                (neighbor_position, State::new(Actor::Base(Base))),
+                (neighbor_position, State::new(Actor::Base(Base::Resting))),
             ],
             0,
         );
@@ -4010,7 +4013,7 @@ mod tests {
                 ),
                 (
                     Position::new(4, 3),
-                    State::new(Actor::YellowDisk(YellowDisk)),
+                    State::new(Actor::YellowDisk(YellowDisk::Resting)),
                 ),
             ],
             0,
@@ -4119,7 +4122,7 @@ mod tests {
                 ),
                 (
                     Position::new(2, 2),
-                    State::new(Actor::YellowDisk(YellowDisk)),
+                    State::new(Actor::YellowDisk(YellowDisk::Resting)),
                 ),
                 (
                     Position::new(3, 2),
@@ -4162,7 +4165,10 @@ mod tests {
                     terminal_position,
                     State::new(Actor::Terminal(Terminal::new())),
                 ),
-                (yellow_position, State::new(Actor::YellowDisk(YellowDisk))),
+                (
+                    yellow_position,
+                    State::new(Actor::YellowDisk(YellowDisk::Resting)),
+                ),
             ],
             0,
         );
@@ -4182,7 +4188,10 @@ mod tests {
             game.tick(Input::default());
         }
         game.board
-            .set(yellow_position, State::new(Actor::YellowDisk(YellowDisk)))
+            .set(
+                yellow_position,
+                State::new(Actor::YellowDisk(YellowDisk::Resting)),
+            )
             .expect("fixture position should remain valid");
         game.tick(Input {
             direction: Some(Direction::Right),
@@ -4246,11 +4255,11 @@ mod tests {
                 ),
                 (
                     Position::new(2, 2),
-                    State::new(Actor::YellowDisk(YellowDisk)),
+                    State::new(Actor::YellowDisk(YellowDisk::Resting)),
                 ),
                 (
                     Position::new(3, 2),
-                    State::new(Actor::YellowDisk(YellowDisk)),
+                    State::new(Actor::YellowDisk(YellowDisk::Resting)),
                 ),
             ],
             0,
@@ -4297,7 +4306,7 @@ mod tests {
             )],
             0,
         );
-        assert!(matches!(Actor::Empty(Empty), Actor::Empty(_)));
+        assert!(matches!(Actor::Empty(Empty::Space), Actor::Empty(_)));
         assert_eq!(game.tick_count(), 0);
     }
 
@@ -4310,8 +4319,8 @@ mod tests {
                     Position::new(1, 4),
                     State::new(Actor::Murphy(Murphy::new())),
                 ),
-                (Position::new(2, 2), State::new(Actor::Bug(Bug))),
-                (Position::new(4, 2), State::new(Actor::Bug(Bug))),
+                (Position::new(2, 2), State::new(Actor::Bug(Bug::new()))),
+                (Position::new(4, 2), State::new(Actor::Bug(Bug::new()))),
             ],
             0,
         );
@@ -4360,8 +4369,8 @@ mod tests {
                     Position::new(1, 4),
                     State::new(Actor::Murphy(Murphy::new())),
                 ),
-                (Position::new(2, 2), State::new(Actor::Bug(Bug))),
-                (Position::new(4, 2), State::new(Actor::Bug(Bug))),
+                (Position::new(2, 2), State::new(Actor::Bug(Bug::new()))),
+                (Position::new(4, 2), State::new(Actor::Bug(Bug::new()))),
             ],
             0,
         );
@@ -4398,7 +4407,7 @@ mod tests {
                     Position::new(1, 2),
                     State::new(Actor::Murphy(Murphy::new())),
                 ),
-                (Position::new(2, 2), State::new(Actor::Bug(Bug))),
+                (Position::new(2, 2), State::new(Actor::Bug(Bug::new()))),
             ],
             0,
         );

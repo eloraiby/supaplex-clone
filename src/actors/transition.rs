@@ -4,7 +4,7 @@
 //! commits writes and events before invoking the next scheduled actor, keeping
 //! mutable board ownership outside actor logic and preserving linear ordering.
 
-use super::{Actor, Animation, Direction, Empty, MurphyMoveTarget, Position, State};
+use super::{Direction, MurphyMoveTarget, Position, State};
 use crate::{game::SoundEffect, level::SpecialPort};
 
 /// One atomic write included in an actor's immediate board transition.
@@ -88,87 +88,76 @@ impl Transition {
         Self::new(vec![CellWrite::new(position, state)], Vec::new())
     }
 
-    /// Moves an actor atomically without producing a gameplay event.
+    /// Begins a downward transfer for one of the two rounded actor types.
     pub(super) fn move_actor(
         source: Position,
         destination: Position,
-        actor: Actor,
-        direction: Direction,
+        actor: super::rounded::RoundedActor,
     ) -> Self {
-        Self::move_actor_with_events(source, destination, actor, direction, Vec::new())
-    }
-
-    /// Moves an actor atomically and emits side effects after its cell writes.
-    pub(super) fn move_actor_with_events(
-        source: Position,
-        destination: Position,
-        actor: Actor,
-        direction: Direction,
-        events: Vec<GameEvent>,
-    ) -> Self {
-        let destination_state = State::animated(actor, Animation::moving(direction));
         Self::new(
             vec![
-                CellWrite::new(source, State::vacating(direction)),
-                CellWrite::new(destination, destination_state),
+                CellWrite::new(source, State::vacating(Direction::Down)),
+                CellWrite::new(
+                    destination,
+                    actor.in_phase(super::rounded::RoundedPhase::Falling(super::Frame::first())),
+                ),
             ],
-            events,
+            Vec::new(),
         )
     }
 
-    /// Starts a Snik Snak transfer with a destination-owned release schedule.
+    /// Begins a Snik Snak transfer with a destination-owned source marker.
     pub(super) fn move_snik_snak(
         source: Position,
         destination: Position,
-        actor: Actor,
+        actor: super::SnikSnak,
         direction: Direction,
     ) -> Self {
-        // A generic Vacating animation releases itself after eight callbacks.
-        // The DOS enemy instead clears its source from movement frame seven,
-        // so this stable reservation is explicitly owned by the destination.
-        let destination_state = State::animated(actor, Animation::snik_snak_move(direction));
-        let source_state = State::animated(
-            Actor::Empty(Empty),
-            Animation::snik_snak_vacating(direction),
-        );
         Self::new(
             vec![
-                CellWrite::new(source, source_state),
-                CellWrite::new(destination, destination_state),
+                CellWrite::new(source, State::loaded_snik_snak_source(direction)),
+                CellWrite::new(
+                    destination,
+                    actor.in_phase(super::enemy::EnemyPhase::Moving {
+                        direction,
+                        frame: super::Frame::first(),
+                    }),
+                ),
             ],
             Vec::new(),
         )
     }
 
-    /// Starts an Electron transfer with destination-owned source cleanup.
+    /// Begins an Electron transfer with its own source marker family.
     pub(super) fn move_electron(
         source: Position,
         destination: Position,
-        actor: Actor,
+        actor: super::Electron,
         direction: Direction,
     ) -> Self {
-        // Separate animation kinds keep Electron reservations distinguishable
-        // from a Snik Snak or generic actor crossing the same cells later.
-        let destination_state = State::animated(actor, Animation::electron_move(direction));
-        let source_state =
-            State::animated(Actor::Empty(Empty), Animation::electron_vacating(direction));
         Self::new(
             vec![
-                CellWrite::new(source, source_state),
-                CellWrite::new(destination, destination_state),
+                CellWrite::new(source, State::loaded_electron_source(direction)),
+                CellWrite::new(
+                    destination,
+                    actor.in_phase(super::enemy::EnemyPhase::Moving {
+                        direction,
+                        frame: super::Frame::first(),
+                    }),
+                ),
             ],
             Vec::new(),
         )
     }
 
-    /// Moves Murphy with a target-specific eight- or nine-frame descriptor.
+    /// Starts a material-specific Murphy step without session side effects.
     pub(super) fn move_murphy(
         source: Position,
         destination: Position,
-        actor: Actor,
+        actor: super::Murphy,
         direction: Direction,
         target: MurphyMoveTarget,
-        looking_left: bool,
+        _looking_left: bool,
     ) -> Self {
         Self::move_murphy_with_events(
             source,
@@ -176,46 +165,44 @@ impl Transition {
             actor,
             direction,
             target,
-            looking_left,
+            _looking_left,
             Vec::new(),
         )
     }
 
-    /// Moves Murphy while emitting action-start side effects after both writes.
+    /// Starts a typed Murphy step and emits its sound after both cell writes.
     pub(super) fn move_murphy_with_events(
         source: Position,
         destination: Position,
-        actor: Actor,
+        actor: super::Murphy,
         direction: Direction,
         target: MurphyMoveTarget,
-        looking_left: bool,
+        _looking_left: bool,
         events: Vec<GameEvent>,
     ) -> Self {
-        // The destination owns animation progress from the initiating update;
-        // the sound belongs to that same atomic start, never to completion.
-        let animation = Animation::murphy_move(direction, target, looking_left);
-        let frame_count = animation.frame_count();
+        let destination_state = actor.moving(direction, target);
+        let duration = destination_state.animation().frame_count();
         Self::new(
             vec![
-                CellWrite::new(source, State::vacating_for(direction, frame_count)),
-                CellWrite::new(destination, State::animated(actor, animation)),
+                CellWrite::new(source, State::vacating_for(direction, duration)),
+                CellWrite::new(destination, destination_state),
             ],
             events,
         )
     }
 
-    /// Begins the two-update side delay while reserving only the adjacent cell.
+    /// Begins a lateral roll only for rounded actors and horizontal directions.
     pub(super) fn prepare_rounded_roll(
         source: Position,
         side: Position,
-        actor: Actor,
-        direction: Direction,
+        actor: super::rounded::RoundedActor,
+        direction: super::Horizontal,
     ) -> Self {
         Self::new(
             vec![
                 CellWrite::new(
                     source,
-                    State::animated(actor, Animation::rounded_pre_roll(direction)),
+                    actor.in_phase(super::rounded::RoundedPhase::PreparingRoll(direction)),
                 ),
                 CellWrite::new(side, State::rounded_side()),
             ],
