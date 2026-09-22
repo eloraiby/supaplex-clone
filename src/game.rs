@@ -7,12 +7,14 @@ use std::{
     time::{SystemTime, UNIX_EPOCH},
 };
 
+use crate::actors::{empty::Reservation, murphy::MurphyPhase};
+
 use crate::{
     actors::{
-        Actor, AnimationKind, Base, Bug, CHAIN_REACTION_FRAMES, Direction, Electron, Empty, Exit,
-        GameEvent, Hardware, Infotron, InvisibleWall, Murphy, OrangeDisk, Port, PortDirections,
-        Position, RED_DISK_DETONATION_COUNTDOWN, RamChip, RamChipShape, RedDisk, SnikSnak, State,
-        Terminal, Transition, YellowDisk, Zonk,
+        Actor, Base, Bug, CHAIN_REACTION_FRAMES, Direction, Electron, Empty, Exit, GameEvent,
+        Hardware, Infotron, InvisibleWall, Murphy, OrangeDisk, Port, PortDirections, Position,
+        RED_DISK_DETONATION_COUNTDOWN, RamChip, RamChipShape, RedDisk, SnikSnak, State, Terminal,
+        Transition, YellowDisk, Zonk,
     },
     level::{LEVEL_HEIGHT, LEVEL_WIDTH, Level, SpecialPort},
 };
@@ -538,8 +540,8 @@ impl Game {
                 .and_then(|position| self.board.state(position))
                 .is_some_and(|state| {
                     matches!(
-                        state.animation().kind(),
-                        AnimationKind::Murphy(crate::actors::MurphyAnimation::Exit)
+                        state.actor(),
+                        Actor::Murphy(actor) if matches!(actor.phase(), MurphyPhase::Exiting(_))
                     )
                 });
 
@@ -574,8 +576,7 @@ impl Game {
                     .position(index)
                     .expect("enumerated board indices are always valid");
                 let is_new_murphy_source = Some(position) == murphy_source
-                    && matches!(state.actor(), Actor::Empty(_))
-                    && matches!(state.animation().kind(), AnimationKind::Vacating(_));
+                    && matches!(state.reservation(), Some(Reservation::Vacating { .. }));
                 (!is_new_murphy_source && !matches!(state.actor(), Actor::Murphy(_)) && simulating)
                     .then(|| (position, std::mem::discriminant(state.actor())))
             })
@@ -818,14 +819,12 @@ impl Game {
         };
         match state.actor() {
             Actor::Murphy(_) => self.planted_red_disk = Some(planted),
-            Actor::Empty(_) if matches!(state.animation().kind(), AnimationKind::Vacating(_)) => {
+            Actor::Empty(Empty::Reserved(Reservation::Vacating { .. })) => {
                 // Murphy's just-vacated source remains collision-reserved until
                 // his movement finishes, so the concealed fuse stays hidden.
                 self.planted_red_disk = Some(planted);
             }
-            Actor::Empty(_) | Actor::RedDisk(_)
-                if state.is_empty() || state.animation().kind() == AnimationKind::RedDiskFuse =>
-            {
+            Actor::Empty(Empty::Space) | Actor::RedDisk(RedDisk::Planted(_)) => {
                 // A visible State exposes the current animation frame, while
                 // this retained record lets Murphy cross without losing time.
                 self.board
@@ -1076,7 +1075,7 @@ impl<'board> WorldView<'board> {
     /// Reports whether a Bug's current animation frame is dangerous to Murphy.
     pub(crate) fn is_bug_active(&self, position: Position) -> bool {
         self.state(position)
-            .is_some_and(|state| state.animation().kind() == AnimationKind::Bug)
+            .is_some_and(|state| matches!(state.actor(), Actor::Bug(Bug::Active(_))))
     }
 
     /// Reports whether any of the eight surrounding cells currently holds Murphy.
@@ -1102,7 +1101,7 @@ impl<'board> WorldView<'board> {
     }
 }
 
-/// Maps one serialized level byte to a typed actor and default animation.
+/// Maps one serialized level byte to a concrete actor in its initial legal phase.
 fn state_from_tile(tile: u8) -> Result<State, BoardError> {
     let actor = match tile {
         0 => Actor::Empty(Empty::Space),

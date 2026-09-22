@@ -16,6 +16,11 @@ pub struct Infotron {
 }
 
 impl Infotron {
+    /// Creates this actor from a phase belonging to rounded-object physics.
+    pub const fn from_phase(phase: RoundedPhase) -> Self {
+        Self { phase }
+    }
+
     /// Returns the physical state for typed dispatch and collision queries.
     pub const fn phase(self) -> RoundedPhase {
         self.phase
@@ -115,7 +120,7 @@ impl Infotron {
 }
 
 impl Infotron {
-    /// Land: resolve this actor-owned phase against the live board.
+    /// Resolves crushes, landing sounds, and retained momentum after a full fall.
     pub(super) fn land(&self, position: Position, world: &WorldView<'_>) -> Transition {
         if let Some(below) = world.offset(position, Direction::Down) {
             if let Some(target) = world.state(below) {

@@ -16,6 +16,17 @@ pub struct Zonk {
 }
 
 impl Zonk {
+    /// Creates this actor from a phase belonging to rounded-object physics.
+    ///
+    /// A player phase cannot be assigned to a rock.
+    /// ```compile_fail
+    /// use supaplex_clone::actors::{Zonk, murphy::MurphyPhase};
+    /// let rock = Zonk::from_phase(MurphyPhase::Ready);
+    /// ```
+    pub const fn from_phase(phase: RoundedPhase) -> Self {
+        Self { phase }
+    }
+
     /// Returns the physical state for typed dispatch and collision queries.
     pub const fn phase(self) -> RoundedPhase {
         self.phase
@@ -132,7 +143,7 @@ impl Zonk {
 }
 
 impl Zonk {
-    /// Land: resolve this actor-owned phase against the live board.
+    /// Resolves crushes, landing sounds, and retained momentum after a full fall.
     pub(super) fn land(&self, position: Position, world: &WorldView<'_>) -> Transition {
         if world.freeze_zonks() {
             return Transition::replace(position, State::new(Actor::Zonk(Self::resting())));

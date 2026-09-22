@@ -118,7 +118,7 @@ impl OrangeDisk {
         }
     }
 
-    /// Begin fall: resolve this actor-owned phase against the live board.
+    /// Starts the visible fall only while the downward reservation survives.
     fn begin_fall(&self, position: Position, world: &WorldView<'_>) -> Option<Transition> {
         let Some(destination) = world.offset(position, Direction::Down) else {
             return Some(Transition::replace(
@@ -127,8 +127,7 @@ impl OrangeDisk {
             ));
         };
         if !world.state(destination).is_some_and(|state| {
-            matches!(state.actor(), Actor::Empty(_))
-                && state.animation().kind() == AnimationKind::RoundedDestination
+            state.reservation() == Some(super::empty::Reservation::RoundedDestination)
         }) {
             return Some(Transition::replace(
                 position,
@@ -141,7 +140,7 @@ impl OrangeDisk {
         ))
     }
 
-    /// Finish fall: resolve this actor-owned phase against the live board.
+    /// Transfers the disk downward, continues its fall, or detonates on landing.
     fn finish_fall(&self, position: Position, world: &WorldView<'_>) -> Option<Transition> {
         let Some(destination) = world.offset(position, Direction::Down) else {
             return Some(Transition::replace(
@@ -150,8 +149,7 @@ impl OrangeDisk {
             ));
         };
         let destination_reserved = world.state(destination).is_some_and(|state| {
-            matches!(state.actor(), Actor::Empty(_))
-                && state.animation().kind() == AnimationKind::RoundedDestination
+            state.reservation() == Some(super::empty::Reservation::RoundedDestination)
         });
         if !destination_reserved {
             return Some(explode_at(world, position, false));

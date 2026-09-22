@@ -10,6 +10,12 @@ use super::{
 use crate::game::WorldView;
 
 /// Legal physical phases shared by rounded falling objects.
+///
+/// A lateral roll cannot carry a vertical direction.
+/// ```compile_fail
+/// use supaplex_clone::actors::{Direction, Frame, rounded::RoundedPhase};
+/// let roll = RoundedPhase::Rolling { direction: Direction::Up, frame: Frame::first() };
+/// ```
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum RoundedPhase {
     /// Stable object without downward momentum.

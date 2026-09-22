@@ -145,8 +145,8 @@ impl SnikSnak {
 
         if let Some(source) = world.offset(position, direction.opposite())
             && world.state(source).is_some_and(|source_state| {
-                matches!(source_state.actor(), Actor::Empty(_))
-                    && source_state.animation().kind() == AnimationKind::SnikSnakVacating(direction)
+                source_state.reservation()
+                    == Some(super::empty::Reservation::SnikSnakSource(direction))
             })
         {
             // A blast may already have replaced the reservation. As in the DOS

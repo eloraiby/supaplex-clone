@@ -3,11 +3,15 @@
 //! A cell stores only a complete Actor. Presentation is derived on demand, so
 //! there is no independent animation that could contradict its identity.
 
-use super::{
-    Actor, Animation, AnimationKind, Bug, Direction, Electron, Empty, EnemyTurn, RedDisk, SnikSnak,
-};
+use super::{Actor, Animation, Bug, Direction, Electron, Empty, EnemyTurn, RedDisk, SnikSnak};
 
-/// Complete content of one board cell.
+/// Complete content of one board cell, with no independent animation storage.
+///
+/// An arbitrary actor/animation pair cannot be installed in a cell.
+/// ```compile_fail
+/// use supaplex_clone::actors::{Actor, Animation, State, Zonk};
+/// let cell = State::animated(Actor::Zonk(Zonk::resting()), Animation::idle());
+/// ```
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct State {
     /// Actor-specific identity and persistent behavior data.
@@ -30,16 +34,19 @@ impl State {
         Self::new(Actor::Empty(Empty::Reserved(reservation)))
     }
 
-    /// Creates the eight-update source marker for a rounded object's fall.
+    /// Creates a source marker for an eight-picture rounded-object transfer.
     pub(super) fn vacating(direction: Direction) -> Self {
-        Self::vacating_for(direction, 8)
+        Self::vacating_for(direction, super::empty::SourceDuration::Eight)
     }
 
     /// Creates a source marker with the owning Murphy movement's exact duration.
-    pub(super) fn vacating_for(direction: Direction, duration: u8) -> Self {
+    pub(super) fn vacating_for(
+        direction: Direction,
+        duration: super::empty::SourceDuration,
+    ) -> Self {
         Self::reserved(super::empty::Reservation::Vacating {
             direction,
-            duration: std::num::NonZeroU8::new(duration).expect("movement duration is positive"),
+            duration,
         })
     }
 
@@ -120,13 +127,21 @@ impl State {
         Self::reserved(super::empty::Reservation::ElectronSource(direction))
     }
 
+    /// Returns a typed movement marker, excluding ordinary empty space.
+    pub fn reservation(&self) -> Option<super::empty::Reservation> {
+        match self.actor {
+            Actor::Empty(Empty::Reserved(reservation)) => Some(reservation),
+            _ => None,
+        }
+    }
+
     /// Reports whether the cell has no actor and no movement reservation.
     pub fn is_empty(&self) -> bool {
         matches!(self.actor, Actor::Empty(Empty::Space))
     }
 
-    /// Reports whether the actor currently presents its stable, unlocked pose.
+    /// Reports the original idle collision classification for this actor phase.
     pub fn is_idle(&self) -> bool {
-        self.animation().kind() == AnimationKind::Idle
+        self.actor.is_idle()
     }
 }

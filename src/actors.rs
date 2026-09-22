@@ -147,6 +147,63 @@ impl Actor {
         }
     }
 
+    /// Reports the original idle collision state without consulting sprite metadata.
+    pub fn is_idle(&self) -> bool {
+        match self {
+            Self::Empty(empty) => matches!(empty, Empty::Space),
+            Self::Zonk(actor) => matches!(
+                actor.phase(),
+                rounded::RoundedPhase::Resting | rounded::RoundedPhase::Momentum
+            ),
+            Self::Infotron(actor) => matches!(
+                actor.phase(),
+                rounded::RoundedPhase::Resting | rounded::RoundedPhase::Momentum
+            ),
+            Self::Base(actor) => matches!(actor, Base::Resting),
+            Self::Murphy(actor) => matches!(
+                actor.phase(),
+                murphy::MurphyPhase::Ready | murphy::MurphyPhase::PreparingPush { .. }
+            ),
+            Self::OrangeDisk(actor) => matches!(actor.phase(), orange_disk::OrangePhase::Resting),
+            Self::YellowDisk(actor) => matches!(actor, YellowDisk::Resting),
+            Self::RedDisk(actor) => matches!(actor, RedDisk::Collectible),
+            Self::RamChip(_)
+            | Self::Hardware(_)
+            | Self::Exit(_)
+            | Self::Port(_)
+            | Self::InvisibleWall(_) => true,
+            Self::SnikSnak(_)
+            | Self::Electron(_)
+            | Self::Bug(_)
+            | Self::Terminal(_)
+            | Self::Explosion(_) => false,
+        }
+    }
+
+    /// Reports targets whose autonomous behavior is suspended by a Murphy action.
+    pub fn is_held(&self) -> bool {
+        match self {
+            Self::Zonk(actor) => matches!(actor.phase(), rounded::RoundedPhase::Held),
+            Self::Infotron(actor) => matches!(actor.phase(), rounded::RoundedPhase::Held),
+            Self::OrangeDisk(actor) => matches!(actor.phase(), orange_disk::OrangePhase::Held),
+            Self::Base(actor) => matches!(actor, Base::Held),
+            Self::YellowDisk(actor) => matches!(actor, YellowDisk::Held),
+            Self::RedDisk(actor) => matches!(actor, RedDisk::Held),
+            Self::Bug(actor) => matches!(actor, Bug::Held),
+            Self::Empty(_)
+            | Self::Murphy(_)
+            | Self::RamChip(_)
+            | Self::Hardware(_)
+            | Self::Exit(_)
+            | Self::Port(_)
+            | Self::SnikSnak(_)
+            | Self::Terminal(_)
+            | Self::Electron(_)
+            | Self::InvisibleWall(_)
+            | Self::Explosion(_) => false,
+        }
+    }
+
     /// Computes presentation; the returned value has no simulation write-back API.
     pub fn animation(&self) -> Animation {
         match self {

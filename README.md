@@ -178,41 +178,66 @@ conversion is:
 index = width * y + x
 ```
 
-The public `actors` module owns actor identities, behavior, and animation state.
-Simulation and rendering import these types through `supaplex_clone::actors`.
-Concrete actors live in `src/actors/` (`murphy.rs`, `zonk.rs`, `infotron.rs`,
-`snik_snak.rs`, and one file for each other actor). Each file owns its actor's
-private data and behavior; `explosion.rs` also owns blast propagation and
-reservation cleanup. Public actor types are re-exported by `actors.rs`, so
-callers need not depend on the file layout. The former `actor` module path has
-been renamed to `actors`.
+Each board `State` contains one complete `Actor`. The actor owns its legal
+phases and progress; there is no separately assignable animation or completion
+command. For example, a Zonk can be resting, awaiting a fall, rolling, falling,
+or held by Murphy. Its falling phase carries `Frame<8>` and its rolling phase
+requires `Horizontal`, so a Murphy action or an upward roll cannot be assigned
+to a Zonk.
 
-Shared responsibilities are kept in private support modules:
+```rust
+use supaplex_clone::actors::{Actor, Frame, State, Zonk, rounded::RoundedPhase};
+
+let falling_rock = State::new(Actor::Zonk(Zonk::from_phase(
+    RoundedPhase::Falling(Frame::first()),
+)));
+let picture = falling_rock.animation(); // Computed view; returned by value.
+```
+
+Each concrete actor lives under `src/actors/` and advances through an exhaustive
+`match` on its own phase. `actors.rs` dispatches to those state machines and
+re-exports their public types. Completion behavior follows from the phase:
+finishing a Zonk fall invokes its landing rules directly. There is no
+`AnimationNext`, `BeginZonkFall`, or generic actor/animation pairing constructor.
+The former `actor` import path is now `supaplex_clone::actors`.
+
+Shared responsibilities are separated by concern:
 
 | File | Responsibility |
 | --- | --- |
-| `actors.rs` | Concrete `Actor` enum, dispatch, and cross-actor completion rules |
-| `actors/geometry.rs` | Board positions and cardinal directions |
-| `actors/enemy.rs` | Shared eight-frame enemy turn mapping |
-| `actors/animation.rs` | Validated animation phases, timing, and typed completion actions |
-| `actors/state.rs` | Complete cell values and reservation constructors |
+| `actors.rs` | Actor dispatch and typed collision queries |
+| `actors/geometry.rs` | Board positions, cardinal directions, and horizontal-only directions |
+| `actors/frame.rs` | Private, bounded `Frame<N>` values and safe advancement |
+| `actors/rounded.rs` | Legal Zonk/Infotron phases, roll reservations, and shared falling mechanics |
+| `actors/enemy.rs` | Legal enemy phases and eight-picture turn mapping |
+| `actors/empty.rs` | Explicit source, side, and destination reservations |
+| `actors/animation.rs` | Read-only sprite and interpolation descriptions derived from actor phases |
+| `actors/state.rs` | Complete cell values and level/session construction boundaries |
 | `actors/transition.rs` | Owned atomic cell writes and game-session events |
 
-Actor fields and animation storage stay private. Internal constructors and
-transition entry points are visible only where needed within the actor family;
-rendering and other consumers use read-only queries. Actor callbacks take
-`&self` because they compute owned replacement states from an immutable world
-view. The game applies those transitions with exclusive mutable access to the
-board. This ownership boundary needs no `Any`, downcasting, `Cell`, or `RefCell`.
-State transitions retain concrete enums and `match`-based dispatch. When adding
-an actor, keep its local state and behavior in its own file, wire its variant
-into the coordinator, and leave scheduling and session-wide effects in `game.rs`.
+Murphy's preparation, planting, movement, snapping, pushing, port traversal, and
+exit sequence belong to one phase enum. They cannot coexist as independent
+flags or animation commands. Push actions constrain rocks and Orange Disks to
+horizontal directions. His seven-picture Infotron snap, eight-picture ordinary
+travel, nine-picture rightward Red Disk travel, and forty-picture exit use
+distinct bounded frame types. The final movement pose is an explicit resumption
+phase, preserving the update between source release and fresh input.
 
-Each `State` combines an `Actor` with a validated `Animation`. `Actor` is an
-enum of concrete actor structs (`Murphy`, `Zonk`, `Infotron`, `Port`, and so on),
-and its dispatch method calls the transition method belonging to that concrete
-actor. An animation stores its current frame, duration, and promised terminal
-action—settle, act, repeat, explode, disappear, or become an Infotron.
+Rendering calls `State::animation()` to obtain a computed `Animation` value.
+Gameplay uses typed phases and collision queries, not sprite-family tags.
+Changing a rendering description cannot change simulation state. `Frame<N>`
+rejects external indices outside its strip, and its private representation
+prevents unchecked construction. Runtime checks still handle board occupancy,
+bounds, and reservations replaced by earlier actors; these depend on the live
+world rather than on an individual actor's type.
+
+Actor callbacks take `&self` because they compute owned replacement states from
+an immutable world view. The game applies transitions with exclusive mutable
+access to the board. No `Any`, downcasting, `Cell`, or `RefCell` is needed.
+When adding an actor, define its legal phases and completion behavior in its
+own module, derive its presentation, and wire its identity into dispatch and
+collision queries. Scheduling, shared RNG, and the position-owned planted Red
+Disk fuse remain in `game.rs`.
 
 Every fixed tick follows the original deterministic linear order:
 
@@ -240,7 +265,7 @@ do not receive autonomous original callbacks. Falling Zonks and Infotrons clear
 their source on state `0x16`, before their last two pictures. Murphy releases his
 old cell while retaining the final moving pose, and processes new direction
 input on his next update. A trailing Zonk that sees the newly opened cell later
-in the same pass first enters `ZonkPreFall`; it transfers only on the following
+in the same pass first enters `RoundedPhase::AwaitingFall`; it transfers only on the following
 pass, after Murphy has received that next input. Explosions that replace a
 moving or rolling Zonk/Infotron clear the reservation selected by that actor's
 live movement phase. Murphy may collect only idle Infotrons when snapping or
@@ -299,6 +324,13 @@ overrides, falling-object collision matrices, Red Disk planting, ordered and
 chained explosions, Bug timing/RNG, exit gating, PNG asset validation, audio
 event timing, effect priorities, direct `BLASTER.SND` VOC extraction, direct
 `ADLIB.SND` validation, sequencing and synthesis, and fixed-strip bounds.
+Compile-fail documentation tests reject mismatched actor phases, vertical rolls
+and rock pushes, wrong-length frame payloads, unchecked frame construction, and
+arbitrary actor/animation pairing. `tests/demo_replay.rs` compares all ten demo
+histories with pre-refactor fixtures over 46,199 input ticks, including every
+cell's sprite timing and collision state, game counters, and emitted sounds.
+These fixtures preserve existing behavior; they do not assert that every legacy
+demo currently completes its level.
 
 Format and mapping references:
 

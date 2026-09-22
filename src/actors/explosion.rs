@@ -38,6 +38,11 @@ impl Explosion {
         self.residue
     }
 
+    /// Reports the original safe tail of a normal explosion for Murphy movement.
+    pub const fn is_harmless(self) -> bool {
+        matches!(self.residue, ExplosionResidue::Empty) && self.frame.index() >= 4
+    }
+
     /// Selects normal or Electron artwork from the same residue used at completion.
     pub(super) fn animation(self) -> Animation {
         let kind = match self.residue {
@@ -87,40 +92,47 @@ fn explosion_state(residue: ExplosionResidue) -> State {
 ///
 /// The original blast dispatcher decodes the actor's state high nibble and
 /// clears the corresponding old, side, or diagonal Space marker. Typed
-/// animations carry that same topology here, so cleanup stays phase-specific
+/// physical phases carry that same topology here, so cleanup stays phase-specific
 /// instead of reviving autonomous behavior in temporary Empty cells.
 fn rounded_actor_reservation(
     world: &WorldView<'_>,
     position: Position,
     state: &State,
 ) -> Option<Position> {
-    if !matches!(state.actor(), Actor::Zonk(_) | Actor::Infotron(_)) {
-        return None;
-    }
+    use super::{empty::Reservation, rounded::RoundedPhase};
 
-    let (reservation, expected_kind) = match state.animation().kind() {
-        AnimationKind::Moving(Direction::Down) => (
-            world.offset(position, Direction::Up)?,
-            AnimationKind::Vacating(Direction::Down),
-        ),
-        AnimationKind::RoundedPreRoll(direction) => (
-            world.offset(position, direction)?,
-            AnimationKind::RoundedSide,
-        ),
-        AnimationKind::Rolling(_) => (
-            world.offset(position, Direction::Down)?,
-            AnimationKind::RoundedDestination,
-        ),
+    let phase = match state.actor() {
+        Actor::Zonk(actor) => actor.phase(),
+        Actor::Infotron(actor) => actor.phase(),
         _ => return None,
     };
-
-    world
-        .state(reservation)
-        .is_some_and(|reservation_state| {
-            matches!(reservation_state.actor(), Actor::Empty(_))
-                && reservation_state.animation().kind() == expected_kind
-        })
-        .then_some(reservation)
+    let reservation = match phase {
+        RoundedPhase::Falling(_) => world.offset(position, Direction::Up)?,
+        RoundedPhase::PreparingRoll(direction) => world.offset(position, direction.direction())?,
+        RoundedPhase::Rolling { .. } => world.offset(position, Direction::Down)?,
+        RoundedPhase::Resting
+        | RoundedPhase::Momentum
+        | RoundedPhase::AwaitingFall
+        | RoundedPhase::Held => return None,
+    };
+    // Cross-cell ownership must still be checked against the live board: an
+    // earlier blast or mover may have legitimately replaced this marker.
+    let marker = world.state(reservation)?.reservation()?;
+    matches!(
+        (phase, marker),
+        (
+            RoundedPhase::Falling(_),
+            Reservation::Vacating {
+                direction: Direction::Down,
+                ..
+            }
+        ) | (RoundedPhase::PreparingRoll(_), Reservation::RoundedSide)
+            | (
+                RoundedPhase::Rolling { .. },
+                Reservation::RoundedDestination
+            )
+    )
+    .then_some(reservation)
 }
 
 /// Builds one immediate 3×3 wave and schedules touched reactive actors.

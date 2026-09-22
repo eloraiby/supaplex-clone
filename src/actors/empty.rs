@@ -21,7 +21,7 @@ pub enum Reservation {
         /// Movement direction used to find the owning destination.
         direction: Direction,
         /// Source lifetime used for presentation, never independently advanced.
-        duration: std::num::NonZeroU8,
+        duration: SourceDuration,
     },
     /// Old cell of a Snik Snak, released by its seventh movement callback.
     SnikSnakSource(Direction),
@@ -35,6 +35,25 @@ pub enum Reservation {
     RoundedDestination,
 }
 
+/// The only lifetimes used by a source marker in the original movement rules.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum SourceDuration {
+    /// Ordinary eight-picture actor transfer.
+    Eight,
+    /// Murphy's nine-picture rightward Red Disk step.
+    Nine,
+}
+
+impl SourceDuration {
+    /// Returns the fixed presentation length without accepting arbitrary counts.
+    pub const fn frames(self) -> u8 {
+        match self {
+            Self::Eight => 8,
+            Self::Nine => 9,
+        }
+    }
+}
+
 impl Empty {
     /// Produces the marker's presentation without giving it autonomous timing.
     pub(super) fn animation(self) -> Animation {
@@ -43,7 +62,7 @@ impl Empty {
             Self::Reserved(Reservation::Vacating {
                 direction,
                 duration,
-            }) => (AnimationKind::Vacating(direction), duration.get()),
+            }) => (AnimationKind::Vacating(direction), duration.frames()),
             Self::Reserved(Reservation::SnikSnakSource(direction)) => {
                 (AnimationKind::SnikSnakVacating(direction), 1)
             }

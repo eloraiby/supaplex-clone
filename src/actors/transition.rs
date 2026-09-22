@@ -157,17 +157,8 @@ impl Transition {
         actor: super::Murphy,
         direction: Direction,
         target: MurphyMoveTarget,
-        _looking_left: bool,
     ) -> Self {
-        Self::move_murphy_with_events(
-            source,
-            destination,
-            actor,
-            direction,
-            target,
-            _looking_left,
-            Vec::new(),
-        )
+        Self::move_murphy_with_events(source, destination, actor, direction, target, Vec::new())
     }
 
     /// Starts a typed Murphy step and emits its sound after both cell writes.
@@ -177,11 +168,9 @@ impl Transition {
         actor: super::Murphy,
         direction: Direction,
         target: MurphyMoveTarget,
-        _looking_left: bool,
         events: Vec<GameEvent>,
     ) -> Self {
-        let destination_state = actor.moving(direction, target);
-        let duration = destination_state.animation().frame_count();
+        let (destination_state, duration) = actor.moving(direction, target);
         Self::new(
             vec![
                 CellWrite::new(source, State::vacating_for(direction, duration)),

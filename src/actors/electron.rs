@@ -146,8 +146,8 @@ impl Electron {
 
         if let Some(source) = world.offset(position, direction.opposite())
             && world.state(source).is_some_and(|source_state| {
-                matches!(source_state.actor(), Actor::Empty(_))
-                    && source_state.animation().kind() == AnimationKind::ElectronVacating(direction)
+                source_state.reservation()
+                    == Some(super::empty::Reservation::ElectronSource(direction))
             })
         {
             // An explosion that reached the old cell wins over movement cleanup
