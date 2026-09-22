@@ -68,3 +68,24 @@ impl Direction {
         matches!(self, Self::Left | Self::Right)
     }
 }
+
+/// A lateral direction accepted by rolling rocks and horizontal pushes.
+///
+/// Unlike [`Direction`], this type cannot represent an upward or downward roll.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum Horizontal {
+    /// One column toward the left edge.
+    Left,
+    /// One column toward the right edge.
+    Right,
+}
+
+impl Horizontal {
+    /// Converts a restricted direction for board-neighbor lookup.
+    pub const fn direction(self) -> Direction {
+        match self {
+            Self::Left => Direction::Left,
+            Self::Right => Direction::Right,
+        }
+    }
+}

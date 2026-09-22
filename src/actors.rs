@@ -19,6 +19,7 @@
 
 mod animation;
 mod enemy;
+mod frame;
 mod geometry;
 mod state;
 mod transition;
@@ -26,7 +27,8 @@ mod transition;
 pub use animation::{Animation, AnimationKind};
 use animation::{AnimationAdvance, AnimationNext};
 pub use enemy::EnemyTurn;
-pub use geometry::{Direction, Position};
+pub use frame::Frame;
+pub use geometry::{Direction, Horizontal, Position};
 pub use state::State;
 pub(crate) use transition::{CellWrite, GameEvent, Transition};
 
