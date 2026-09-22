@@ -25,6 +25,11 @@ pub struct Explosion {
 }
 
 impl Explosion {
+    /// Returns this explosion's bounded progress for direct sprite selection.
+    pub const fn frame(self) -> super::Frame<8> {
+        self.frame
+    }
+
     /// Creates one explosion cell with an explicit terminal residue.
     pub const fn new(residue: ExplosionResidue) -> Self {
         Self {

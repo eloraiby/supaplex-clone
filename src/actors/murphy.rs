@@ -445,9 +445,9 @@ impl Murphy {
     }
 
     /// Derives player artwork exclusively from the current legal phase.
-    pub(super) fn animation(self) -> Animation {
+    pub fn sprite_pose(self) -> Option<(MurphyAnimation, u8)> {
         let (action, frame) = match self.phase {
-            MurphyPhase::Ready | MurphyPhase::PreparingPush { .. } => return Animation::idle(),
+            MurphyPhase::Ready | MurphyPhase::PreparingPush { .. } => return None,
             MurphyPhase::PlantingRedDisk { remaining } => {
                 (MurphyAnimation::PlantRedDisk, 64 - remaining.index())
             }
@@ -486,7 +486,17 @@ impl Murphy {
             }
             MurphyPhase::Exiting(frame) => (MurphyAnimation::Exit, frame.index()),
         };
-        Animation::view(AnimationKind::Murphy(action), frame, action.frame_count())
+        Some((action, frame))
+    }
+
+    /// Adapts the actor-specific pose for callers still using the old view API.
+    pub(super) fn animation(self) -> Animation {
+        match self.sprite_pose() {
+            Some((action, frame)) => {
+                Animation::view(AnimationKind::Murphy(action), frame, action.frame_count())
+            }
+            None => Animation::idle(),
+        }
     }
 
     /// Advances one player phase; input-sensitive delays and artwork share one state.

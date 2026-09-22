@@ -12,11 +12,13 @@ use sdl2::{
     video::{Window, WindowContext},
 };
 
+use crate::actors::{
+    Bug, Frame, Horizontal, enemy::EnemyPhase, explosion::ExplosionResidue, murphy::MurphyPhase,
+    orange_disk::OrangePhase, rounded::RoundedPhase,
+};
+
 use crate::{
-    actors::{
-        Actor, AnimationKind, Direction, EnemyTurn, MurphyAnimation, MurphyMoveTarget, Position,
-        State,
-    },
+    actors::{Actor, Direction, EnemyTurn, MurphyAnimation, MurphyMoveTarget, Position, State},
     assets::{
         self, AssetError, BACK_GRAPHICS_PATH, CONTROLS_GRAPHICS_PATH, FIXED_GRAPHICS_PATH,
         FONT_GRAPHICS_PATH, GFX_TUTOR_GRAPHICS_PATH, MENU_FONT_GRAPHICS_PATH, MENU_GRAPHICS_PATH,
@@ -553,15 +555,7 @@ impl<'textures> Renderer<'textures> {
         // port traversal behind the terrain it visually overlaps.
         for moving_pass in [false, true] {
             for (index, state) in game.board().cells().iter().enumerate() {
-                let is_interpolated = matches!(
-                    state.animation().kind(),
-                    AnimationKind::Moving(_)
-                        | AnimationKind::Rolling(_)
-                        | AnimationKind::OrangeFalling
-                        | AnimationKind::SnikSnakMove(_)
-                        | AnimationKind::ElectronMove(_)
-                        | AnimationKind::Murphy(_)
-                );
+                let is_interpolated = draws_over_terrain(state.actor());
                 if is_interpolated != moving_pass {
                     continue;
                 }
@@ -587,71 +581,48 @@ impl<'textures> Renderer<'textures> {
         state: &State,
         camera: Camera,
     ) -> Result<(), RenderError> {
-        // Empty and invisible cells intentionally leave the freshly cleared
-        // black background untouched.
-        if matches!(state.actor(), Actor::Empty(_) | Actor::InvisibleWall(_)) {
-            return Ok(());
-        }
-
-        if matches!(
-            state.animation().kind(),
-            AnimationKind::Rolling(_)
-                | AnimationKind::OrangeFalling
-                | AnimationKind::Moving(Direction::Down)
-        ) && matches!(
-            state.actor(),
-            Actor::Zonk(_) | Actor::Infotron(_) | Actor::OrangeDisk(_)
-        ) {
-            return self.draw_gravity_actor(canvas, position, state, camera);
-        }
-
-        if let AnimationKind::Murphy(action) = state.animation().kind() {
-            return self.draw_murphy_animation(
-                canvas,
-                position,
-                action,
-                state.animation().frame(),
-                camera,
-            );
-        }
-
-        if matches!(state.actor(), Actor::SnikSnak(_))
-            && matches!(
-                state.animation().kind(),
-                AnimationKind::SnikSnakTurn(_) | AnimationKind::SnikSnakMove(_)
-            )
-        {
-            return self.draw_snik_snak_animation(canvas, position, state, camera);
-        }
-        if matches!(state.actor(), Actor::Electron(_))
-            && matches!(
-                state.animation().kind(),
-                AnimationKind::ElectronTurn(_) | AnimationKind::ElectronMove(_)
-            )
-        {
-            return self.draw_electron_animation(canvas, position, state, camera);
-        }
-
-        if matches!(
-            state.animation().kind(),
-            AnimationKind::Explosion | AnimationKind::ElectronExplosion | AnimationKind::Bug
-        ) {
-            return self.draw_animated_cell(canvas, position, state, camera);
-        }
-
-        if state.animation().kind() == AnimationKind::Terminal {
-            return self.draw_terminal(canvas, position, state.animation().frame(), camera);
-        }
-
-        // Dormant Bugs mimic Base even though their actor identity remains
-        // lethal; every other stable state uses its serialized FIXED.DAT code.
-        let tile = if state.animation().kind() == AnimationKind::BugDormant {
-            2
-        } else {
-            state.actor().tile_code()
+        // Dispatch on the actual actor, then its own legal phase. No unrelated
+        // animation tag or independently supplied frame can reach a sprite table.
+        let part = match state.actor() {
+            Actor::Empty(_) | Actor::InvisibleWall(_) => return Ok(()),
+            Actor::Zonk(actor) => zonk_sprite_part(actor.phase()),
+            Actor::Infotron(actor) => infotron_sprite_part(actor.phase()),
+            Actor::OrangeDisk(actor) => match actor.phase() {
+                OrangePhase::Falling(frame) => Some(orange_sprite_part(frame)),
+                OrangePhase::Resting
+                | OrangePhase::AwaitingFall(_)
+                | OrangePhase::Fuse(_)
+                | OrangePhase::Held => None,
+            },
+            Actor::Murphy(actor) => {
+                if let Some((action, frame)) = actor.sprite_pose() {
+                    return self.draw_murphy_animation(canvas, position, action, frame, camera);
+                }
+                None
+            }
+            Actor::SnikSnak(actor) => Some(snik_snak_sprite_part(actor.phase())),
+            Actor::Electron(actor) => Some(electron_sprite_part(actor.phase())),
+            Actor::Explosion(actor) => Some(explosion_sprite_part(actor.residue(), actor.frame())),
+            Actor::Bug(Bug::Active(frame)) => Some(bug_sprite_part(*frame)),
+            Actor::Bug(Bug::Dormant(_)) => {
+                return self.draw_fixed_tile(canvas, position, 2, camera, 0, 0);
+            }
+            Actor::Terminal(actor) => {
+                return self.draw_terminal(canvas, position, actor.screen_frame(), camera);
+            }
+            Actor::Base(_)
+            | Actor::RamChip(_)
+            | Actor::Hardware(_)
+            | Actor::Exit(_)
+            | Actor::Port(_)
+            | Actor::YellowDisk(_)
+            | Actor::RedDisk(_)
+            | Actor::Bug(Bug::Held) => None,
         };
-        let (offset_x, offset_y) = movement_offset(state);
-        self.draw_fixed_tile(canvas, position, tile, camera, offset_x, offset_y)
+        match part {
+            Some(part) => self.draw_murphy_part(canvas, position, part, camera),
+            None => self.draw_fixed_tile(canvas, position, state.actor().tile_code(), camera, 0, 0),
+        }
     }
 
     /// Draws one original variably sized Murphy descriptor at two-times scale.
@@ -739,28 +710,6 @@ impl<'textures> Renderer<'textures> {
             .map_err(RenderError::Sdl)
     }
 
-    /// Draws one opaque 16×16 Bug or explosion frame from MOVING.DAT.
-    fn draw_animated_cell(
-        &mut self,
-        canvas: &mut Canvas<Window>,
-        position: Position,
-        state: &State,
-        camera: Camera,
-    ) -> Result<(), RenderError> {
-        // These animations all replace one complete cell, so their literal
-        // source coordinates share a zero-offset 16×16 descriptor shape.
-        let Some(part) =
-            animated_cell_sprite_part(state.animation().kind(), state.animation().frame())
-        else {
-            debug_assert!(
-                false,
-                "animated-cell renderer received an unsupported phase"
-            );
-            return Ok(());
-        };
-        self.draw_murphy_part(canvas, position, part, camera)
-    }
-
     /// Reconstructs one Terminal screen scroll directly from its FIXED.DAT tile.
     fn draw_terminal(
         &mut self,
@@ -821,64 +770,6 @@ impl<'textures> Renderer<'textures> {
         canvas
             .copy(&self.moving, source, destination)
             .map_err(RenderError::Sdl)
-    }
-
-    /// Draws original Zonk, Infotron, or Orange fall/slide rectangles.
-    fn draw_gravity_actor(
-        &mut self,
-        canvas: &mut Canvas<Window>,
-        position: Position,
-        state: &State,
-        camera: Camera,
-    ) -> Result<(), RenderError> {
-        let Some(part) = gravity_sprite_part(
-            state.actor(),
-            state.animation().kind(),
-            state.animation().frame(),
-        ) else {
-            debug_assert!(
-                false,
-                "gravity renderer received an unsupported actor phase"
-            );
-            return Ok(());
-        };
-        self.draw_murphy_part(canvas, position, part, camera)
-    }
-
-    /// Draws one exact original Snik Snak turn or transfer rectangle.
-    fn draw_snik_snak_animation(
-        &mut self,
-        canvas: &mut Canvas<Window>,
-        position: Position,
-        state: &State,
-        camera: Camera,
-    ) -> Result<(), RenderError> {
-        let Some(part) = snik_snak_sprite_part(state.animation().kind(), state.animation().frame())
-        else {
-            debug_assert!(false, "Snik Snak renderer received an unsupported phase");
-            return Ok(());
-        };
-        // Enemy frames share the same opaque MOVING.DAT conversion and unscaled
-        // offset convention as Murphy and gravity actors.
-        self.draw_murphy_part(canvas, position, part, camera)
-    }
-
-    /// Draws one exact original Electron turn or transfer rectangle.
-    fn draw_electron_animation(
-        &mut self,
-        canvas: &mut Canvas<Window>,
-        position: Position,
-        state: &State,
-        camera: Camera,
-    ) -> Result<(), RenderError> {
-        let Some(part) = electron_sprite_part(state.animation().kind(), state.animation().frame())
-        else {
-            debug_assert!(false, "Electron renderer received an unsupported phase");
-            return Ok(());
-        };
-        // Electron artwork is copied opaquely from the same MOVING.DAT texture
-        // while retaining its own literal coordinate table.
-        self.draw_murphy_part(canvas, position, part, camera)
     }
 
     /// Draws the original panel and its live values at their historical positions.
@@ -1158,79 +1049,102 @@ fn format_menu_level(number: usize, title: &str) -> String {
     format!("{number:03} {title}").chars().take(29).collect()
 }
 
-/// Selects one unscaled original source rectangle for a gravity-driven actor.
-fn gravity_sprite_part(actor: &Actor, kind: AnimationKind, frame: u8) -> Option<SpritePart> {
-    let frame = frame.min(7);
-    let part = match (actor, kind) {
-        (Actor::Zonk(_), AnimationKind::Moving(Direction::Down)) => SpritePart {
-            source: crate::murphy_animation::SourcePoint { x: 224, y: 82 },
+/// Selects the zonk fall or roll artwork from its bounded physical phase.
+fn zonk_sprite_part(phase: RoundedPhase) -> Option<SpritePart> {
+    match phase {
+        RoundedPhase::Falling(frame) => Some(SpritePart {
+            source: SourcePoint { x: 224, y: 82 },
             width: 16,
             height: 18,
             offset_x: 0,
-            offset_y: -16 + i32::from(frame) * 2,
-        },
-        (Actor::Infotron(_), AnimationKind::Moving(Direction::Down)) => SpritePart {
-            source: crate::murphy_animation::SourcePoint { x: 240, y: 178 },
-            width: 16,
-            height: 18,
-            offset_x: 0,
-            offset_y: -16 + i32::from(frame) * 2,
-        },
-        (Actor::OrangeDisk(_), AnimationKind::OrangeFalling) => SpritePart {
-            source: crate::murphy_animation::SourcePoint { x: 128, y: 64 },
-            width: 16,
-            height: 18,
-            offset_x: 0,
-            offset_y: i32::from(frame) * 2,
-        },
-        (Actor::Zonk(_), AnimationKind::Rolling(direction)) => {
-            let source_y = if direction == Direction::Left {
-                84
-            } else {
-                100
-            };
-            SpritePart {
-                source: crate::murphy_animation::SourcePoint {
-                    x: i32::from(frame) * 32,
-                    y: source_y,
-                },
-                width: 32,
-                height: 16,
-                offset_x: if direction == Direction::Right {
-                    -16
+            offset_y: -16 + i32::from(frame.index()) * 2,
+        }),
+        RoundedPhase::Rolling { direction, frame } => {
+            let frame = frame.index();
+            Some({
+                let source_y = if direction == Horizontal::Left {
+                    84
                 } else {
-                    0
-                },
-                offset_y: 0,
-            }
+                    100
+                };
+                SpritePart {
+                    source: crate::murphy_animation::SourcePoint {
+                        x: i32::from(frame) * 32,
+                        y: source_y,
+                    },
+                    width: 32,
+                    height: 16,
+                    offset_x: if direction == Horizontal::Right {
+                        -16
+                    } else {
+                        0
+                    },
+                    offset_y: 0,
+                }
+            })
         }
-        (Actor::Infotron(_), AnimationKind::Rolling(direction)) => {
-            // Frame four of the left strip really begins at x=8 in the
-            // original pointer table. Preserve that historical coordinate.
-            const LEFT_X: [i32; 8] = [0, 32, 64, 96, 8, 160, 192, 224];
-            let (source_x, source_y) = if direction == Direction::Left {
-                (LEFT_X[usize::from(frame)], 164)
-            } else {
-                (i32::from(frame) * 32, 180)
-            };
-            SpritePart {
-                source: crate::murphy_animation::SourcePoint {
-                    x: source_x,
-                    y: source_y,
-                },
-                width: 32,
-                height: 16,
-                offset_x: if direction == Direction::Right {
-                    -16
+        RoundedPhase::Resting
+        | RoundedPhase::Momentum
+        | RoundedPhase::AwaitingFall
+        | RoundedPhase::PreparingRoll(_)
+        | RoundedPhase::Held => None,
+    }
+}
+
+/// Selects the infotron fall or roll artwork from its bounded physical phase.
+fn infotron_sprite_part(phase: RoundedPhase) -> Option<SpritePart> {
+    match phase {
+        RoundedPhase::Falling(frame) => Some(SpritePart {
+            source: SourcePoint { x: 240, y: 178 },
+            width: 16,
+            height: 18,
+            offset_x: 0,
+            offset_y: -16 + i32::from(frame.index()) * 2,
+        }),
+        RoundedPhase::Rolling { direction, frame } => {
+            let frame = frame.index();
+            Some({
+                // Frame four of the left strip really begins at x=8 in the
+                // original pointer table. Preserve that historical coordinate.
+                const LEFT_X: [i32; 8] = [0, 32, 64, 96, 8, 160, 192, 224];
+                let (source_x, source_y) = if direction == Horizontal::Left {
+                    (LEFT_X[usize::from(frame)], 164)
                 } else {
-                    0
-                },
-                offset_y: 0,
-            }
+                    (i32::from(frame) * 32, 180)
+                };
+                SpritePart {
+                    source: crate::murphy_animation::SourcePoint {
+                        x: source_x,
+                        y: source_y,
+                    },
+                    width: 32,
+                    height: 16,
+                    offset_x: if direction == Horizontal::Right {
+                        -16
+                    } else {
+                        0
+                    },
+                    offset_y: 0,
+                }
+            })
         }
-        _ => return None,
-    };
-    Some(part)
+        RoundedPhase::Resting
+        | RoundedPhase::Momentum
+        | RoundedPhase::AwaitingFall
+        | RoundedPhase::PreparingRoll(_)
+        | RoundedPhase::Held => None,
+    }
+}
+
+/// Selects the source-retained Orange Disk fall using an eight-picture frame.
+fn orange_sprite_part(frame: Frame<8>) -> SpritePart {
+    SpritePart {
+        source: SourcePoint { x: 128, y: 64 },
+        width: 16,
+        height: 18,
+        offset_x: 0,
+        offset_y: i32::from(frame.index()) * 2,
+    }
 }
 
 /// Original `MOVING.DAT` coordinates for all sixteen turn and thirty-two move frames.
@@ -1289,17 +1203,22 @@ const SNIK_SNAK_SOURCE_POINTS: [SourcePoint; 48] = [
 ];
 
 /// Selects one variably sized Snik Snak rectangle and its logical-cell offset.
-fn snik_snak_sprite_part(kind: AnimationKind, frame: u8) -> Option<SpritePart> {
-    let frame = frame.min(7);
-    let (source_index, width, height, offset_x, offset_y) = match kind {
-        AnimationKind::SnikSnakTurn(turn) => {
+fn snik_snak_sprite_part(phase: EnemyPhase) -> SpritePart {
+    let frame = match phase {
+        EnemyPhase::Turning { frame, .. } | EnemyPhase::Moving { frame, .. } => frame.index(),
+    };
+    let (source_index, width, height, offset_x, offset_y) = match phase {
+        EnemyPhase::Turning { turn, .. } => {
             let cycle_start = match turn {
                 EnemyTurn::Left => 0,
                 EnemyTurn::Right => 8,
             };
             (cycle_start + usize::from(frame), 16, 16, 0, 0)
         }
-        AnimationKind::SnikSnakMove(Direction::Up) => {
+        EnemyPhase::Moving {
+            direction: Direction::Up,
+            ..
+        } => {
             // Up states use gravity offsets one through eight, beginning two
             // original pixels above the retained source cell.
             (
@@ -1310,24 +1229,32 @@ fn snik_snak_sprite_part(kind: AnimationKind, frame: u8) -> Option<SpritePart> {
                 14 - i32::from(frame) * 2,
             )
         }
-        AnimationKind::SnikSnakMove(Direction::Left) => (24 + usize::from(frame), 32, 16, 0, 0),
-        AnimationKind::SnikSnakMove(Direction::Down) => (
+        EnemyPhase::Moving {
+            direction: Direction::Left,
+            ..
+        } => (24 + usize::from(frame), 32, 16, 0, 0),
+        EnemyPhase::Moving {
+            direction: Direction::Down,
+            ..
+        } => (
             32 + usize::from(frame),
             16,
             18,
             0,
             -16 + i32::from(frame) * 2,
         ),
-        AnimationKind::SnikSnakMove(Direction::Right) => (40 + usize::from(frame), 32, 16, -16, 0),
-        _ => return None,
+        EnemyPhase::Moving {
+            direction: Direction::Right,
+            ..
+        } => (40 + usize::from(frame), 32, 16, -16, 0),
     };
-    Some(SpritePart {
+    SpritePart {
         source: SNIK_SNAK_SOURCE_POINTS[source_index],
         width,
         height,
         offset_x,
         offset_y,
-    })
+    }
 }
 
 /// Original `MOVING.DAT` coordinates for all Electron turn and transfer states.
@@ -1386,41 +1313,54 @@ const ELECTRON_SOURCE_POINTS: [SourcePoint; 48] = [
 ];
 
 /// Selects one variably sized Electron rectangle and its logical-cell offset.
-fn electron_sprite_part(kind: AnimationKind, frame: u8) -> Option<SpritePart> {
-    let frame = frame.min(7);
-    let (source_index, width, height, offset_x, offset_y) = match kind {
-        AnimationKind::ElectronTurn(turn) => {
+fn electron_sprite_part(phase: EnemyPhase) -> SpritePart {
+    let frame = match phase {
+        EnemyPhase::Turning { frame, .. } | EnemyPhase::Moving { frame, .. } => frame.index(),
+    };
+    let (source_index, width, height, offset_x, offset_y) = match phase {
+        EnemyPhase::Turning { turn, .. } => {
             let cycle_start = match turn {
                 EnemyTurn::Left => 0,
                 EnemyTurn::Right => 8,
             };
             (cycle_start + usize::from(frame), 16, 16, 0, 0)
         }
-        AnimationKind::ElectronMove(Direction::Up) => (
+        EnemyPhase::Moving {
+            direction: Direction::Up,
+            ..
+        } => (
             16 + usize::from(frame),
             16,
             18,
             0,
             14 - i32::from(frame) * 2,
         ),
-        AnimationKind::ElectronMove(Direction::Left) => (24 + usize::from(frame), 32, 16, 0, 0),
-        AnimationKind::ElectronMove(Direction::Down) => (
+        EnemyPhase::Moving {
+            direction: Direction::Left,
+            ..
+        } => (24 + usize::from(frame), 32, 16, 0, 0),
+        EnemyPhase::Moving {
+            direction: Direction::Down,
+            ..
+        } => (
             32 + usize::from(frame),
             16,
             18,
             0,
             -16 + i32::from(frame) * 2,
         ),
-        AnimationKind::ElectronMove(Direction::Right) => (40 + usize::from(frame), 32, 16, -16, 0),
-        _ => return None,
+        EnemyPhase::Moving {
+            direction: Direction::Right,
+            ..
+        } => (40 + usize::from(frame), 32, 16, -16, 0),
     };
-    Some(SpritePart {
+    SpritePart {
         source: ELECTRON_SOURCE_POINTS[source_index],
         width,
         height,
         offset_x,
         offset_y,
-    })
+    }
 }
 
 /// Returns the rendered width of one string in logical SDL pixels.
@@ -1548,10 +1488,8 @@ fn fixed_tile_source(tile: u8) -> Rect {
     )
 }
 
-/// Selects one complete-cell Bug or explosion rectangle from MOVING.DAT.
-fn animated_cell_sprite_part(kind: AnimationKind, frame: u8) -> Option<SpritePart> {
-    // Literal coordinates replace the repacked atlas rows. The original tables
-    // contain eight regular, eight Infotron, and fourteen active Bug pictures.
+/// Selects a lethal Bug picture; out-of-range table indices are unrepresentable.
+fn bug_sprite_part(frame: Frame<14>) -> SpritePart {
     const BUG: [SourcePoint; 14] = [
         SourcePoint { x: 304, y: 100 },
         SourcePoint { x: 256, y: 196 },
@@ -1568,26 +1506,30 @@ fn animated_cell_sprite_part(kind: AnimationKind, frame: u8) -> Option<SpritePar
         SourcePoint { x: 304, y: 100 },
         SourcePoint { x: 304, y: 64 },
     ];
-    let source = match kind {
-        AnimationKind::Explosion => SourcePoint {
-            x: i32::from(frame.min(7)) * 16,
-            y: 196,
-        },
-        AnimationKind::ElectronExplosion => SourcePoint {
-            x: 128 + i32::from(frame.min(7)) * 16,
-            y: 196,
-        },
-        AnimationKind::Bug => BUG[usize::from(frame.min(13))],
-        _ => return None,
-    };
+    cell_sprite_part(BUG[usize::from(frame.index())])
+}
 
-    Some(SpritePart {
+/// Selects one of the two explosion strips with bounded explosion progress.
+fn explosion_sprite_part(residue: ExplosionResidue, frame: Frame<8>) -> SpritePart {
+    let start_x = match residue {
+        ExplosionResidue::Empty => 0,
+        ExplosionResidue::Infotron => 128,
+    };
+    cell_sprite_part(SourcePoint {
+        x: start_x + i32::from(frame.index()) * 16,
+        y: 196,
+    })
+}
+
+/// Wraps a source coordinate in the shared opaque one-cell drawing geometry.
+fn cell_sprite_part(source: SourcePoint) -> SpritePart {
+    SpritePart {
         source,
         width: FIXED_TILE_SIZE,
         height: FIXED_TILE_SIZE,
         offset_x: 0,
         offset_y: 0,
-    })
+    }
 }
 
 /// Maps one Terminal display scanline to its retained FIXED.DAT source row.
@@ -1604,30 +1546,78 @@ fn terminal_source_row(frame: u8, destination_row: u8) -> u8 {
     3 + (destination_row - 2 + phase - 1) % 7
 }
 
-/// Returns the sub-cell pixel offset implied by a movement animation.
-fn movement_offset(state: &State) -> (i32, i32) {
-    // Ordinary moving actors interpolate between inclusive endpoints because
-    // their frame zero represents the untouched source position. Murphy is
-    // handled separately below: his original routine advances its persistent
-    // pixel position before drawing frame zero, so reusing this progress value
-    // would insert a motionless update at the start of every Murphy action.
-    let remaining = 1.0 - state.animation().progress();
-    let distance = (remaining * TILE_SIZE as f32).round() as i32;
-    match state.animation().kind() {
-        AnimationKind::Moving(direction) => match direction {
-            Direction::Up => (0, distance),
-            Direction::Right => (-distance, 0),
-            Direction::Down => (0, -distance),
-            Direction::Left => (distance, 0),
+/// Reports actors whose legal phase must paint over neighboring terrain.
+fn draws_over_terrain(actor: &Actor) -> bool {
+    match actor {
+        Actor::Zonk(actor) => matches!(
+            actor.phase(),
+            RoundedPhase::Falling(_) | RoundedPhase::Rolling { .. }
+        ),
+        Actor::Infotron(actor) => matches!(
+            actor.phase(),
+            RoundedPhase::Falling(_) | RoundedPhase::Rolling { .. }
+        ),
+        Actor::OrangeDisk(actor) => matches!(actor.phase(), OrangePhase::Falling(_)),
+        Actor::SnikSnak(actor) => matches!(actor.phase(), EnemyPhase::Moving { .. }),
+        Actor::Electron(actor) => matches!(actor.phase(), EnemyPhase::Moving { .. }),
+        Actor::Murphy(actor) => match actor.phase() {
+            MurphyPhase::Ready | MurphyPhase::PreparingPush { .. } => false,
+            MurphyPhase::PlantingRedDisk { .. }
+            | MurphyPhase::Moving(_)
+            | MurphyPhase::Resuming(_)
+            | MurphyPhase::Snapping(_)
+            | MurphyPhase::Pushing { .. }
+            | MurphyPhase::CrossingPort { .. }
+            | MurphyPhase::Exiting(_) => true,
         },
-        AnimationKind::Rolling(direction) => match direction {
-            Direction::Left => (distance, -distance),
-            Direction::Right => (-distance, -distance),
-            Direction::Up | Direction::Down => (0, 0),
-        },
-        AnimationKind::Murphy(action) => murphy_movement_offset(action, state.animation().frame()),
-        _ => (0, 0),
+        Actor::Empty(_)
+        | Actor::Base(_)
+        | Actor::RamChip(_)
+        | Actor::Hardware(_)
+        | Actor::Exit(_)
+        | Actor::Port(_)
+        | Actor::YellowDisk(_)
+        | Actor::Terminal(_)
+        | Actor::RedDisk(_)
+        | Actor::Bug(_)
+        | Actor::InvisibleWall(_)
+        | Actor::Explosion(_) => false,
     }
+}
+
+/// Returns camera interpolation from a concrete moving actor's bounded progress.
+fn movement_offset(state: &State) -> (i32, i32) {
+    let rounded = match state.actor() {
+        Actor::Murphy(actor) => {
+            return match actor.sprite_pose() {
+                Some((action, frame)) => murphy_movement_offset(action, frame),
+                None => (0, 0),
+            };
+        }
+        Actor::Zonk(actor) => actor.phase(),
+        Actor::Infotron(actor) => actor.phase(),
+        _ => return (0, 0),
+    };
+    match rounded {
+        RoundedPhase::Falling(frame) => (0, -remaining_distance(frame)),
+        RoundedPhase::Rolling { direction, frame } => {
+            let distance = remaining_distance(frame);
+            match direction {
+                Horizontal::Left => (distance, -distance),
+                Horizontal::Right => (-distance, -distance),
+            }
+        }
+        RoundedPhase::Resting
+        | RoundedPhase::Momentum
+        | RoundedPhase::AwaitingFall
+        | RoundedPhase::PreparingRoll(_)
+        | RoundedPhase::Held => (0, 0),
+    }
+}
+
+/// Converts the remaining portion of an eight-picture transfer to logical pixels.
+fn remaining_distance(frame: Frame<8>) -> i32 {
+    ((1.0 - f32::from(frame.index()) / 7.0) * TILE_SIZE as f32).round() as i32
 }
 
 /// Reconstructs Murphy's original persistent pixel position for one action frame.
@@ -1788,15 +1778,15 @@ mod tests {
 
     use super::{
         BlackPixelPolicy, FIXED_TILE_COUNT, FIXED_TILE_SIZE, MOVING_SCALE, SourcePoint,
-        animated_cell_sprite_part, apply_black_pixel_policy, decode_png, electron_sprite_part,
-        fixed_tile_source, gravity_sprite_part, murphy_movement_offset, snik_snak_sprite_part,
-        terminal_source_row,
+        apply_black_pixel_policy, bug_sprite_part, decode_png, electron_sprite_part,
+        explosion_sprite_part, fixed_tile_source, infotron_sprite_part, murphy_movement_offset,
+        orange_sprite_part, snik_snak_sprite_part, terminal_source_row, zonk_sprite_part,
+    };
+    use crate::actors::{
+        Frame, Horizontal, enemy::EnemyPhase, explosion::ExplosionResidue, rounded::RoundedPhase,
     };
     use crate::{
-        actors::{
-            Actor, AnimationKind, Direction, EnemyTurn, Infotron, MurphyAnimation,
-            MurphyMoveTarget, MurphyPushTarget, OrangeDisk, Zonk,
-        },
+        actors::{Direction, EnemyTurn, MurphyAnimation, MurphyMoveTarget, MurphyPushTarget},
         assets,
     };
 
@@ -2013,11 +2003,7 @@ mod tests {
     #[test]
     fn bug_frames_follow_the_original_spark_and_base_sequence() {
         let active = (0..14)
-            .map(|frame| {
-                animated_cell_sprite_part(AnimationKind::Bug, frame)
-                    .expect("active Bug frame should map")
-                    .source
-            })
+            .map(|frame| bug_sprite_part(Frame::new(frame).unwrap()).source)
             .collect::<Vec<_>>();
 
         assert_eq!(
@@ -2046,16 +2032,12 @@ mod tests {
     fn explosion_frames_use_literal_moving_coordinates() {
         let regular = (0..8)
             .map(|frame| {
-                animated_cell_sprite_part(AnimationKind::Explosion, frame)
-                    .expect("regular explosion frame should map")
-                    .source
+                explosion_sprite_part(ExplosionResidue::Empty, Frame::new(frame).unwrap()).source
             })
             .collect::<Vec<_>>();
         let electron = (0..8)
             .map(|frame| {
-                animated_cell_sprite_part(AnimationKind::ElectronExplosion, frame)
-                    .expect("Electron explosion frame should map")
-                    .source
+                explosion_sprite_part(ExplosionResidue::Infotron, Frame::new(frame).unwrap()).source
             })
             .collect::<Vec<_>>();
 
@@ -2070,18 +2052,26 @@ mod tests {
     /// Confirms horizontal rolls use literal MOVING.DAT direction strips.
     #[test]
     fn rolling_frames_select_original_source_rows() {
-        let zonk = Actor::Zonk(Zonk::resting());
-        let infotron = Actor::Infotron(Infotron::resting());
-        let zonk_left = gravity_sprite_part(&zonk, AnimationKind::Rolling(Direction::Left), 3)
-            .expect("left Zonk roll should map");
-        let zonk_right = gravity_sprite_part(&zonk, AnimationKind::Rolling(Direction::Right), 3)
-            .expect("right Zonk roll should map");
-        let infotron_left =
-            gravity_sprite_part(&infotron, AnimationKind::Rolling(Direction::Left), 4)
-                .expect("left Infotron roll should map");
-        let infotron_right =
-            gravity_sprite_part(&infotron, AnimationKind::Rolling(Direction::Right), 4)
-                .expect("right Infotron roll should map");
+        let zonk_left = zonk_sprite_part(RoundedPhase::Rolling {
+            direction: Horizontal::Left,
+            frame: Frame::new(3).unwrap(),
+        })
+        .expect("moving phase has a sprite");
+        let zonk_right = zonk_sprite_part(RoundedPhase::Rolling {
+            direction: Horizontal::Right,
+            frame: Frame::new(3).unwrap(),
+        })
+        .expect("moving phase has a sprite");
+        let infotron_left = infotron_sprite_part(RoundedPhase::Rolling {
+            direction: Horizontal::Left,
+            frame: Frame::new(4).unwrap(),
+        })
+        .expect("moving phase has a sprite");
+        let infotron_right = infotron_sprite_part(RoundedPhase::Rolling {
+            direction: Horizontal::Right,
+            frame: Frame::new(4).unwrap(),
+        })
+        .expect("moving phase has a sprite");
 
         assert_eq!(zonk_left.source, SourcePoint { x: 96, y: 84 });
         assert_eq!(zonk_right.source, SourcePoint { x: 96, y: 100 });
@@ -2092,11 +2082,10 @@ mod tests {
     /// Confirms falling actors use the original two-pixel gravity increments.
     #[test]
     fn gravity_frames_stop_two_pixels_before_the_destination_tile() {
-        let zonk = Actor::Zonk(Zonk::resting());
-        let first = gravity_sprite_part(&zonk, AnimationKind::Moving(Direction::Down), 0)
-            .expect("Zonk fall frame should map");
-        let last = gravity_sprite_part(&zonk, AnimationKind::Moving(Direction::Down), 7)
-            .expect("Zonk fall frame should map");
+        let first = zonk_sprite_part(RoundedPhase::Falling(Frame::new(0).unwrap()))
+            .expect("moving phase has a sprite");
+        let last = zonk_sprite_part(RoundedPhase::Falling(Frame::new(7).unwrap()))
+            .expect("moving phase has a sprite");
 
         assert_eq!(first.offset_y, -16);
         assert_eq!(last.offset_y, -2);
@@ -2106,18 +2095,9 @@ mod tests {
     /// Confirms each gravity actor selects its own unscaled source picture.
     #[test]
     fn falling_actor_sources_remain_distinct() {
-        let infotron = gravity_sprite_part(
-            &Actor::Infotron(Infotron::resting()),
-            AnimationKind::Moving(Direction::Down),
-            0,
-        )
-        .expect("Infotron fall frame should map");
-        let orange = gravity_sprite_part(
-            &Actor::OrangeDisk(OrangeDisk::resting()),
-            AnimationKind::OrangeFalling,
-            0,
-        )
-        .expect("Orange fall frame should map");
+        let infotron = infotron_sprite_part(RoundedPhase::Falling(Frame::new(0).unwrap()))
+            .expect("moving phase has a sprite");
+        let orange = orange_sprite_part(Frame::new(0).unwrap());
 
         assert_eq!((infotron.source.x, infotron.source.y), (240, 178));
         assert_eq!((orange.source.x, orange.source.y), (128, 64));
@@ -2127,12 +2107,18 @@ mod tests {
     /// Confirms Snik Snak turns and moves use the literal MOVING.DAT rectangles.
     #[test]
     fn snik_snak_frames_preserve_turn_order_and_wide_horizontal_composites() {
-        let turn = snik_snak_sprite_part(AnimationKind::SnikSnakTurn(EnemyTurn::Left), 2)
-            .expect("left-turn frame should map");
-        let move_left = snik_snak_sprite_part(AnimationKind::SnikSnakMove(Direction::Left), 7)
-            .expect("left movement frame should map");
-        let move_up = snik_snak_sprite_part(AnimationKind::SnikSnakMove(Direction::Up), 0)
-            .expect("up movement frame should map");
+        let turn = snik_snak_sprite_part(EnemyPhase::Turning {
+            turn: EnemyTurn::Left,
+            frame: Frame::new(2).unwrap(),
+        });
+        let move_left = snik_snak_sprite_part(EnemyPhase::Moving {
+            direction: Direction::Left,
+            frame: Frame::new(7).unwrap(),
+        });
+        let move_up = snik_snak_sprite_part(EnemyPhase::Moving {
+            direction: Direction::Up,
+            frame: Frame::new(0).unwrap(),
+        });
 
         assert_eq!((turn.source.x, turn.source.y), (96, 244));
         assert_eq!((move_left.source.x, move_left.source.y), (96, 244));
@@ -2146,12 +2132,18 @@ mod tests {
     /// Confirms Electron frames retain exact coordinates and vertical row quirks.
     #[test]
     fn electron_frames_preserve_reverse_turns_and_literal_vertical_sources() {
-        let right_turn = electron_sprite_part(AnimationKind::ElectronTurn(EnemyTurn::Right), 1)
-            .expect("right-turn frame should map");
-        let down_five = electron_sprite_part(AnimationKind::ElectronMove(Direction::Down), 5)
-            .expect("down movement frame should map");
-        let move_right = electron_sprite_part(AnimationKind::ElectronMove(Direction::Right), 1)
-            .expect("right movement frame should map");
+        let right_turn = electron_sprite_part(EnemyPhase::Turning {
+            turn: EnemyTurn::Right,
+            frame: Frame::new(1).unwrap(),
+        });
+        let down_five = electron_sprite_part(EnemyPhase::Moving {
+            direction: Direction::Down,
+            frame: Frame::new(5).unwrap(),
+        });
+        let move_right = electron_sprite_part(EnemyPhase::Moving {
+            direction: Direction::Right,
+            frame: Frame::new(1).unwrap(),
+        });
 
         assert_eq!((right_turn.source.x, right_turn.source.y), (112, 404));
         assert_eq!((down_five.source.x, down_five.source.y), (80, 403));

@@ -29,6 +29,11 @@ pub struct OrangeDisk {
 }
 
 impl OrangeDisk {
+    /// Constructs a disk using only Orange Disk phases.
+    pub const fn from_phase(phase: OrangePhase) -> Self {
+        Self { phase }
+    }
+
     /// Creates a stationary disk loaded from a level.
     pub const fn resting() -> Self {
         Self {
