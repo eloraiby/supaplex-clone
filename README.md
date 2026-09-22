@@ -338,6 +338,22 @@ demo currently completes its level. Rendering tests also compare all 182 origina
 gravity, enemy, Bug, and explosion rectangles with a pre-refactor fingerprint,
 and check terrain layering and camera interpolation directly from typed phases.
 
+Moving Zonks use a separate silhouette texture and render after opaque actor
+composites. At load time, black pixels connected to each Zonk frame's perimeter
+become transparent; enclosed black details remain opaque. This removes the
+original rectangular erase padding without changing the source rectangles,
+physics, or the tick when Murphy can enter a released cell. Murphy's eating and
+pushing composites retain their opaque background reconstruction. The silhouette
+mask assumes the original artwork convention: pure black connected to a frame
+edge is background, including in replacement `moving.png` assets.
+
+Mirrored regression fixtures push a Zonk onto a RAM chip, follow its sideways
+roll, and enter its released source during the fall. They check production atlas
+pixels that previously covered Murphy with black and verify the rendering layer
+for both directions. A separate mask fixture protects enclosed black details.
+These are simulation/pixel checks; they do not capture an interactive SDL window.
+
+
 Format and mapping references:
 
 - [Historical Supaplex file formats](https://www.elmerproductions.com/sp/filefmt.html)
