@@ -2,8 +2,8 @@
 
 use std::{error::Error, fmt, io::Cursor};
 
-mod composite;
-use composite::{FrameCache, Layer};
+mod level;
+use level::LevelRenderer;
 
 use crate::platform as sdl2;
 #[cfg(not(any(feature = "pocketgo", target_env = "uclibc")))]
@@ -16,19 +16,18 @@ use sdl2::{
 };
 
 use crate::actors::{
-    Bug, Frame, Horizontal, enemy::EnemyPhase, explosion::ExplosionResidue, murphy::MurphyPhase,
-    orange_disk::OrangePhase, rounded::RoundedPhase,
+    Frame, Horizontal, enemy::EnemyPhase, explosion::ExplosionResidue, rounded::RoundedPhase,
 };
 
 use crate::{
-    actors::{Actor, Direction, EnemyTurn, MurphyAnimation, MurphyMoveTarget, Position, State},
+    actors::{Actor, Direction, EnemyTurn, MurphyAnimation, State},
     assets::{
-        self, AssetError, BACK_GRAPHICS_PATH, CONTROLS_GRAPHICS_PATH, FIXED_GRAPHICS_PATH,
-        FONT_GRAPHICS_PATH, GFX_TUTOR_GRAPHICS_PATH, MENU_FONT_GRAPHICS_PATH, MENU_GRAPHICS_PATH,
-        PANEL_GRAPHICS_PATH, TITLE_GRAPHICS_PATH,
+        self, AssetError, BACK_GRAPHICS_PATH, CONTROLS_GRAPHICS_PATH, FONT_GRAPHICS_PATH,
+        GFX_TUTOR_GRAPHICS_PATH, MENU_FONT_GRAPHICS_PATH, MENU_GRAPHICS_PATH, PANEL_GRAPHICS_PATH,
+        TITLE_GRAPHICS_PATH,
     },
     frontend::{ControlsTarget, MainMenuTarget},
-    game::{Game, GameStatus},
+    game::{BoardChange, Game, GameStatus},
     murphy_animation::{SourcePoint, SpritePart, sprite_parts},
 };
 
@@ -197,12 +196,10 @@ enum BlackPixelPolicy {
     Transparent,
 }
 
-/// Textures and mapping logic needed to draw one game snapshot.
+/// Front-end textures and a persistent bitmap for the active level.
 pub struct Renderer<'textures> {
-    /// Original fixed 16×16 tiles used for stable actors and target backdrops.
-    fixed: Texture<'textures>,
-    /// Actor-local bitmap compositions, cached independently of board position.
-    frames: FrameCache<'textures>,
+    /// Persistent board bitmap updated in simulation callback order.
+    level: LevelRenderer<'textures>,
     /// Original eight-pixel DOS font converted to an RGBA PNG.
     font: Texture<'textures>,
     /// Original 320×24 in-game panel, enlarged to the full logical width.
@@ -234,15 +231,7 @@ impl<'textures> Renderer<'textures> {
         // Asset acquisition is completed before the first texture upload so an
         // unbundled build reports missing files without retaining partial state.
         let graphics = assets::load_graphics().map_err(RenderError::Asset)?;
-        let fixed = load_texture(
-            texture_creator,
-            graphics.fixed.as_ref(),
-            640,
-            16,
-            FIXED_GRAPHICS_PATH,
-            BlackPixelPolicy::Opaque,
-        )?;
-        let frames = FrameCache::new(
+        let level = LevelRenderer::new(
             texture_creator,
             graphics.fixed.as_ref(),
             graphics.moving.as_ref(),
@@ -313,8 +302,7 @@ impl<'textures> Renderer<'textures> {
         )?;
 
         Ok(Self {
-            fixed,
-            frames,
+            level,
             font,
             panel,
             title,
@@ -529,7 +517,7 @@ impl<'textures> Renderer<'textures> {
             .map_err(RenderError::Sdl)
     }
 
-    /// Draws the scrolling board, HUD, and completion/death overlay.
+    /// Presents the saved level image, HUD, and completion/death overlay.
     pub fn draw(
         &mut self,
         canvas: &mut Canvas<Window>,
@@ -537,8 +525,8 @@ impl<'textures> Renderer<'textures> {
         level_number: usize,
         steps_per_second: u32,
     ) -> Result<(), RenderError> {
-        // Every cell sprite uses black as its original DOS background. Clearing
-        // first also supplies black behind pixels made transparent on upload.
+        // Clear the display around the board and HUD. The saved level bitmap
+        // survives this operation and changes only through simulation updates.
         canvas.set_draw_color(Color::RGB(0, 0, 0));
         canvas.clear();
 
@@ -549,173 +537,22 @@ impl<'textures> Renderer<'textures> {
         }
         let camera = self.camera;
 
-        let composited_target = murphy_composited_target(game);
-
-        // Logical destinations hold actors while their sprites interpolate
-        // from a source cell. Paint stationary cells first and interpolated
-        // actors second so row-major ordering cannot hide a leftward roll or
-        // port traversal behind the terrain it visually overlaps.
-        for moving_pass in [false, true] {
-            for (index, state) in game.board().cells().iter().enumerate() {
-                let is_interpolated = draws_over_terrain(state.actor());
-                if is_interpolated != moving_pass {
-                    continue;
-                }
-
-                let position = game
-                    .board()
-                    .position(index)
-                    .expect("enumerated board indices are always valid");
-                // During a push or snap, Murphy's frame already contains this
-                // held target. Preparation still paints the target normally.
-                if state.actor().is_held() && Some(position) == composited_target {
-                    continue;
-                }
-                self.draw_state(canvas, position, state, camera)?;
-            }
-        }
+        self.level.draw(canvas, camera)?;
 
         self.draw_hud(canvas, game, level_number, steps_per_second)?;
         self.draw_status_overlay(canvas, game.status())?;
         Ok(())
     }
 
-    /// Draws one actor frame at its camera-relative, interpolated destination.
-    fn draw_state(
-        &mut self,
-        canvas: &mut Canvas<Window>,
-        position: Position,
-        state: &State,
-        camera: Camera,
-    ) -> Result<(), RenderError> {
-        // Dispatch on the actual actor, then its own legal phase. No unrelated
-        // animation tag or independently supplied frame can reach a sprite table.
-        let part = match state.actor() {
-            Actor::Empty(_) | Actor::InvisibleWall(_) => return Ok(()),
-            Actor::Zonk(actor) => zonk_sprite_part(actor.phase()),
-            Actor::Infotron(actor) => infotron_sprite_part(actor.phase()),
-            Actor::OrangeDisk(actor) => match actor.phase() {
-                OrangePhase::Falling(frame) => Some(orange_sprite_part(frame)),
-                OrangePhase::Resting
-                | OrangePhase::AwaitingFall(_)
-                | OrangePhase::Fuse(_)
-                | OrangePhase::Held => None,
-            },
-            Actor::Murphy(actor) => {
-                if let Some((action, frame)) = actor.sprite_pose() {
-                    return self.draw_murphy_animation(canvas, position, action, frame, camera);
-                }
-                None
-            }
-            Actor::SnikSnak(actor) => Some(snik_snak_sprite_part(actor.phase())),
-            Actor::Electron(actor) => Some(electron_sprite_part(actor.phase())),
-            Actor::Explosion(actor) => Some(explosion_sprite_part(actor.residue(), actor.frame())),
-            Actor::Bug(Bug::Active(frame)) => Some(bug_sprite_part(*frame)),
-            Actor::Bug(Bug::Dormant(_)) => {
-                return self.draw_fixed_tile(canvas, position, 2, camera, 0, 0);
-            }
-            Actor::Terminal(actor) => {
-                return self.draw_terminal(canvas, position, actor.screen_frame(), camera);
-            }
-            Actor::Base(_)
-            | Actor::RamChip(_)
-            | Actor::Hardware(_)
-            | Actor::Exit(_)
-            | Actor::Port(_)
-            | Actor::YellowDisk(_)
-            | Actor::RedDisk(_)
-            | Actor::Bug(Bug::Held) => None,
-        };
-        match part {
-            Some(part) => self
-                .frames
-                .draw(canvas, position, &[Layer::Moving(part)], camera),
-            None => self.draw_fixed_tile(canvas, position, state.actor().tile_code(), camera, 0, 0),
-        }
+    /// Initializes the saved board image before a new level's first fade or tick.
+    pub fn begin_level(&mut self, game: &Game) -> Result<(), RenderError> {
+        self.camera = camera_for(game).unwrap_or_default();
+        self.level.reset(game.board())
     }
 
-    /// Draws one original variably sized Murphy descriptor at two-times scale.
-    fn draw_murphy_animation(
-        &mut self,
-        canvas: &mut Canvas<Window>,
-        position: Position,
-        action: MurphyAnimation,
-        frame: u8,
-        camera: Camera,
-    ) -> Result<(), RenderError> {
-        // Reconstruct targets, retained Murphy artwork, and erase rectangles
-        // together before this actor contributes any pixels to the shared scene.
-        self.frames
-            .draw(canvas, position, &murphy_layers(action, frame), camera)
-    }
-
-    /// Draws a stable FIXED.DAT tile at one optional sub-cell displacement.
-    fn draw_fixed_tile(
-        &mut self,
-        canvas: &mut Canvas<Window>,
-        position: Position,
-        tile: u8,
-        camera: Camera,
-        offset_x: i32,
-        offset_y: i32,
-    ) -> Result<(), RenderError> {
-        // FIXED.DAT stores each original 16×16 tile consecutively. SDL enlarges
-        // that exact source cell to the clone's 32×32 logical board scale.
-        let destination = Rect::new(
-            position.x as i32 * TILE_SIZE as i32 - camera.x + offset_x,
-            position.y as i32 * TILE_SIZE as i32 - camera.y + offset_y,
-            TILE_SIZE,
-            TILE_SIZE,
-        );
-
-        // Skip cells completely outside the board viewport, including a stable
-        // fallback temporarily displaced by an internal movement state.
-        let viewport = Rect::new(0, 0, LOGICAL_WIDTH, VIEW_HEIGHT);
-        if !destination.has_intersection(viewport) {
-            return Ok(());
-        }
-
-        canvas
-            .copy(&self.fixed, fixed_tile_source(tile), destination)
-            .map_err(RenderError::Sdl)
-    }
-
-    /// Reconstructs one Terminal screen scroll directly from its FIXED.DAT tile.
-    fn draw_terminal(
-        &mut self,
-        canvas: &mut Canvas<Window>,
-        position: Position,
-        frame: u8,
-        camera: Camera,
-    ) -> Result<(), RenderError> {
-        // The casing and lamps never move, so begin with the complete original
-        // Terminal tile before replacing only its eight-row green display area.
-        self.draw_fixed_tile(canvas, position, 19, camera, 0, 0)?;
-        let destination_x = position.x as i32 * TILE_SIZE as i32 - camera.x;
-        let destination_y = position.y as i32 * TILE_SIZE as i32 - camera.y;
-
-        for destination_row in 2..=9 {
-            // Each original scroll rotates the display upward by one row. Copy
-            // one source scanline at 2× height to reproduce that byte operation
-            // without retaining a mutable level bitmap inside the renderer.
-            let source_row = terminal_source_row(frame, destination_row);
-            let source = Rect::new(
-                19 * FIXED_TILE_SIZE as i32,
-                i32::from(source_row),
-                FIXED_TILE_SIZE,
-                1,
-            );
-            let destination = Rect::new(
-                destination_x,
-                destination_y + i32::from(destination_row) * MOVING_SCALE as i32,
-                TILE_SIZE,
-                MOVING_SCALE,
-            );
-            canvas
-                .copy(&self.fixed, source, destination)
-                .map_err(RenderError::Sdl)?;
-        }
-        Ok(())
+    /// Applies committed changes immediately after each simulation operation.
+    pub fn apply_board_changes(&mut self, changes: &[BoardChange]) {
+        self.level.apply(changes);
     }
 
     /// Draws the original panel and its live values at their historical positions.
@@ -993,70 +830,6 @@ fn format_menu_level(number: usize, title: &str) -> String {
     // Original titles are ASCII and at most 23 characters, but the truncation
     // also keeps custom level data inside the right-hand menu frame.
     format!("{number:03} {title}").chars().take(29).collect()
-}
-
-/// Finds the held neighbor whose artwork is included in Murphy's current frame.
-fn murphy_composited_target(game: &Game) -> Option<Position> {
-    let position = game.murphy_position()?;
-    let Actor::Murphy(murphy) = game.board().state(position)?.actor() else {
-        return None;
-    };
-    let (action, _) = murphy.sprite_pose()?;
-    let direction = match action {
-        MurphyAnimation::Push { direction, .. } | MurphyAnimation::Snap { direction, .. } => {
-            direction
-        }
-        _ => return None,
-    };
-    // Checked neighbor arithmetic also handles custom boards at their borders.
-    // PreparingPush has no sprite pose, so its held target is never suppressed.
-    let target = match direction {
-        Direction::Left => Position::new(position.x.checked_sub(1)?, position.y),
-        Direction::Right => Position::new(position.x.checked_add(1)?, position.y),
-        Direction::Up => Position::new(position.x, position.y.checked_sub(1)?),
-        Direction::Down => Position::new(position.x, position.y.checked_add(1)?),
-    };
-    game.board()
-        .state(target)
-        .filter(|state| state.actor().is_held())
-        .map(|_| target)
-}
-
-/// Describes one complete Murphy frame as ordered, actor-local bitmap copies.
-fn murphy_layers(action: MurphyAnimation, frame: u8) -> Vec<Layer> {
-    let mut layers = Vec::new();
-    if let MurphyAnimation::Move { target, .. } = action {
-        let background_tile = match target {
-            MurphyMoveTarget::Empty => None,
-            MurphyMoveTarget::Base => Some(2),
-            MurphyMoveTarget::Infotron => Some(4),
-            MurphyMoveTarget::RedDisk | MurphyMoveTarget::PlantedRedDisk => Some(20),
-        };
-        if let Some(tile) = background_tile {
-            let source = fixed_tile_source(tile);
-            layers.push(Layer::Fixed(SpritePart {
-                source: SourcePoint {
-                    x: source.x(),
-                    y: source.y(),
-                },
-                width: 16,
-                height: 16,
-                offset_x: 0,
-                offset_y: 0,
-            }));
-        }
-    }
-    // Erase data applies only to these earlier layers, so eaten material cannot
-    // survive as a ghost behind transparent pixels in the final scene.
-    let parts = sprite_parts(action, frame);
-    if let Some(retained) = parts.retained {
-        layers.push(Layer::Moving(retained));
-    }
-    layers.push(Layer::Moving(parts.primary));
-    if let Some(secondary) = parts.secondary {
-        layers.push(Layer::Moving(secondary));
-    }
-    layers
 }
 
 /// Selects the zonk fall or roll artwork from its bounded physical phase.
@@ -1392,9 +1165,8 @@ fn load_texture<'textures>(
     black_pixel_policy: BlackPixelPolicy,
 ) -> Result<Texture<'textures>, RenderError> {
     let mut image = decode_sized_png(png_bytes, expected_width, expected_height, asset_name)?;
-    // Fixed artwork is opaque and fonts use their selected colorkey. Animated
-    // artwork is reconstructed separately by FrameCache so its erase pixels
-    // operate inside an actor's frame rather than on the shared scene.
+    // Front-end artwork is opaque and fonts use their selected color key.
+    // The level renderer loads both gameplay atlases as opaque bitmap sources.
     apply_black_pixel_policy(&mut image.pixels, black_pixel_policy);
 
     let blend_mode = match black_pixel_policy {
@@ -1574,45 +1346,6 @@ fn terminal_source_row(frame: u8, destination_row: u8) -> u8 {
     3 + (destination_row - 2 + phase - 1) % 7
 }
 
-/// Reports actors whose legal phase must paint over neighboring terrain.
-fn draws_over_terrain(actor: &Actor) -> bool {
-    match actor {
-        Actor::Zonk(actor) => matches!(
-            actor.phase(),
-            RoundedPhase::Falling(_) | RoundedPhase::Rolling { .. }
-        ),
-        Actor::Infotron(actor) => matches!(
-            actor.phase(),
-            RoundedPhase::Falling(_) | RoundedPhase::Rolling { .. }
-        ),
-        Actor::OrangeDisk(actor) => matches!(actor.phase(), OrangePhase::Falling(_)),
-        Actor::SnikSnak(actor) => matches!(actor.phase(), EnemyPhase::Moving { .. }),
-        Actor::Electron(actor) => matches!(actor.phase(), EnemyPhase::Moving { .. }),
-        Actor::Murphy(actor) => match actor.phase() {
-            MurphyPhase::Ready | MurphyPhase::PreparingPush { .. } => false,
-            MurphyPhase::PlantingRedDisk { .. }
-            | MurphyPhase::Moving(_)
-            | MurphyPhase::Resuming(_)
-            | MurphyPhase::Snapping(_)
-            | MurphyPhase::Pushing { .. }
-            | MurphyPhase::CrossingPort { .. }
-            | MurphyPhase::Exiting(_) => true,
-        },
-        Actor::Empty(_)
-        | Actor::Base(_)
-        | Actor::RamChip(_)
-        | Actor::Hardware(_)
-        | Actor::Exit(_)
-        | Actor::Port(_)
-        | Actor::YellowDisk(_)
-        | Actor::Terminal(_)
-        | Actor::RedDisk(_)
-        | Actor::Bug(_)
-        | Actor::InvisibleWall(_)
-        | Actor::Explosion(_) => false,
-    }
-}
-
 /// Returns camera interpolation from a concrete moving actor's bounded progress.
 fn movement_offset(state: &State) -> (i32, i32) {
     let rounded = match state.actor() {
@@ -1754,6 +1487,8 @@ pub enum RenderError {
         /// Decoder-selected component depth.
         bit_depth: png::BitDepth,
     },
+    /// Gameplay drawing was requested before its level bitmap was initialized.
+    LevelNotInitialized,
     /// SDL rejected texture creation, upload, or a draw operation.
     Sdl(String),
 }
@@ -1784,6 +1519,9 @@ impl fmt::Display for RenderError {
                 formatter,
                 "production PNG decoded as {color_type:?}/{bit_depth:?}; expected RGBA/8-bit"
             ),
+            Self::LevelNotInitialized => {
+                formatter.write_str("begin_level must precede gameplay drawing")
+            }
             Self::Sdl(error) => write!(formatter, "SDL rendering failed: {error}"),
         }
     }
@@ -1817,180 +1555,6 @@ mod tests {
         actors::{Direction, EnemyTurn, MurphyAnimation, MurphyMoveTarget, MurphyPushTarget},
         assets,
     };
-
-    /// Actual software-rendered pixels preserve Murphy in both intended following windows.
-    #[cfg(not(any(feature = "pocketgo", target_env = "uclibc", target_arch = "wasm32")))]
-    #[test]
-    fn rendered_push_roll_and_fall_preserve_murphy_without_delaying_him() {
-        use crate::platform::{self, pixels::PixelFormatEnum};
-        use crate::{
-            actors::Actor,
-            game::{Game, Input},
-            level::{LEVEL_RECORD_SIZE, LEVEL_WIDTH, LevelSet},
-        };
-        // This is the only video test; the dummy driver opens no visible window.
-        platform::hint::set("SDL_VIDEODRIVER", "dummy");
-        let sdl = platform::init().unwrap();
-        let video = sdl.video().unwrap();
-        let window = video
-            .window(
-                "compositing regression",
-                super::LOGICAL_WIDTH,
-                super::LOGICAL_HEIGHT,
-            )
-            .hidden()
-            .build()
-            .unwrap();
-        let mut canvas = window.into_canvas().software().build().unwrap();
-        let creator = canvas.texture_creator();
-        let mut renderer = super::Renderer::new(&creator).unwrap();
-        let graphics = assets::load_graphics().unwrap();
-        let moving = decode_png(graphics.moving.as_ref()).unwrap();
-        let fixed = decode_png(graphics.fixed.as_ref()).unwrap();
-        for direction in [Direction::Left, Direction::Right] {
-            let mut record = vec![0; LEVEL_RECORD_SIZE];
-            record[..60 * 24].fill(6);
-            for y in 1..7 {
-                for x in 1..9 {
-                    record[y * LEVEL_WIDTH + x] = 0;
-                }
-            }
-            let (start, support) = match direction {
-                Direction::Left => (5, 3),
-                Direction::Right => (3, 5),
-                _ => unreachable!(),
-            };
-            record[2 * LEVEL_WIDTH + start] = 3;
-            record[2 * LEVEL_WIDTH + 4] = 1;
-            record[3 * LEVEL_WIDTH + 4] = 6;
-            record[3 * LEVEL_WIDTH + support] = 5;
-            let level = LevelSet::new(&record).load(1).unwrap();
-            let mut game = Game::with_random_seed(&level, 0).unwrap();
-            let mut protected_pixels = 0;
-            for tick in 1..=32 {
-                game.tick(Input {
-                    direction: Some(direction),
-                    action: false,
-                });
-                renderer.draw(&mut canvas, &game, 1, 35).unwrap();
-                let pixels = canvas.read_pixels(None, PixelFormatEnum::RGBA32).unwrap();
-                let mpos = game.murphy_position().unwrap();
-                let Actor::Murphy(murphy) = game.board().state(mpos).unwrap().actor() else {
-                    unreachable!()
-                };
-                if tick <= 8 {
-                    // Holding a direction has not started the push picture yet:
-                    // the reserved rock must remain visible at its original cell.
-                    for y in 0..16 {
-                        for x in 0..16 {
-                            let source = (y * 640 + 16 + x) * 4;
-                            let dx =
-                                (4 * 16 + x) * MOVING_SCALE as usize - renderer.camera.x as usize;
-                            let dy =
-                                (2 * 16 + y) * MOVING_SCALE as usize - renderer.camera.y as usize;
-                            let screen = (dy * super::LOGICAL_WIDTH as usize + dx) * 4;
-                            assert_eq!(
-                                &pixels[screen..screen + 3],
-                                &fixed.pixels[source..source + 3],
-                                "held rock disappeared"
-                            );
-                        }
-                    }
-                }
-                let Some((action, frame)) = murphy.sprite_pose() else {
-                    continue;
-                };
-                let part = crate::murphy_animation::sprite_parts(action, frame).primary;
-                let mx = mpos.x as i32 * 16 + part.offset_x;
-                let my = mpos.y as i32 * 16 + part.offset_y;
-                if matches!(action, MurphyAnimation::Push { .. }) && (9..16).contains(&tick) {
-                    // The push composite owns the held rock as well as Murphy.
-                    // A separately painted fixed rock would show through its
-                    // transparent exterior and leave a duplicate at the source.
-                    for y in 0..part.height as i32 {
-                        for x in 0..part.width as i32 {
-                            let source =
-                                (((part.source.y + y) * 320 + part.source.x + x) * 4) as usize;
-                            let dx = (mx + x) * MOVING_SCALE as i32 - renderer.camera.x;
-                            let dy = (my + y) * MOVING_SCALE as i32 - renderer.camera.y;
-                            let screen =
-                                (dy as usize * super::LOGICAL_WIDTH as usize + dx as usize) * 4;
-                            assert_eq!(
-                                &pixels[screen..screen + 3],
-                                &moving.pixels[source..source + 3],
-                                "{direction:?} push tick {tick}: duplicate target at ({dx},{dy})"
-                            );
-                        }
-                    }
-                }
-
-                // These exact entry ticks belong to the pre-fix gameplay. A
-                // rendering change must not pass by delaying Murphy's movement.
-                if tick == 18 {
-                    assert_eq!((mpos.x, mpos.y), (support, 2));
-                }
-                if tick == 26 {
-                    assert_eq!(
-                        (mpos.x, mpos.y),
-                        (if direction == Direction::Left { 2 } else { 6 }, 2)
-                    );
-                }
-                for (index, state) in game.board().cells().iter().enumerate() {
-                    let Actor::Zonk(zonk) = state.actor() else {
-                        continue;
-                    };
-                    let Some(rock) = zonk_sprite_part(zonk.phase()) else {
-                        continue;
-                    };
-                    let rows = match zonk.phase() {
-                        RoundedPhase::Falling(_) => 2,
-                        RoundedPhase::Rolling { frame, .. } if frame.index() == 7 => 16,
-                        _ => continue,
-                    };
-                    let pos = game.board().position(index).unwrap();
-                    let zx = pos.x as i32 * 16 + rock.offset_x;
-                    let zy = pos.y as i32 * 16 + rock.offset_y;
-                    // Compare real scene pixels where the old rectangle painted
-                    // pure black over colored Murphy artwork. The first two fall
-                    // rows and final roll's trailing half are known erase data.
-                    for y in 0..rows {
-                        for x in 0..rock.width as i32 {
-                            let px = zx + x - mx;
-                            let py = zy + y - my;
-                            if px < 0
-                                || py < 0
-                                || px >= part.width as i32
-                                || py >= part.height as i32
-                            {
-                                continue;
-                            }
-                            let ri = (((rock.source.y + y) * 320 + rock.source.x + x) * 4) as usize;
-                            let mi =
-                                (((part.source.y + py) * 320 + part.source.x + px) * 4) as usize;
-                            let expected = &moving.pixels[mi..mi + 3];
-                            if moving.pixels[ri..ri + 3] != [0, 0, 0] || expected == [0, 0, 0] {
-                                continue;
-                            }
-                            let dx = (zx + x) * MOVING_SCALE as i32 - renderer.camera.x;
-                            let dy = (zy + y) * MOVING_SCALE as i32 - renderer.camera.y;
-                            let screen =
-                                ((dy as usize * super::LOGICAL_WIDTH as usize) + dx as usize) * 4;
-                            assert_eq!(
-                                &pixels[screen..screen + 3],
-                                expected,
-                                "{direction:?} tick {tick} at ({dx},{dy})"
-                            );
-                            protected_pixels += 1;
-                        }
-                    }
-                }
-            }
-            assert!(
-                protected_pixels > 100,
-                "fixture must exercise the reported overlap"
-            );
-        }
-    }
 
     /// Confirms all production resources decode to their contracted RGBA sizes.
     #[test]
@@ -2406,62 +1970,6 @@ mod tests {
             digest, 0xc972aa2eabf028cd,
             "an original sprite rectangle changed"
         );
-    }
-
-    /// Verifies terrain layering follows actual moving phases and preserves source markers.
-    #[test]
-    fn terrain_layering_reads_typed_actor_phases() {
-        use crate::actors::{Actor, Infotron, OrangeDisk, State, Zonk, orange_disk::OrangePhase};
-        for phase in [
-            RoundedPhase::Resting,
-            RoundedPhase::Momentum,
-            RoundedPhase::AwaitingFall,
-            RoundedPhase::PreparingRoll(Horizontal::Left),
-            RoundedPhase::Held,
-        ] {
-            assert!(!super::draws_over_terrain(&Actor::Zonk(Zonk::from_phase(
-                phase
-            ))));
-            assert!(!super::draws_over_terrain(&Actor::Infotron(
-                Infotron::from_phase(phase)
-            )));
-        }
-        for phase in [
-            RoundedPhase::Falling(Frame::first()),
-            RoundedPhase::Rolling {
-                direction: Horizontal::Left,
-                frame: Frame::first(),
-            },
-            RoundedPhase::Rolling {
-                direction: Horizontal::Right,
-                frame: Frame::last(),
-            },
-        ] {
-            assert!(super::draws_over_terrain(&Actor::Zonk(Zonk::from_phase(
-                phase
-            ))));
-            assert!(super::draws_over_terrain(&Actor::Infotron(
-                Infotron::from_phase(phase)
-            )));
-        }
-        assert!(!super::draws_over_terrain(&Actor::OrangeDisk(
-            OrangeDisk::from_phase(OrangePhase::AwaitingFall(Frame::first()))
-        )));
-        assert!(super::draws_over_terrain(&Actor::OrangeDisk(
-            OrangeDisk::from_phase(OrangePhase::Falling(Frame::first()))
-        )));
-        assert!(super::draws_over_terrain(
-            State::loaded_snik_snak_move(Direction::Right).actor()
-        ));
-        assert!(!super::draws_over_terrain(
-            State::loaded_snik_snak_source(Direction::Right).actor()
-        ));
-        assert!(super::draws_over_terrain(
-            State::loaded_electron_move(Direction::Up).actor()
-        ));
-        assert!(!super::draws_over_terrain(
-            State::loaded_electron_source(Direction::Up).actor()
-        ));
     }
 
     /// Retains the old camera interpolation at every bounded fall and roll picture.

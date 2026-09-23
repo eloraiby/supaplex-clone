@@ -12,7 +12,7 @@ use crate::actors::{
 };
 
 /// One pixel coordinate in the unscaled 320×462 `MOVING.DAT` conversion.
-#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) struct SourcePoint {
     /// Horizontal source pixel measured from the left edge of `moving.png`.
     pub(crate) x: i32,
@@ -55,7 +55,7 @@ impl Descriptor {
 }
 
 /// Drawable rectangle and destination displacement for one animation layer.
-#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) struct SpritePart {
     /// Top-left pixel in the unscaled moving-sprite sheet.
     pub(crate) source: SourcePoint,
@@ -69,10 +69,10 @@ pub(crate) struct SpritePart {
     pub(crate) offset_y: i32,
 }
 
-/// Ordered sprite layers needed to reconstruct one complete Murphy action frame.
+/// Original bitmap copies associated with one Murphy action frame.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) struct SpriteParts {
-    /// Complete Murphy cell retained underneath an adjacent snap descriptor.
+    /// One-time Murphy pose painted at the start of a Base or Infotron snap.
     pub(crate) retained: Option<SpritePart>,
     /// Main descriptor layer drawn for every Murphy action.
     pub(crate) primary: SpritePart,
@@ -142,10 +142,12 @@ pub(crate) fn sprite_parts(action: MurphyAnimation, frame: u8) -> SpriteParts {
     };
 
     // Snap descriptors draw only into the adjacent material cell. The DOS
-    // level bitmap retained a complete Murphy picture in his own cell, so a
-    // stateless renderer must explicitly reproduce that persistent underlay.
-    let retained = if let MurphyAnimation::Snap { direction, target } = action {
-        Some(snap_retained_part(direction, target))
+    // level bitmap retains a complete Murphy picture in his own cell. The
+    // renderer paints this pose once when the snap starts.
+    let retained = if frame == 0
+        && let MurphyAnimation::Snap { direction, target } = action
+    {
+        snap_retained_part(direction, target)
     } else {
         None
     };
@@ -158,11 +160,11 @@ pub(crate) fn sprite_parts(action: MurphyAnimation, frame: u8) -> SpriteParts {
 }
 
 /// Returns the complete Murphy picture retained while an adjacent cell is snapped.
-fn snap_retained_part(direction: Direction, target: MurphySnapTarget) -> SpritePart {
+fn snap_retained_part(direction: Direction, target: MurphySnapTarget) -> Option<SpritePart> {
     // Base and Infotron handlers copied these direction-specific pictures into
     // Murphy's cell immediately before starting the adjacent-cell strip. Red
-    // Disk handlers relied on the already persistent bitmap instead; the still
-    // picture is the faithful deterministic reconstruction after Murphy rests.
+    // Disk handlers keep the already persistent pose, so they emit no copy.
+    // Inserting a standing picture here would discard Murphy's preceding pose.
     let source = match target {
         MurphySnapTarget::Base | MurphySnapTarget::Infotron => match direction {
             Direction::Up => SourcePoint { x: 160, y: 64 },
@@ -170,19 +172,19 @@ fn snap_retained_part(direction: Direction, target: MurphySnapTarget) -> SpriteP
             Direction::Down => SourcePoint { x: 176, y: 64 },
             Direction::Right => SourcePoint { x: 192, y: 16 },
         },
-        MurphySnapTarget::RedDisk => SourcePoint { x: 304, y: 132 },
+        MurphySnapTarget::RedDisk => return None,
     };
 
     // The retained image replaces exactly Murphy's own cell. Directional
     // displacement belongs exclusively to the primary snap descriptor, which
     // is deliberately positioned over the neighboring material cell.
-    SpritePart {
+    Some(SpritePart {
         source,
         width: 16,
         height: 16,
         offset_x: 0,
         offset_y: 0,
-    }
+    })
 }
 
 /// Maps a typed action to the descriptor selected by the original direction handlers.
@@ -797,7 +799,7 @@ mod tests {
         assert_ne!(base.primary.source, infotron.primary.source);
     }
 
-    /// Verifies every snap reconstructs Murphy while its descriptor replaces the target cell.
+    /// Snap entry draws directional Base/Infotron poses and retains existing Red Disk pixels.
     #[test]
     fn snap_frames_retain_a_complete_murphy_in_his_own_cell() {
         let directional_poses = [
@@ -817,6 +819,12 @@ mod tests {
                 assert_eq!(retained.source, expected_source);
                 assert_eq!((retained.width, retained.height), (16, 16));
                 assert_eq!((retained.offset_x, retained.offset_y), (0, 0));
+                assert!(
+                    sprite_parts(MurphyAnimation::Snap { direction, target }, 1)
+                        .retained
+                        .is_none(),
+                    "the entry pose must not overwrite later drawings"
+                );
                 assert_ne!(
                     (parts.primary.offset_x, parts.primary.offset_y),
                     (0, 0),
@@ -838,12 +846,11 @@ mod tests {
                 },
                 0,
             )
-            .retained
-            .expect("Red Disk snaps must retain Murphy");
-
-            assert_eq!(retained.source, SourcePoint { x: 304, y: 132 });
-            assert_eq!((retained.width, retained.height), (16, 16));
-            assert_eq!((retained.offset_x, retained.offset_y), (0, 0));
+            .retained;
+            assert!(
+                retained.is_none(),
+                "Red Disk snapping preserves the saved pose"
+            );
         }
     }
 

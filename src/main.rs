@@ -504,6 +504,9 @@ fn play_level(
     // Constructing after the menu fade guarantees no simulation time elapses
     // while the selected record is still hidden behind the old screen.
     let mut game = Game::new(session.level).map_err(|error| error.to_string())?;
+    renderer
+        .begin_level(&game)
+        .map_err(|error| error.to_string())?;
     if let Some(audio) = audio.as_mut() {
         // A new level clears any protected terminal effect and resumes music
         // only when the user has not muted it.
@@ -558,6 +561,9 @@ fn play_level(
                     // retaining the process RNG stream, as original play does.
                     game.restart(session.level)
                         .map_err(|error| error.to_string())?;
+                    renderer
+                        .begin_level(&game)
+                        .map_err(|error| error.to_string())?;
                     if let Some(audio) = audio.as_mut() {
                         audio.restart_level();
                     }
@@ -598,7 +604,7 @@ fn play_level(
         if destroy_murphy {
             // The simulation owns blast construction and terminal timing. A
             // repeated Escape during the death sequence is an intentional no-op.
-            game.destroy_murphy();
+            renderer.apply_board_changes(&game.destroy_murphy_with_changes());
         }
 
         let mut processed_steps = 0;
@@ -609,7 +615,7 @@ fn play_level(
                 action: keyboard.is_scancode_pressed(Scancode::Space)
                     || keyboard.is_scancode_pressed(Scancode::LAlt),
             };
-            game.tick(input);
+            renderer.apply_board_changes(&game.tick_with_changes(input));
             if game.status() == GameStatus::Completed && completion_tick.is_none() {
                 // Capture the instant completion first appears so the original
                 // terminal delay does not inflate persistent player time.
@@ -714,6 +720,9 @@ fn play_demo(
     // Legacy standalone demos do not embed a SpeedFix seed, so the original
     // zero-initialized demo seed table supplies zero for deterministic Bugs.
     let mut game = Game::with_random_seed(session.level, 0).map_err(|error| error.to_string())?;
+    renderer
+        .begin_level(&game)
+        .map_err(|error| error.to_string())?;
     if let Some(audio) = audio.as_mut() {
         audio.restart_level();
     }
@@ -758,7 +767,7 @@ fn play_demo(
         let mut processed_steps = 0;
         while accumulator >= step && processed_steps < MAX_STEPS_PER_FRAME && !stream_finished {
             if let Some(input) = playback.next() {
-                game.tick(input);
+                renderer.apply_board_changes(&game.tick_with_changes(input));
                 if let Some(audio) = audio.as_mut() {
                     // Demo effects pass through the same one-channel priority
                     // gate as live play while recorded input remains immutable.
