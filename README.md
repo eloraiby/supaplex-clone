@@ -213,9 +213,9 @@ Shared responsibilities are separated by concern:
 | `actors/enemy.rs` | Legal enemy phases and eight-picture turn mapping |
 | `actors/empty.rs` | Explicit source, side, and destination reservations |
 | `render.rs` | Front-end drawing, camera, HUD, and typed sprite geometry |
-| `render/level.rs` | Persistent level bitmap and opaque copies in simulation order |
+| `render/level.rs` | Persistent level bitmap consuming explicit actor pictures in callback order |
 | `actors/state.rs` | Complete cell values and level/session construction boundaries |
-| `actors/transition.rs` | Owned atomic cell writes and game-session events |
+| `actors/transition.rs` | Explicit typed pictures, atomic cell writes, and session events |
 
 Murphy's preparation, planting, movement, snapping, pushing, port traversal, and
 exit sequence belong to one phase enum. They cannot coexist as independent
@@ -230,7 +230,9 @@ shared animation-kind enum, generic animation object, or `State::animation()`
 API. Enemy sprite selectors accept `EnemyPhase`; rock selectors accept
 `RoundedPhase`; Bug and explosion tables take their own bounded frames.
 Murphy's own artwork descriptor selects the original composite sprite tables.
-Gameplay and rendering both read actor-owned state. `Frame<N>`
+Gameplay stores actor-owned state; rendering consumes the typed pictures explicitly
+emitted by actor transitions. A terminal picture can be emitted even when the
+actor completes or transfers in that callback. `Frame<N>`
 rejects external indices outside its strip, and its private representation
 prevents unchecked construction. Runtime checks still handle board occupancy,
 bounds, and reservations replaced by earlier actors; these depend on the live
@@ -263,8 +265,8 @@ the original asymmetric edge behavior is required by known demos. Tile 40 is
 the historical accidental invisible wall: it is always collision-solid, always
 drawn as empty space, and has no reveal-on-touch transition.
 
-Logical movement occupies the destination at animation start while its source
-becomes an invisible `Vacating` reservation. The destination sprite is offset
+Murphy's ordinary movement occupies the destination at animation start while its
+source becomes an invisible `Vacating` reservation. The destination sprite is offset
 toward that source and owns the reservation's release; temporary Space markers
 do not receive autonomous original callbacks. Falling Zonks and Infotrons clear
 their source on state `0x16`, before their last two pictures. Murphy releases his
@@ -272,8 +274,8 @@ old cell while retaining the final moving pose, and processes new direction
 input on his next update. A trailing Zonk that sees the newly opened cell later
 in the same pass first enters `RoundedPhase::AwaitingFall`; it transfers only on the following
 pass, after Murphy has received that next input. Explosions that replace a
-moving or rolling Zonk/Infotron clear the reservation selected by that actor's
-live movement phase. Murphy may collect only idle Infotrons when snapping or
+moving or rolling Zonk/Infotron clear all surviving reservations owned by that
+actor's live movement phase. Murphy may collect only idle Infotrons when snapping or
 moving up, left, or right; ordinary downward movement retains the original
 tile-only collision check.
 
@@ -332,11 +334,12 @@ event timing, effect priorities, direct `BLASTER.SND` VOC extraction, direct
 Compile-fail documentation tests reject mismatched actor phases, vertical rolls
 and rock pushes, wrong-length frame payloads, unchecked frame construction, and
 arbitrary actor/animation pairing. `tests/demo_replay.rs` compares all ten demo
-histories with pre-refactor fixtures over 46,199 input ticks, including every
-cell's sprite timing and collision state, game counters, and emitted sounds.
-These fixtures preserve existing behavior; they do not assert that every legacy
-demo currently completes its level. Rendering tests also compare all 182 original
-gravity, enemy, Bug, and explosion rectangles with a pre-refactor fingerprint,
+histories over 46,199 input ticks, including every cell's typed phase and collision
+state, game counters, and emitted sounds. Histories were updated for the corrected
+rounded-object reservation timing; the previous hashes preserved early source
+release. They guard determinism and do not assert full upstream parity or that
+every legacy demo currently completes its level. Rendering tests also compare all
+182 original gravity, enemy, Bug, and explosion rectangles with a pre-refactor fingerprint,
 and check camera interpolation directly from typed phases.
 
 Source release and animation completion are distinct events. In
@@ -347,51 +350,67 @@ advancing the state, and the preparation pictures belong to the roll's eight
 pictures. These counters must not be treated as interchangeable with a
 post-update snapshot frame without checking the full transition sequence.
 
-Gameplay drawing follows the simulation's committed order. `Game::tick_with_changes`
-uses the ordinary tick implementation and returns typed `BoardChange` values in
-write order: Murphy first, then the captured row-major callbacks and their
-immediate events, then the remaining session timers. Intermediate changes to the
-same cell are retained. Ordinary `Game::tick` records nothing, so headless play
-has no growing presentation queue.
+Actor transitions produce three separate effects: typed `Drawing` pictures,
+atomic cell writes, and immediate session events. `Game::tick_with_drawings`
+retains pictures in execution order: Murphy first, then the captured row-major
+callbacks and their events, then session timers. `Board::set` does not imply a
+picture. Ordinary `Game::tick` uses the same simulation without retaining output.
 
-`render/level.rs` applies those changes to one persistent board bitmap at the
-original 16-pixel tile resolution. Sprite rectangles are opaque copies, including
-all black erase pixels. Collision-only reservation changes do not paint Space.
-Murphy's target material remains in the bitmap until his original strip erases
-it; a snap's initial pose is painted once. Held targets keep their pixels during
-push preparation. Their artwork is not reconstructed over later push frames.
-The renderer uses the original rectangle sizes and actor-owned bounded phases.
+Drawing and completion occur in the same callback. For example, Infotron snapping
+emits the final original rectangle at `(304, 148)` before it removes the held
+Infotron and records collection. That empty picture erases the preceding frame's
+ten remaining colored pixels. The same contract preserves terminal push, port,
+and exit pictures at their original anchors. No extra completion tick is needed.
+
+Rounded-object frames identify the **next picture to draw**. Preparation consumes
+the first two pictures of the eight-picture roll while the actor still owns its
+source cell. Ownership then transfers sideways with the source still reserved.
+The fourth picture changes the source marker; the sixth releases it, allowing
+Murphy to enter on his next callback while the final two roll pictures finish.
+The eighth roll picture transfers the actor downward without also drawing falling
+picture zero. Each falling callback likewise draws before advancing or landing;
+continued falls reserve the next destination and resume on the next callback.
+This follows the original collision windows instead of opening cells early to
+match a renderer's post-update snapshot.
+
+`render/level.rs` applies emitted pictures to one persistent board bitmap at the
+original 16-pixel tile resolution. Copies are opaque, including all black erase
+pixels. Normal reservation release is silent; destruction of moving artwork by
+a blast explicitly emits its cleanup. Target material and held push targets stay
+in the bitmap until the original action strip erases them. Stopping at a wall
+retains the completed movement picture until an actor emits another picture.
 
 The application initializes the bitmap before each level's entry fade, applies
-changes after every fixed tick, and replaces the bitmap on restart. Demos use
-the same path. Escape uses `destroy_murphy_with_changes` so its immediate blast
-appears even when no fixed tick is due. A display refresh uploads changed pixels
-and copies the camera's view of the saved board. Multiple catch-up ticks preserve
-every intervening copy while sharing one texture upload; repeated display frames
-and camera movement never repaint actors. Fonts retain their existing color key.
+pictures after every fixed tick, and replaces the bitmap on restart. Demos use
+the same path. Escape uses `destroy_murphy_with_drawings` so its immediate blast
+appears even when no fixed tick is due. Display refreshes upload changed pixels
+and copy the camera's view. Catch-up ticks preserve every intervening copy while
+sharing one texture upload; camera movement never replays actor drawings.
 
-This drawing architecture follows
-[OpenSupaplex's `updateMovingObjects` callback order](https://github.com/sergiou87/open-supaplex/blob/master/src/supaplex.c)
-and [its persistent `gLevelBitmapData` copies](https://github.com/sergiou87/open-supaplex/blob/master/src/graphics.c).
-Later opaque rectangles win where they overlap. It does not impose a separate
-actor priority or infer transparency from black. The change preserves this
-clone's existing phase timing and collision behavior; the replay fingerprints
-verify that preservation, not full frame-by-frame equivalence to upstream.
+The callback order and opaque-copy contract follow
+[OpenSupaplex's simulation](https://github.com/sergiou87/open-supaplex/blob/bad56a4e174e628643995284ea55d4c49af3137c/src/supaplex.c)
+and [saved level bitmap](https://github.com/sergiou87/open-supaplex/blob/bad56a4e174e628643995284ea55d4c49af3137c/src/graphics.c).
+Independent traces cover 22 scenarios: all snap materials/directions, eating Base
+and reversing through cleared cells in all directions, following pushed Zonks,
+and revisiting cleared Base beside rolling/falling Zonks and Infotrons. Tests
+compare actual rectangles, positions, or complete saved pixels **after each tick**,
+not only at completion. See [trace reproduction instructions](tests/support/opensupaplex_traces.md).
+These scenarios establish specific upstream agreement, not parity of every game
+interaction.
 
-Pixel regressions exercise pushing, rolling, and falling in both directions,
-opaque overlap order, source releases, retained material, clipping, restart, and
-six ticks accumulated before presentation. A hidden SDL software renderer also
-compares displayed pixels with the saved bitmap, checks repeated display frames
-and camera movement, and verifies immediate death rendering. All ten original
-replay fingerprints and the 182 sprite-rectangle fingerprint remain unchanged.
-The replay test additionally compares every observed tick with an ordinary
-headless tick, including the board, status, counters, toggles, and sound events.
+Additional regressions cover all push/port/exit terminal pictures, opaque overlap
+order, reservation destruction, retained material, clipping, restart, and six
+ticks accumulated before presentation. A hidden SDL software renderer compares
+displayed pixels with the saved bitmap, checks repeated display frames and camera
+movement, and verifies immediate death rendering. The 182 sprite-rectangle
+fingerprint remains unchanged. Each bundled demo also runs with and without
+drawing capture and compares boards, counters, toggles, status, and sounds.
 
 Format and mapping references:
 
 - [Historical Supaplex file formats](https://www.elmerproductions.com/sp/filefmt.html)
 - [OpenSupaplex tile and level definitions](https://github.com/sergiou87/open-supaplex/blob/master/src/globals.h)
 
-The historical replay fixture encoding lives only in `tests/support/legacy_snapshot.rs`.
-It translates typed state into the original fixture text so the pre-refactor
-fingerprints remain unchanged; production simulation and rendering do not use it.
+The test-only encoding in `tests/support/legacy_snapshot.rs` retains historical
+labels for unchanged phases and encodes new rounded reservations and preparation
+progress explicitly. Production simulation and rendering do not use those labels.
