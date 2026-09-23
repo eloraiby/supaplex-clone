@@ -16,7 +16,7 @@ pub enum Empty {
 /// The finite set of non-actor occupancy markers used by original movements.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum Reservation {
-    /// Trailing cell of a rounded roll, a falling object, or a Murphy transfer.
+    /// Old cell of a falling object or Murphy transfer.
     Vacating {
         /// Movement direction used to find the owning destination.
         direction: Direction,

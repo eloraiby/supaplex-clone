@@ -25,7 +25,7 @@ pub enum RoundedPhase {
     AwaitingFall,
     /// Side reservation installed; the diagonal must remain available.
     PreparingRoll(Horizontal),
-    /// Horizontal slide with a trailing source held until picture six and a reserved drop cell.
+    /// Horizontal slide toward a reserved diagonal destination.
     Rolling {
         /// Only left or right is representable.
         direction: Horizontal,
@@ -94,21 +94,10 @@ impl RoundedActor {
             },
             RoundedPhase::PreparingRoll(direction) => self.begin_slide(position, direction, world),
             RoundedPhase::Rolling { direction, frame } => match frame.next() {
-                Some(next) => {
-                    let mut writes = vec![CellWrite::new(
-                        position,
-                        self.in_phase(RoundedPhase::Rolling {
-                            direction,
-                            frame: next,
-                        }),
-                    )];
-                    // As in a straight fall, the owner releases its trailing
-                    // cell at picture six, never at the start of the transfer.
-                    if frame.index() == 5 {
-                        self.release_source(position, direction.direction(), world, &mut writes);
-                    }
-                    Some(Transition::new(writes, Vec::new()))
-                }
+                Some(frame) => Some(Transition::replace(
+                    position,
+                    self.in_phase(RoundedPhase::Rolling { direction, frame }),
+                )),
                 None => self.begin_drop(position, world),
             },
             RoundedPhase::Falling(frame) => match frame.next() {
@@ -117,10 +106,22 @@ impl RoundedActor {
                         position,
                         self.in_phase(RoundedPhase::Falling(next)),
                     )];
-                    // Straight falls and roll-to-fall transfers have identical
-                    // source ownership and release it at original state 0x16.
-                    if frame.index() == 5 {
-                        self.release_source(position, Direction::Down, world, &mut writes);
+                    // State 0x16 opens the source before the final two pictures.
+                    if frame.index() == 5
+                        && let Some(source) = world.offset(position, Direction::Up)
+                        && world.state(source).is_some_and(|state| {
+                            matches!(
+                                state.actor(),
+                                Actor::Empty(super::Empty::Reserved(
+                                    super::empty::Reservation::Vacating {
+                                        direction: Direction::Down,
+                                        ..
+                                    }
+                                ))
+                            )
+                        })
+                    {
+                        writes.push(CellWrite::new(source, State::empty()));
                     }
                     Some(Transition::new(writes, Vec::new()))
                 }
@@ -129,27 +130,6 @@ impl RoundedActor {
                     Self::Infotron(a) => a.land(position, world),
                 }),
             },
-        }
-    }
-
-    /// Releases a trailing reservation only when this movement still owns it.
-    fn release_source(
-        self,
-        position: Position,
-        direction: Direction,
-        world: &WorldView<'_>,
-        writes: &mut Vec<CellWrite>,
-    ) {
-        // A blast may already have replaced the marker. Never clear its new
-        // occupant merely because this animation reached its release frame.
-        if let Some(source) = world.offset(position, direction.opposite())
-            && world.state(source).is_some_and(|state| {
-                matches!(state.reservation(), Some(super::empty::Reservation::Vacating {
-                    direction: reserved_direction, ..
-                }) if reserved_direction == direction)
-            })
-        {
-            writes.push(CellWrite::new(source, State::empty()));
         }
     }
 
@@ -176,7 +156,7 @@ impl RoundedActor {
             (true, Some(side), Some(diagonal)) if world.is_empty(diagonal) => {
                 Some(Transition::new(
                     vec![
-                        CellWrite::new(position, State::vacating(direction.direction())),
+                        CellWrite::new(position, State::empty()),
                         CellWrite::new(
                             side,
                             self.in_phase(RoundedPhase::Rolling {
@@ -211,9 +191,16 @@ impl RoundedActor {
                 )
             })
         {
-            // Use the same atomic transfer as every other downward move:
-            // destination ownership does not make the source immediately free.
-            return Some(Transition::move_actor(position, destination, self));
+            return Some(Transition::new(
+                vec![
+                    CellWrite::new(position, State::empty()),
+                    CellWrite::new(
+                        destination,
+                        self.in_phase(RoundedPhase::Falling(Frame::first())),
+                    ),
+                ],
+                Vec::new(),
+            ));
         }
         Some(Transition::replace(
             position,
