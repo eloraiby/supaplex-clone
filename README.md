@@ -213,6 +213,7 @@ Shared responsibilities are separated by concern:
 | `actors/enemy.rs` | Legal enemy phases and eight-picture turn mapping |
 | `actors/empty.rs` | Explicit source, side, and destination reservations |
 | `render.rs` | Direct sprite selection from actor-specific phases and bounded frames |
+| `render/composite.rs` | Actor-local bitmap composition and cached scene-ready frames |
 | `actors/state.rs` | Complete cell values and level/session construction boundaries |
 | `actors/transition.rs` | Owned atomic cell writes and game-session events |
 
@@ -346,11 +347,32 @@ advancing the state, and the preparation pictures belong to the roll's eight
 pictures. These counters must not be treated as interchangeable with a
 post-update snapshot frame without checking the full transition sequence.
 
-Known rendering issue: when Murphy follows a pushed Zonk through a roll and
-fall, opaque animation erase rectangles can paint over him. The gameplay
-following window must be preserved when correcting this presentation issue.
-The replay fingerprints verify existing behavior, not full OpenSupaplex parity
-or the correctness of every rendered frame.
+Animation rectangles from `MOVING.DAT` include black pixels that erased old
+artwork in the original persistent level bitmap. In this renderer, those copies
+are first assembled on a private surface for each actor frame. Murphy's target
+material, retained picture, and action rectangles are composed there in order.
+Their black pixels can erase that local material without erasing another actor.
+The completed frame is then placed on the freshly drawn scene.
+
+Exterior black connected to the completed frame's edges becomes transparent;
+enclosed black details remain opaque. This is one rule for all animated actors,
+not a special Zonk texture or drawing priority. It assumes the original asset
+convention that edge-connected black is background; replacement graphics use
+the same convention. Held targets remain visible during push preparation, then
+are drawn only inside Murphy's active push or snap composite to avoid duplicates.
+Source rectangles, actor phases, collision rules, and movement timing remain
+unchanged. Frames are cached by their bitmap operations, excluding board position
+and camera offset, so composition and texture upload happen once per recipe.
+
+A desktop regression uses SDL's hidden software renderer and reads the actual
+screen pixels for both push–roll–fall directions. It verifies the original Murphy
+entry ticks, visibility during push preparation, absence of a duplicate pushed
+rock, and preservation of Murphy under the old erase regions. Pixel tests also
+check local material erasure and opaque enclosed black details. Reinstating
+opaque scene erasure or duplicate target drawing makes the desktop regression
+fail. The original ten-demo fingerprints and 182 sprite rectangles are unchanged.
+This scene-composition rule deliberately removes erase-rectangle overlap; it is
+not a claim of pixel-for-pixel equivalence to OpenSupaplex's persistent bitmap.
 
 Format and mapping references:
 
