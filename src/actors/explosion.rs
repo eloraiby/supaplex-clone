@@ -82,51 +82,62 @@ fn explosion_state(residue: ExplosionResidue) -> State {
     State::new(actor)
 }
 
-/// Finds the temporary cell owned by one moving Zonk or Infotron phase.
+/// Finds all temporary cells still owned by a moving Zonk or Infotron phase.
 ///
 /// The original blast dispatcher decodes the actor's state high nibble and
 /// clears the corresponding old, side, or diagonal Space marker. Typed
 /// physical phases carry that same topology here, so cleanup stays phase-specific
 /// instead of reviving autonomous behavior in temporary Empty cells.
-fn rounded_actor_reservation(
+fn rounded_actor_reservations(
     world: &WorldView<'_>,
     position: Position,
     state: &State,
-) -> Option<Position> {
-    use super::{empty::Reservation, rounded::RoundedPhase};
+) -> Vec<Position> {
+    use super::{
+        empty::{Reservation, SourceDuration},
+        rounded::RoundedPhase,
+    };
 
     let phase = match state.actor() {
         Actor::Zonk(actor) => actor.phase(),
         Actor::Infotron(actor) => actor.phase(),
-        _ => return None,
+        _ => return Vec::new(),
     };
-    let reservation = match phase {
-        RoundedPhase::Falling(_) => world.offset(position, Direction::Up)?,
-        RoundedPhase::PreparingRoll(direction) => world.offset(position, direction.direction())?,
-        RoundedPhase::Rolling { .. } => world.offset(position, Direction::Down)?,
+    // Rolling owns two cells: the trailing source and the cell below the
+    // destination. A blast must release both without deleting new occupants.
+    let expected = match phase {
+        RoundedPhase::Falling(_) => vec![(
+            Direction::Up,
+            Reservation::Vacating {
+                direction: Direction::Down,
+                duration: SourceDuration::Eight,
+            },
+        )],
+        RoundedPhase::PreparingRoll(direction) => {
+            vec![(direction.direction(), Reservation::RoundedSide)]
+        }
+        RoundedPhase::Rolling { direction, .. } => vec![
+            (
+                direction.direction().opposite(),
+                Reservation::Vacating {
+                    direction: direction.direction(),
+                    duration: SourceDuration::Eight,
+                },
+            ),
+            (Direction::Down, Reservation::RoundedDestination),
+        ],
         RoundedPhase::Resting
         | RoundedPhase::Momentum
         | RoundedPhase::AwaitingFall
-        | RoundedPhase::Held => return None,
+        | RoundedPhase::Held => return Vec::new(),
     };
-    // Cross-cell ownership must still be checked against the live board: an
-    // earlier blast or mover may have legitimately replaced this marker.
-    let marker = world.state(reservation)?.reservation()?;
-    matches!(
-        (phase, marker),
-        (
-            RoundedPhase::Falling(_),
-            Reservation::Vacating {
-                direction: Direction::Down,
-                ..
-            }
-        ) | (RoundedPhase::PreparingRoll(_), Reservation::RoundedSide)
-            | (
-                RoundedPhase::Rolling { .. },
-                Reservation::RoundedDestination
-            )
-    )
-    .then_some(reservation)
+    expected
+        .into_iter()
+        .filter_map(|(direction, marker)| {
+            let reserved = world.offset(position, direction)?;
+            (world.state(reserved)?.reservation() == Some(marker)).then_some(reserved)
+        })
+        .collect()
 }
 
 /// Builds one immediate 3×3 wave and schedules touched reactive actors.
@@ -170,10 +181,10 @@ fn explode_wave(world: &WorldView<'_>, center: Position, electron_wave: bool) ->
                 continue;
             }
 
-            if let Some(reservation) = rounded_actor_reservation(world, position, state)
-                && !rounded_cleanup.contains(&reservation)
-            {
-                rounded_cleanup.push(reservation);
+            for reservation in rounded_actor_reservations(world, position, state) {
+                if !rounded_cleanup.contains(&reservation) {
+                    rounded_cleanup.push(reservation);
+                }
             }
 
             let is_murphy = matches!(state.actor(), Actor::Murphy(_));

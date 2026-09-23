@@ -1,4 +1,4 @@
-//! Semantic replay fingerprints captured before the actor-owned state migration.
+//! Semantic replay fingerprints after correcting rounded movement source ownership.
 //!
 //! Hash every cell and session result after every input sample, including sprite
 //! timing, momentum, collision occupancy, counters, toggles, and emitted sounds.
@@ -45,28 +45,31 @@ impl Fingerprint {
     }
 }
 
-/// Replays every bundled input stream against its pre-refactor semantic history.
+/// Replays every bundled input stream against the corrected occupancy history.
 #[test]
-fn all_original_demo_histories_preserve_actor_and_render_timing() {
+fn all_demo_histories_preserve_corrected_movement_ownership() {
     let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
     let bytes = std::fs::read(root.join("assets/data/levels.dat")).unwrap();
     let levels = LevelSet::new(&bytes);
-    // Captured from ef691ba before changing actor state storage or behavior.
-    // These are parity fixtures, not a claim that every legacy demo solves its
-    // level: the baseline already ends some streams while Playing or Dead.
+    // The earlier ef691ba fixtures preserved a bug: rolls and roll-to-fall
+    // transfers exposed their source immediately. The targeted source-lifetime
+    // and mirrored pixel regressions establish the correction independently;
+    // these hashes then detect unrelated changes across all supplied demos.
+    // They do not claim upstream equivalence or successful completion of every demo.
     let expected = [
-        0x6561310bb59a571d,
-        0x1d35e0c99d83843c,
-        0xc112f4f5654a3847,
-        0x95fe4a1f8550bdf5,
-        0xc45d5592b5e82405,
-        0x928210d0e59d031d,
-        0x64425c3c8debb7f0,
-        0x8d7bd725421971a8,
-        0xc65e6cb875ff01ae,
-        0x2e09fb1f4ed8faea,
+        0xc51b78d5c0d0e0f0,
+        0x8d51a138735b25f1,
+        0x18456193044496e5,
+        0xdefec9be17950b9b,
+        0xdc9a6106c7305b11,
+        0x08b01ce7cd141553,
+        0xb119616a9f1c2744,
+        0x18f1d3eb11fd1e84,
+        0xfaa7f8c56fbd536d,
+        0xaa6d701dac3b22c6,
     ];
-    for (demo_index, expected) in expected.into_iter().enumerate() {
+    let mut actual = Vec::new();
+    for demo_index in 0..expected.len() {
         let bytes = std::fs::read(root.join(format!("assets/data/demo{demo_index}.bin"))).unwrap();
         let demo = Demo::decode(&bytes, levels.level_count().unwrap()).unwrap();
         let level = levels.load(demo.level_number()).unwrap();
@@ -115,9 +118,7 @@ fn all_original_demo_histories_preserve_actor_and_render_timing() {
                 }
             }
         }
-        assert_eq!(
-            history.0, expected,
-            "demo {demo_index} diverged from its pre-refactor history"
-        );
+        actual.push(history.0);
     }
+    assert_eq!(actual, expected, "demo histories changed");
 }

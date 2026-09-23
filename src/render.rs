@@ -198,10 +198,8 @@ enum BlackPixelPolicy {
 pub struct Renderer<'textures> {
     /// Original fixed 16×16 tiles used for stable actors and target backdrops.
     fixed: Texture<'textures>,
-    /// Opaque original frames for Murphy and the remaining actor composites.
+    /// Original variably sized frames used for every animated actor composite.
     moving: Texture<'textures>,
-    /// Zonk artwork with exterior erase pixels masked for foreground compositing.
-    zonks: Texture<'textures>,
     /// Original eight-pixel DOS font converted to an RGBA PNG.
     font: Texture<'textures>,
     /// Original 320×24 in-game panel, enlarged to the full logical width.
@@ -249,7 +247,6 @@ impl<'textures> Renderer<'textures> {
             MOVING_GRAPHICS_PATH,
             BlackPixelPolicy::Opaque,
         )?;
-        let zonks = load_zonk_texture(texture_creator, graphics.moving.as_ref())?;
         let font = load_texture(
             texture_creator,
             graphics.font.as_ref(),
@@ -318,7 +315,6 @@ impl<'textures> Renderer<'textures> {
         Ok(Self {
             fixed,
             moving,
-            zonks,
             font,
             panel,
             title,
@@ -553,12 +549,14 @@ impl<'textures> Renderer<'textures> {
         }
         let camera = self.camera;
 
-        // Murphy's original composites must erase their target backgrounds first.
-        // Moving Zonks then contribute only their silhouette, regardless of which
-        // side of Murphy their logical destination occupies in board order.
-        for pass in [BoardPass::Terrain, BoardPass::Animation, BoardPass::Zonk] {
+        // Logical destinations hold actors while their sprites interpolate
+        // from a source cell. Paint stationary cells first and interpolated
+        // actors second so row-major ordering cannot hide a leftward roll or
+        // port traversal behind the terrain it visually overlaps.
+        for moving_pass in [false, true] {
             for (index, state) in game.board().cells().iter().enumerate() {
-                if board_pass(state.actor()) != pass {
+                let is_interpolated = draws_over_terrain(state.actor());
+                if is_interpolated != moving_pass {
                     continue;
                 }
 
@@ -622,13 +620,7 @@ impl<'textures> Renderer<'textures> {
             | Actor::Bug(Bug::Held) => None,
         };
         match part {
-            Some(part) => {
-                let texture = match state.actor() {
-                    Actor::Zonk(_) => &self.zonks,
-                    _ => &self.moving,
-                };
-                draw_sprite_part(canvas, texture, position, part, camera)
-            }
+            Some(part) => self.draw_murphy_part(canvas, position, part, camera),
             None => self.draw_fixed_tile(canvas, position, state.actor().tile_code(), camera, 0, 0),
         }
     }
@@ -764,7 +756,20 @@ impl<'textures> Renderer<'textures> {
         part: SpritePart,
         camera: Camera,
     ) -> Result<(), RenderError> {
-        draw_sprite_part(canvas, &self.moving, position, part, camera)
+        let source = Rect::new(part.source.x, part.source.y, part.width, part.height);
+        let destination = Rect::new(
+            position.x as i32 * TILE_SIZE as i32 - camera.x + part.offset_x * MOVING_SCALE as i32,
+            position.y as i32 * TILE_SIZE as i32 - camera.y + part.offset_y * MOVING_SCALE as i32,
+            part.width * MOVING_SCALE,
+            part.height * MOVING_SCALE,
+        );
+
+        // SDL clips wide push and vertical 18/34-pixel composites against the
+        // viewport, preserving partial frames at camera edges without slicing
+        // the descriptor tables themselves.
+        canvas
+            .copy(&self.moving, source, destination)
+            .map_err(RenderError::Sdl)
     }
 
     /// Draws the original panel and its live values at their historical positions.
@@ -1044,51 +1049,6 @@ fn format_menu_level(number: usize, title: &str) -> String {
     format!("{number:03} {title}").chars().take(29).collect()
 }
 
-/// Ordered board layers; moving Zonks are silhouettes above opaque composites.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-enum BoardPass {
-    /// Stable cells form the background for interpolated actors.
-    Terrain,
-    /// Original animation composites reconstruct and erase their own backdrops.
-    Animation,
-    /// Zonk silhouettes cover earlier layers without clearing another actor.
-    Zonk,
-}
-
-/// Assigns a snapshot to its compositing layer without changing simulation order.
-fn board_pass(actor: &Actor) -> BoardPass {
-    match actor {
-        Actor::Zonk(zonk) => match zonk.phase() {
-            RoundedPhase::Falling(_) | RoundedPhase::Rolling { .. } => BoardPass::Zonk,
-            _ => BoardPass::Terrain,
-        },
-        _ if draws_over_terrain(actor) => BoardPass::Animation,
-        _ => BoardPass::Terrain,
-    }
-}
-
-/// Copies one descriptor using the caller's opaque or silhouette texture.
-fn draw_sprite_part(
-    canvas: &mut Canvas<Window>,
-    texture: &Texture<'_>,
-    position: Position,
-    part: SpritePart,
-    camera: Camera,
-) -> Result<(), RenderError> {
-    // Preserve the original geometry and let SDL clip against the viewport.
-    // Texture alpha controls coverage; cell ownership does not clip a moving actor.
-    let source = Rect::new(part.source.x, part.source.y, part.width, part.height);
-    let destination = Rect::new(
-        position.x as i32 * TILE_SIZE as i32 - camera.x + part.offset_x * MOVING_SCALE as i32,
-        position.y as i32 * TILE_SIZE as i32 - camera.y + part.offset_y * MOVING_SCALE as i32,
-        part.width * MOVING_SCALE,
-        part.height * MOVING_SCALE,
-    );
-    canvas
-        .copy(texture, source, destination)
-        .map_err(RenderError::Sdl)
-}
-
 /// Selects the zonk fall or roll artwork from its bounded physical phase.
 fn zonk_sprite_part(phase: RoundedPhase) -> Option<SpritePart> {
     match phase {
@@ -1099,30 +1059,17 @@ fn zonk_sprite_part(phase: RoundedPhase) -> Option<SpritePart> {
             offset_x: 0,
             offset_y: -16 + i32::from(frame.index()) * 2,
         }),
-        RoundedPhase::Rolling { direction, frame } => {
-            let frame = frame.index();
-            Some({
-                let source_y = if direction == Horizontal::Left {
-                    84
-                } else {
-                    100
-                };
-                SpritePart {
-                    source: crate::murphy_animation::SourcePoint {
-                        x: i32::from(frame) * 32,
-                        y: source_y,
-                    },
-                    width: 32,
-                    height: 16,
-                    offset_x: if direction == Horizontal::Right {
-                        -16
-                    } else {
-                        0
-                    },
-                    offset_y: 0,
-                }
-            })
-        }
+        RoundedPhase::Rolling { direction, frame } => Some(rounded_roll_part(
+            SourcePoint {
+                x: i32::from(frame.index()) * 32,
+                y: match direction {
+                    Horizontal::Left => 84,
+                    Horizontal::Right => 100,
+                },
+            },
+            direction,
+            frame,
+        )),
         RoundedPhase::Resting
         | RoundedPhase::Momentum
         | RoundedPhase::AwaitingFall
@@ -1142,37 +1089,66 @@ fn infotron_sprite_part(phase: RoundedPhase) -> Option<SpritePart> {
             offset_y: -16 + i32::from(frame.index()) * 2,
         }),
         RoundedPhase::Rolling { direction, frame } => {
-            let frame = frame.index();
-            Some({
-                // Frame four of the left strip really begins at x=8 in the
-                // original pointer table. Preserve that historical coordinate.
-                const LEFT_X: [i32; 8] = [0, 32, 64, 96, 8, 160, 192, 224];
-                let (source_x, source_y) = if direction == Horizontal::Left {
-                    (LEFT_X[usize::from(frame)], 164)
-                } else {
-                    (i32::from(frame) * 32, 180)
-                };
-                SpritePart {
-                    source: crate::murphy_animation::SourcePoint {
-                        x: source_x,
-                        y: source_y,
-                    },
-                    width: 32,
-                    height: 16,
-                    offset_x: if direction == Horizontal::Right {
-                        -16
-                    } else {
-                        0
-                    },
-                    offset_y: 0,
-                }
-            })
+            // Preserve the original left-strip pointer, including frame four.
+            const LEFT_X: [i32; 8] = [0, 32, 64, 96, 8, 160, 192, 224];
+            let source = match direction {
+                Horizontal::Left => SourcePoint {
+                    x: LEFT_X[usize::from(frame.index())],
+                    y: 164,
+                },
+                Horizontal::Right => SourcePoint {
+                    x: i32::from(frame.index()) * 32,
+                    y: 180,
+                },
+            };
+            Some(rounded_roll_part(source, direction, frame))
         }
         RoundedPhase::Resting
         | RoundedPhase::Momentum
         | RoundedPhase::AwaitingFall
         | RoundedPhase::PreparingRoll(_)
         | RoundedPhase::Held => None,
+    }
+}
+
+/// Maps a rounded roll to the cells its current picture still needs to paint.
+fn rounded_roll_part(
+    mut source: SourcePoint,
+    direction: Horizontal,
+    frame: Frame<8>,
+) -> SpritePart {
+    // At the last picture the object fits wholly inside its destination. The
+    // other half of the DOS rectangle only erased the previous framebuffer;
+    // that source is now available to another actor. A freshly cleared scene
+    // must draw the destination picture without repeating that obsolete erase.
+    match (frame.index(), direction) {
+        (7, Horizontal::Left) => SpritePart {
+            source,
+            width: 16,
+            height: 16,
+            offset_x: 0,
+            offset_y: 0,
+        },
+        (7, Horizontal::Right) => {
+            source.x += 16;
+            SpritePart {
+                source,
+                width: 16,
+                height: 16,
+                offset_x: 0,
+                offset_y: 0,
+            }
+        }
+        (_, direction) => SpritePart {
+            source,
+            width: 32,
+            height: 16,
+            offset_x: match direction {
+                Horizontal::Left => 0,
+                Horizontal::Right => -16,
+            },
+            offset_y: 0,
+        },
     }
 }
 
@@ -1421,29 +1397,9 @@ fn load_texture<'textures>(
     asset_name: &'static str,
     black_pixel_policy: BlackPixelPolicy,
 ) -> Result<Texture<'textures>, RenderError> {
-    let mut image = decode_sized_png(png_bytes, expected_width, expected_height, asset_name)?;
-    // Original composite textures retain the DOS rectangular erase behavior.
-    // Fonts use colorkeys; moving Zonk silhouettes have a separate loader so
-    // masking their background cannot change Murphy's eating/pushing frames.
-    apply_black_pixel_policy(&mut image.pixels, black_pixel_policy);
-
-    let blend_mode = match black_pixel_policy {
-        BlackPixelPolicy::Opaque => BlendMode::None,
-        BlackPixelPolicy::Transparent => BlendMode::Blend,
-    };
-    upload_texture(texture_creator, &image, blend_mode)
-}
-
-/// Validates atlas dimensions before any descriptor indexes decoded pixels.
-fn decode_sized_png(
-    png_bytes: &[u8],
-    expected_width: u32,
-    expected_height: u32,
-    asset_name: &'static str,
-) -> Result<DecodedPng, RenderError> {
     // Validate the decoded geometry before applying any pixel transformation so
     // malformed production resources report their dimensions without mutation.
-    let image = decode_png(png_bytes)?;
+    let mut image = decode_png(png_bytes)?;
     if image.width != expected_width || image.height != expected_height {
         return Err(RenderError::UnexpectedDimensions {
             asset: asset_name,
@@ -1454,15 +1410,11 @@ fn decode_sized_png(
         });
     }
 
-    Ok(image)
-}
+    // FIXED.DAT and MOVING.DAT require opaque black because their pictures were
+    // historically rectangular byte copies. The font remains overlay-oriented
+    // and uses the modern colorkey behavior selected by its caller.
+    apply_black_pixel_policy(&mut image.pixels, black_pixel_policy);
 
-/// Uploads prepared pixels with an explicit coverage rule and nearest sampling.
-fn upload_texture<'textures>(
-    texture_creator: &'textures TextureCreator<WindowContext>,
-    image: &DecodedPng,
-    blend_mode: BlendMode,
-) -> Result<Texture<'textures>, RenderError> {
     // Upload the transformed straight-alpha bytes. The desktop texture mode is
     // set explicitly rather than relying only on SDL_RENDER_SCALE_QUALITY: an
     // environment override or backend default must not introduce atlas bleed.
@@ -1474,82 +1426,14 @@ fn upload_texture<'textures>(
         .map_err(|error| RenderError::Sdl(error.to_string()))?;
     #[cfg(not(any(feature = "pocketgo", target_env = "uclibc")))]
     texture.set_scale_mode(ScaleMode::Nearest);
-    texture.set_blend_mode(blend_mode);
+    // Opaque DOS rectangles are literal replacements, so disable blending at
+    // the SDL copy operation as well as forcing their stored alpha bytes. Font
+    // masks retain ordinary source-alpha blending.
+    texture.set_blend_mode(match black_pixel_policy {
+        BlackPixelPolicy::Opaque => BlendMode::None,
+        BlackPixelPolicy::Transparent => BlendMode::Blend,
+    });
     Ok(texture)
-}
-
-/// Builds a separate Zonk atlas so Murphy's erase composites remain opaque.
-fn load_zonk_texture<'textures>(
-    texture_creator: &'textures TextureCreator<WindowContext>,
-    png_bytes: &[u8],
-) -> Result<Texture<'textures>, RenderError> {
-    let mut image = decode_sized_png(png_bytes, 320, 462, MOVING_GRAPHICS_PATH)?;
-    mask_zonk_backgrounds(&mut image);
-    upload_texture(texture_creator, &image, BlendMode::Blend)
-}
-
-/// Masks each Zonk frame independently, retaining enclosed black rock details.
-fn mask_zonk_backgrounds(image: &mut DecodedPng) {
-    // Start opaque even for replacement assets with preexisting alpha. Only
-    // edge-connected black belongs to the DOS rectangle's erase background.
-    apply_black_pixel_policy(&mut image.pixels, BlackPixelPolicy::Opaque);
-    let falling = zonk_sprite_part(RoundedPhase::Falling(Frame::first())).unwrap();
-    mask_sprite_background(image, falling);
-    for direction in [Horizontal::Left, Horizontal::Right] {
-        for index in 0..8 {
-            let part = zonk_sprite_part(RoundedPhase::Rolling {
-                direction,
-                frame: Frame::new(index).unwrap(),
-            })
-            .unwrap();
-            mask_sprite_background(image, part);
-        }
-    }
-}
-
-/// Floods black from a frame's perimeter, leaving enclosed black pixels opaque.
-fn mask_sprite_background(image: &mut DecodedPng, part: SpritePart) {
-    let width = part.width as usize;
-    let height = part.height as usize;
-    let mut visited = vec![false; width * height];
-    let mut pending = Vec::new();
-    // Seed all four edges: black padding can be disconnected by a silhouette
-    // touching the frame boundary. Floods never cross into a neighboring frame.
-    for y in 0..height {
-        pending.push((0, y));
-        pending.push((width - 1, y));
-    }
-    for x in 0..width {
-        pending.push((x, 0));
-        pending.push((x, height - 1));
-    }
-    while let Some((x, y)) = pending.pop() {
-        let local = y * width + x;
-        if visited[local] {
-            continue;
-        }
-        visited[local] = true;
-        let offset =
-            ((part.source.y as usize + y) * image.width as usize + part.source.x as usize + x) * 4;
-        let pixel = &mut image.pixels[offset..offset + 4];
-        match pixel[..3] {
-            [0, 0, 0] => pixel[3] = 0,
-            _ => continue,
-        }
-        // Four-connected neighbors preserve black cavities surrounded by color.
-        if x > 0 {
-            pending.push((x - 1, y));
-        }
-        if x + 1 < width {
-            pending.push((x + 1, y));
-        }
-        if y > 0 {
-            pending.push((x, y - 1));
-        }
-        if y + 1 < height {
-            pending.push((x, y + 1));
-        }
-    }
 }
 
 /// Applies opaque-copy or black-colorkey semantics to tightly packed RGBA pixels.
@@ -1922,49 +1806,9 @@ mod tests {
         assets,
     };
 
-    /// Verifies masking removes padding without punching holes in black details.
-    #[test]
-    fn sprite_background_mask_preserves_enclosed_black() {
-        let mut image = super::DecodedPng {
-            width: 5,
-            height: 5,
-            pixels: vec![0; 5 * 5 * 4],
-        };
-        // A colored ring encloses a black center; the outer black border erases.
-        for y in 1..4 {
-            for x in 1..4 {
-                let offset = (y * 5 + x) * 4;
-                if (x, y) != (2, 2) {
-                    image.pixels[offset..offset + 3].fill(127);
-                }
-            }
-        }
-        apply_black_pixel_policy(&mut image.pixels, BlackPixelPolicy::Opaque);
-        super::mask_sprite_background(
-            &mut image,
-            crate::murphy_animation::SpritePart {
-                source: SourcePoint { x: 0, y: 0 },
-                width: 5,
-                height: 5,
-                offset_x: 0,
-                offset_y: 0,
-            },
-        );
-        for y in 0..5 {
-            for x in 0..5 {
-                let expected = if x == 0 || y == 0 || x == 4 || y == 4 {
-                    0
-                } else {
-                    255
-                };
-                assert_eq!(image.pixels[(y * 5 + x) * 4 + 3], expected);
-            }
-        }
-    }
-
     /// Replays both push/roll/drop directions against the actual sprite pixels.
     #[test]
-    fn zonk_erase_background_cannot_cover_murphy_after_a_pushed_roll() {
+    fn pushed_zonk_roll_and_drop_do_not_paint_over_murphy() {
         use crate::{
             actors::Actor,
             game::{Game, Input},
@@ -1973,8 +1817,6 @@ mod tests {
         let graphics = assets::load_graphics().unwrap();
         let mut opaque = decode_png(graphics.moving.as_ref()).unwrap();
         apply_black_pixel_policy(&mut opaque.pixels, BlackPixelPolicy::Opaque);
-        let mut masked = decode_png(graphics.moving.as_ref()).unwrap();
-        super::mask_zonk_backgrounds(&mut masked);
 
         for direction in [Direction::Left, Direction::Right] {
             let mut bytes = vec![0; LEVEL_RECORD_SIZE];
@@ -1997,7 +1839,7 @@ mod tests {
             bytes[3 * LEVEL_WIDTH + support] = 5;
             let level = LevelSet::new(&bytes).load(1).unwrap();
             let mut game = Game::with_random_seed(&level, 0).unwrap();
-            let mut protected_pixels = 0;
+            let mut checked_fall = false;
             let mut checked_roll = false;
             for _ in 0..32 {
                 game.tick(Input {
@@ -2022,23 +1864,20 @@ mod tests {
                     let Some(part) = zonk_sprite_part(zonk.phase()) else {
                         continue;
                     };
-                    // Both directions must render Murphy before the moving rock,
-                    // even when the rock's board index would ordinarily come first.
-                    assert_eq!(super::board_pass(murphy_actor), super::BoardPass::Animation);
-                    assert_eq!(super::board_pass(state.actor()), super::BoardPass::Zonk);
                     let zpos = game.board().position(index).unwrap();
                     let zx = zpos.x as i32 * 16 + part.offset_x;
                     let zy = zpos.y as i32 * 16 + part.offset_y;
-                    let rows = match zonk.phase() {
-                        RoundedPhase::Falling(_) => 2,
-                        RoundedPhase::Rolling { frame, .. } if frame.index() == 7 => {
-                            checked_roll = true;
-                            16
-                        }
-                        _ => continue,
-                    };
-                    // The fall's top two rows are erase padding. At roll frame
-                    // seven, all black in the released trailing cell is padding.
+                    match zonk.phase() {
+                        RoundedPhase::Falling(_) => checked_fall = true,
+                        RoundedPhase::Rolling { .. } => checked_roll = true,
+                        _ => unreachable!(),
+                    }
+                    // The ordinary renderer uses opaque copies in board order.
+                    // A later Zonk must never erase a colored Murphy pixel.
+                    if index < game.board().index(position).unwrap() {
+                        continue;
+                    }
+                    let rows = part.height as i32;
                     for y in 0..rows {
                         for x in 0..part.width as i32 {
                             let px = zx + x - mx;
@@ -2057,22 +1896,51 @@ mod tests {
                                     as usize;
                             let rock = &opaque.pixels[rock_offset..rock_offset + 4];
                             let player_pixel = &opaque.pixels[player_offset..player_offset + 4];
-                            if rock[..3] == [0, 0, 0] && player_pixel[..3] != [0, 0, 0] {
-                                // Source-over with zero source alpha retains all
-                                // destination channels, rather than replacing them
-                                // with the opaque atlas's black rectangle.
-                                assert_eq!(masked.pixels[rock_offset + 3], 0, "{direction:?}");
-                                protected_pixels += 1;
-                            }
+                            assert!(
+                                rock[..3] != [0, 0, 0] || player_pixel[..3] == [0, 0, 0],
+                                "{direction:?}: {:?} erases Murphy",
+                                zonk.phase()
+                            );
                         }
                     }
                 }
             }
             assert!(checked_roll, "fixture must reach the final roll frame");
-            assert!(
-                protected_pixels > 0,
-                "fixture must expose visible Murphy pixels"
-            );
+            assert!(checked_fall, "fixture must exercise the drop after rolling");
+        }
+    }
+
+    /// Terminal roll pictures omit only black erase data from a released cell.
+    #[test]
+    fn completed_rounded_rolls_draw_only_the_destination_cell() {
+        let graphics = assets::load_graphics().unwrap();
+        let image = decode_png(graphics.moving.as_ref()).unwrap();
+        for direction in [Horizontal::Left, Horizontal::Right] {
+            let phase = RoundedPhase::Rolling {
+                direction,
+                frame: Frame::new(7).unwrap(),
+            };
+            for part in [
+                zonk_sprite_part(phase).unwrap(),
+                infotron_sprite_part(phase).unwrap(),
+            ] {
+                assert_eq!(
+                    (part.width, part.height, part.offset_x, part.offset_y),
+                    (16, 16, 0, 0)
+                );
+                let erased_x = match direction {
+                    Horizontal::Left => part.source.x + 16,
+                    Horizontal::Right => part.source.x - 16,
+                };
+                // This is a descriptor-boundary correction, not a colorkey:
+                // the discarded half contains no actor artwork of any color.
+                for y in part.source.y..part.source.y + 16 {
+                    for x in erased_x..erased_x + 16 {
+                        let offset = ((y * image.width as i32 + x) * 4) as usize;
+                        assert_eq!(image.pixels[offset..offset + 3], [0, 0, 0]);
+                    }
+                }
+            }
         }
     }
 
@@ -2462,8 +2330,21 @@ mod tests {
             record(infotron_sprite_part(RoundedPhase::Falling(frame)).unwrap());
             record(orange_sprite_part(frame));
             for direction in [Horizontal::Left, Horizontal::Right] {
-                record(zonk_sprite_part(RoundedPhase::Rolling { direction, frame }).unwrap());
-                record(infotron_sprite_part(RoundedPhase::Rolling { direction, frame }).unwrap());
+                for mut part in [
+                    zonk_sprite_part(RoundedPhase::Rolling { direction, frame }).unwrap(),
+                    infotron_sprite_part(RoundedPhase::Rolling { direction, frame }).unwrap(),
+                ] {
+                    // Normalize the four terminal pictures to the historical
+                    // erase rectangle; a separate test checks their safe bounds.
+                    if index == 7 {
+                        part.width = 32;
+                        if direction == Horizontal::Right {
+                            part.source.x -= 16;
+                            part.offset_x = -16;
+                        }
+                    }
+                    record(part);
+                }
             }
             for turn in [EnemyTurn::Left, EnemyTurn::Right] {
                 record(snik_snak_sprite_part(EnemyPhase::Turning { turn, frame }));
