@@ -12,7 +12,7 @@ use crate::actors::{
 };
 
 /// One pixel coordinate in the unscaled 320×462 `MOVING.DAT` conversion.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
 pub(crate) struct SourcePoint {
     /// Horizontal source pixel measured from the left edge of `moving.png`.
     pub(crate) x: i32,
@@ -55,7 +55,7 @@ impl Descriptor {
 }
 
 /// Drawable rectangle and destination displacement for one animation layer.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
 pub(crate) struct SpritePart {
     /// Top-left pixel in the unscaled moving-sprite sheet.
     pub(crate) source: SourcePoint,

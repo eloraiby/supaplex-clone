@@ -2,6 +2,9 @@
 
 use std::{error::Error, fmt, io::Cursor};
 
+mod composite;
+use composite::{FrameCache, Layer};
+
 use crate::platform as sdl2;
 #[cfg(not(any(feature = "pocketgo", target_env = "uclibc")))]
 use sdl2::render::ScaleMode;
@@ -22,7 +25,7 @@ use crate::{
     assets::{
         self, AssetError, BACK_GRAPHICS_PATH, CONTROLS_GRAPHICS_PATH, FIXED_GRAPHICS_PATH,
         FONT_GRAPHICS_PATH, GFX_TUTOR_GRAPHICS_PATH, MENU_FONT_GRAPHICS_PATH, MENU_GRAPHICS_PATH,
-        MOVING_GRAPHICS_PATH, PANEL_GRAPHICS_PATH, TITLE_GRAPHICS_PATH,
+        PANEL_GRAPHICS_PATH, TITLE_GRAPHICS_PATH,
     },
     frontend::{ControlsTarget, MainMenuTarget},
     game::{Game, GameStatus},
@@ -198,8 +201,8 @@ enum BlackPixelPolicy {
 pub struct Renderer<'textures> {
     /// Original fixed 16×16 tiles used for stable actors and target backdrops.
     fixed: Texture<'textures>,
-    /// Original variably sized frames used for every animated actor composite.
-    moving: Texture<'textures>,
+    /// Actor-local bitmap compositions, cached independently of board position.
+    frames: FrameCache<'textures>,
     /// Original eight-pixel DOS font converted to an RGBA PNG.
     font: Texture<'textures>,
     /// Original 320×24 in-game panel, enlarged to the full logical width.
@@ -239,13 +242,10 @@ impl<'textures> Renderer<'textures> {
             FIXED_GRAPHICS_PATH,
             BlackPixelPolicy::Opaque,
         )?;
-        let moving = load_texture(
+        let frames = FrameCache::new(
             texture_creator,
+            graphics.fixed.as_ref(),
             graphics.moving.as_ref(),
-            320,
-            462,
-            MOVING_GRAPHICS_PATH,
-            BlackPixelPolicy::Opaque,
         )?;
         let font = load_texture(
             texture_creator,
@@ -314,7 +314,7 @@ impl<'textures> Renderer<'textures> {
 
         Ok(Self {
             fixed,
-            moving,
+            frames,
             font,
             panel,
             title,
@@ -549,6 +549,8 @@ impl<'textures> Renderer<'textures> {
         }
         let camera = self.camera;
 
+        let composited_target = murphy_composited_target(game);
+
         // Logical destinations hold actors while their sprites interpolate
         // from a source cell. Paint stationary cells first and interpolated
         // actors second so row-major ordering cannot hide a leftward roll or
@@ -564,6 +566,11 @@ impl<'textures> Renderer<'textures> {
                     .board()
                     .position(index)
                     .expect("enumerated board indices are always valid");
+                // During a push or snap, Murphy's frame already contains this
+                // held target. Preparation still paints the target normally.
+                if state.actor().is_held() && Some(position) == composited_target {
+                    continue;
+                }
                 self.draw_state(canvas, position, state, camera)?;
             }
         }
@@ -620,7 +627,9 @@ impl<'textures> Renderer<'textures> {
             | Actor::Bug(Bug::Held) => None,
         };
         match part {
-            Some(part) => self.draw_murphy_part(canvas, position, part, camera),
+            Some(part) => self
+                .frames
+                .draw(canvas, position, &[Layer::Moving(part)], camera),
             None => self.draw_fixed_tile(canvas, position, state.actor().tile_code(), camera, 0, 0),
         }
     }
@@ -634,49 +643,10 @@ impl<'textures> Renderer<'textures> {
         frame: u8,
         camera: Camera,
     ) -> Result<(), RenderError> {
-        // The DOS level bitmap persisted between frames, so target pixels not
-        // yet reached by a narrow vertical descriptor remained visible. This
-        // stateless renderer must reconstruct that untouched target because its
-        // logical cell already contains Murphy from frame zero. MOVING.DAT is
-        // then copied opaquely over it: black pixels erase the traversed area,
-        // and every final movement rectangle covers the complete target cell.
-        if let MurphyAnimation::Move { target, .. } = action {
-            let background_tile = match target {
-                MurphyMoveTarget::Empty => None,
-                MurphyMoveTarget::Base => Some(2),
-                MurphyMoveTarget::Infotron => Some(4),
-                MurphyMoveTarget::RedDisk | MurphyMoveTarget::PlantedRedDisk => Some(20),
-            };
-            if let Some(tile) = background_tile {
-                // Draw only the semantic target cell. The following opaque
-                // descriptor supplies the already-consumed portions and Murphy.
-                let destination = Rect::new(
-                    position.x as i32 * TILE_SIZE as i32 - camera.x,
-                    position.y as i32 * TILE_SIZE as i32 - camera.y,
-                    TILE_SIZE,
-                    TILE_SIZE,
-                );
-                canvas
-                    .copy(&self.fixed, fixed_tile_source(tile), destination)
-                    .map_err(RenderError::Sdl)?;
-            }
-        }
-
-        // A stationary snap descriptor touches only the neighboring material
-        // cell. Repaint the complete Murphy image which the persistent DOS
-        // level bitmap kept in his own cell before copying that descriptor.
-        let parts = sprite_parts(action, frame);
-        if let Some(retained) = parts.retained {
-            self.draw_murphy_part(canvas, position, retained, camera)?;
-        }
-
-        // Each descriptor is a complete opaque rectangle rather than a
-        // transparent sprite layer, exactly matching the original byte copy.
-        self.draw_murphy_part(canvas, position, parts.primary, camera)?;
-        if let Some(secondary) = parts.secondary {
-            self.draw_murphy_part(canvas, position, secondary, camera)?;
-        }
-        Ok(())
+        // Reconstruct targets, retained Murphy artwork, and erase rectangles
+        // together before this actor contributes any pixels to the shared scene.
+        self.frames
+            .draw(canvas, position, &murphy_layers(action, frame), camera)
     }
 
     /// Draws a stable FIXED.DAT tile at one optional sub-cell displacement.
@@ -746,30 +716,6 @@ impl<'textures> Renderer<'textures> {
                 .map_err(RenderError::Sdl)?;
         }
         Ok(())
-    }
-
-    /// Copies one original-resolution Murphy layer into board pixel space.
-    fn draw_murphy_part(
-        &mut self,
-        canvas: &mut Canvas<Window>,
-        position: Position,
-        part: SpritePart,
-        camera: Camera,
-    ) -> Result<(), RenderError> {
-        let source = Rect::new(part.source.x, part.source.y, part.width, part.height);
-        let destination = Rect::new(
-            position.x as i32 * TILE_SIZE as i32 - camera.x + part.offset_x * MOVING_SCALE as i32,
-            position.y as i32 * TILE_SIZE as i32 - camera.y + part.offset_y * MOVING_SCALE as i32,
-            part.width * MOVING_SCALE,
-            part.height * MOVING_SCALE,
-        );
-
-        // SDL clips wide push and vertical 18/34-pixel composites against the
-        // viewport, preserving partial frames at camera edges without slicing
-        // the descriptor tables themselves.
-        canvas
-            .copy(&self.moving, source, destination)
-            .map_err(RenderError::Sdl)
     }
 
     /// Draws the original panel and its live values at their historical positions.
@@ -1047,6 +993,70 @@ fn format_menu_level(number: usize, title: &str) -> String {
     // Original titles are ASCII and at most 23 characters, but the truncation
     // also keeps custom level data inside the right-hand menu frame.
     format!("{number:03} {title}").chars().take(29).collect()
+}
+
+/// Finds the held neighbor whose artwork is included in Murphy's current frame.
+fn murphy_composited_target(game: &Game) -> Option<Position> {
+    let position = game.murphy_position()?;
+    let Actor::Murphy(murphy) = game.board().state(position)?.actor() else {
+        return None;
+    };
+    let (action, _) = murphy.sprite_pose()?;
+    let direction = match action {
+        MurphyAnimation::Push { direction, .. } | MurphyAnimation::Snap { direction, .. } => {
+            direction
+        }
+        _ => return None,
+    };
+    // Checked neighbor arithmetic also handles custom boards at their borders.
+    // PreparingPush has no sprite pose, so its held target is never suppressed.
+    let target = match direction {
+        Direction::Left => Position::new(position.x.checked_sub(1)?, position.y),
+        Direction::Right => Position::new(position.x.checked_add(1)?, position.y),
+        Direction::Up => Position::new(position.x, position.y.checked_sub(1)?),
+        Direction::Down => Position::new(position.x, position.y.checked_add(1)?),
+    };
+    game.board()
+        .state(target)
+        .filter(|state| state.actor().is_held())
+        .map(|_| target)
+}
+
+/// Describes one complete Murphy frame as ordered, actor-local bitmap copies.
+fn murphy_layers(action: MurphyAnimation, frame: u8) -> Vec<Layer> {
+    let mut layers = Vec::new();
+    if let MurphyAnimation::Move { target, .. } = action {
+        let background_tile = match target {
+            MurphyMoveTarget::Empty => None,
+            MurphyMoveTarget::Base => Some(2),
+            MurphyMoveTarget::Infotron => Some(4),
+            MurphyMoveTarget::RedDisk | MurphyMoveTarget::PlantedRedDisk => Some(20),
+        };
+        if let Some(tile) = background_tile {
+            let source = fixed_tile_source(tile);
+            layers.push(Layer::Fixed(SpritePart {
+                source: SourcePoint {
+                    x: source.x(),
+                    y: source.y(),
+                },
+                width: 16,
+                height: 16,
+                offset_x: 0,
+                offset_y: 0,
+            }));
+        }
+    }
+    // Erase data applies only to these earlier layers, so eaten material cannot
+    // survive as a ghost behind transparent pixels in the final scene.
+    let parts = sprite_parts(action, frame);
+    if let Some(retained) = parts.retained {
+        layers.push(Layer::Moving(retained));
+    }
+    layers.push(Layer::Moving(parts.primary));
+    if let Some(secondary) = parts.secondary {
+        layers.push(Layer::Moving(secondary));
+    }
+    layers
 }
 
 /// Selects the zonk fall or roll artwork from its bounded physical phase.
@@ -1381,9 +1391,29 @@ fn load_texture<'textures>(
     asset_name: &'static str,
     black_pixel_policy: BlackPixelPolicy,
 ) -> Result<Texture<'textures>, RenderError> {
+    let mut image = decode_sized_png(png_bytes, expected_width, expected_height, asset_name)?;
+    // Fixed artwork is opaque and fonts use their selected colorkey. Animated
+    // artwork is reconstructed separately by FrameCache so its erase pixels
+    // operate inside an actor's frame rather than on the shared scene.
+    apply_black_pixel_policy(&mut image.pixels, black_pixel_policy);
+
+    let blend_mode = match black_pixel_policy {
+        BlackPixelPolicy::Opaque => BlendMode::None,
+        BlackPixelPolicy::Transparent => BlendMode::Blend,
+    };
+    upload_texture(texture_creator, &image, blend_mode)
+}
+
+/// Validates atlas dimensions before descriptors can address decoded pixels.
+fn decode_sized_png(
+    png_bytes: &[u8],
+    expected_width: u32,
+    expected_height: u32,
+    asset_name: &'static str,
+) -> Result<DecodedPng, RenderError> {
     // Validate the decoded geometry before applying any pixel transformation so
     // malformed production resources report their dimensions without mutation.
-    let mut image = decode_png(png_bytes)?;
+    let image = decode_png(png_bytes)?;
     if image.width != expected_width || image.height != expected_height {
         return Err(RenderError::UnexpectedDimensions {
             asset: asset_name,
@@ -1394,11 +1424,15 @@ fn load_texture<'textures>(
         });
     }
 
-    // FIXED.DAT and MOVING.DAT require opaque black because their pictures were
-    // historically rectangular byte copies. The font remains overlay-oriented
-    // and uses the modern colorkey behavior selected by its caller.
-    apply_black_pixel_policy(&mut image.pixels, black_pixel_policy);
+    Ok(image)
+}
 
+/// Uploads prepared pixels with an explicit coverage rule and nearest sampling.
+fn upload_texture<'textures>(
+    texture_creator: &'textures TextureCreator<WindowContext>,
+    image: &DecodedPng,
+    blend_mode: BlendMode,
+) -> Result<Texture<'textures>, RenderError> {
     // Upload the transformed straight-alpha bytes. The desktop texture mode is
     // set explicitly rather than relying only on SDL_RENDER_SCALE_QUALITY: an
     // environment override or backend default must not introduce atlas bleed.
@@ -1410,13 +1444,7 @@ fn load_texture<'textures>(
         .map_err(|error| RenderError::Sdl(error.to_string()))?;
     #[cfg(not(any(feature = "pocketgo", target_env = "uclibc")))]
     texture.set_scale_mode(ScaleMode::Nearest);
-    // Opaque DOS rectangles are literal replacements, so disable blending at
-    // the SDL copy operation as well as forcing their stored alpha bytes. Font
-    // masks retain ordinary source-alpha blending.
-    texture.set_blend_mode(match black_pixel_policy {
-        BlackPixelPolicy::Opaque => BlendMode::None,
-        BlackPixelPolicy::Transparent => BlendMode::Blend,
-    });
+    texture.set_blend_mode(blend_mode);
     Ok(texture)
 }
 
@@ -1789,6 +1817,180 @@ mod tests {
         actors::{Direction, EnemyTurn, MurphyAnimation, MurphyMoveTarget, MurphyPushTarget},
         assets,
     };
+
+    /// Actual software-rendered pixels preserve Murphy in both intended following windows.
+    #[cfg(not(any(feature = "pocketgo", target_env = "uclibc", target_arch = "wasm32")))]
+    #[test]
+    fn rendered_push_roll_and_fall_preserve_murphy_without_delaying_him() {
+        use crate::platform::{self, pixels::PixelFormatEnum};
+        use crate::{
+            actors::Actor,
+            game::{Game, Input},
+            level::{LEVEL_RECORD_SIZE, LEVEL_WIDTH, LevelSet},
+        };
+        // This is the only video test; the dummy driver opens no visible window.
+        platform::hint::set("SDL_VIDEODRIVER", "dummy");
+        let sdl = platform::init().unwrap();
+        let video = sdl.video().unwrap();
+        let window = video
+            .window(
+                "compositing regression",
+                super::LOGICAL_WIDTH,
+                super::LOGICAL_HEIGHT,
+            )
+            .hidden()
+            .build()
+            .unwrap();
+        let mut canvas = window.into_canvas().software().build().unwrap();
+        let creator = canvas.texture_creator();
+        let mut renderer = super::Renderer::new(&creator).unwrap();
+        let graphics = assets::load_graphics().unwrap();
+        let moving = decode_png(graphics.moving.as_ref()).unwrap();
+        let fixed = decode_png(graphics.fixed.as_ref()).unwrap();
+        for direction in [Direction::Left, Direction::Right] {
+            let mut record = vec![0; LEVEL_RECORD_SIZE];
+            record[..60 * 24].fill(6);
+            for y in 1..7 {
+                for x in 1..9 {
+                    record[y * LEVEL_WIDTH + x] = 0;
+                }
+            }
+            let (start, support) = match direction {
+                Direction::Left => (5, 3),
+                Direction::Right => (3, 5),
+                _ => unreachable!(),
+            };
+            record[2 * LEVEL_WIDTH + start] = 3;
+            record[2 * LEVEL_WIDTH + 4] = 1;
+            record[3 * LEVEL_WIDTH + 4] = 6;
+            record[3 * LEVEL_WIDTH + support] = 5;
+            let level = LevelSet::new(&record).load(1).unwrap();
+            let mut game = Game::with_random_seed(&level, 0).unwrap();
+            let mut protected_pixels = 0;
+            for tick in 1..=32 {
+                game.tick(Input {
+                    direction: Some(direction),
+                    action: false,
+                });
+                renderer.draw(&mut canvas, &game, 1, 35).unwrap();
+                let pixels = canvas.read_pixels(None, PixelFormatEnum::RGBA32).unwrap();
+                let mpos = game.murphy_position().unwrap();
+                let Actor::Murphy(murphy) = game.board().state(mpos).unwrap().actor() else {
+                    unreachable!()
+                };
+                if tick <= 8 {
+                    // Holding a direction has not started the push picture yet:
+                    // the reserved rock must remain visible at its original cell.
+                    for y in 0..16 {
+                        for x in 0..16 {
+                            let source = (y * 640 + 16 + x) * 4;
+                            let dx =
+                                (4 * 16 + x) * MOVING_SCALE as usize - renderer.camera.x as usize;
+                            let dy =
+                                (2 * 16 + y) * MOVING_SCALE as usize - renderer.camera.y as usize;
+                            let screen = (dy * super::LOGICAL_WIDTH as usize + dx) * 4;
+                            assert_eq!(
+                                &pixels[screen..screen + 3],
+                                &fixed.pixels[source..source + 3],
+                                "held rock disappeared"
+                            );
+                        }
+                    }
+                }
+                let Some((action, frame)) = murphy.sprite_pose() else {
+                    continue;
+                };
+                let part = crate::murphy_animation::sprite_parts(action, frame).primary;
+                let mx = mpos.x as i32 * 16 + part.offset_x;
+                let my = mpos.y as i32 * 16 + part.offset_y;
+                if matches!(action, MurphyAnimation::Push { .. }) && (9..16).contains(&tick) {
+                    // The push composite owns the held rock as well as Murphy.
+                    // A separately painted fixed rock would show through its
+                    // transparent exterior and leave a duplicate at the source.
+                    for y in 0..part.height as i32 {
+                        for x in 0..part.width as i32 {
+                            let source =
+                                (((part.source.y + y) * 320 + part.source.x + x) * 4) as usize;
+                            let dx = (mx + x) * MOVING_SCALE as i32 - renderer.camera.x;
+                            let dy = (my + y) * MOVING_SCALE as i32 - renderer.camera.y;
+                            let screen =
+                                (dy as usize * super::LOGICAL_WIDTH as usize + dx as usize) * 4;
+                            assert_eq!(
+                                &pixels[screen..screen + 3],
+                                &moving.pixels[source..source + 3],
+                                "{direction:?} push tick {tick}: duplicate target at ({dx},{dy})"
+                            );
+                        }
+                    }
+                }
+
+                // These exact entry ticks belong to the pre-fix gameplay. A
+                // rendering change must not pass by delaying Murphy's movement.
+                if tick == 18 {
+                    assert_eq!((mpos.x, mpos.y), (support, 2));
+                }
+                if tick == 26 {
+                    assert_eq!(
+                        (mpos.x, mpos.y),
+                        (if direction == Direction::Left { 2 } else { 6 }, 2)
+                    );
+                }
+                for (index, state) in game.board().cells().iter().enumerate() {
+                    let Actor::Zonk(zonk) = state.actor() else {
+                        continue;
+                    };
+                    let Some(rock) = zonk_sprite_part(zonk.phase()) else {
+                        continue;
+                    };
+                    let rows = match zonk.phase() {
+                        RoundedPhase::Falling(_) => 2,
+                        RoundedPhase::Rolling { frame, .. } if frame.index() == 7 => 16,
+                        _ => continue,
+                    };
+                    let pos = game.board().position(index).unwrap();
+                    let zx = pos.x as i32 * 16 + rock.offset_x;
+                    let zy = pos.y as i32 * 16 + rock.offset_y;
+                    // Compare real scene pixels where the old rectangle painted
+                    // pure black over colored Murphy artwork. The first two fall
+                    // rows and final roll's trailing half are known erase data.
+                    for y in 0..rows {
+                        for x in 0..rock.width as i32 {
+                            let px = zx + x - mx;
+                            let py = zy + y - my;
+                            if px < 0
+                                || py < 0
+                                || px >= part.width as i32
+                                || py >= part.height as i32
+                            {
+                                continue;
+                            }
+                            let ri = (((rock.source.y + y) * 320 + rock.source.x + x) * 4) as usize;
+                            let mi =
+                                (((part.source.y + py) * 320 + part.source.x + px) * 4) as usize;
+                            let expected = &moving.pixels[mi..mi + 3];
+                            if moving.pixels[ri..ri + 3] != [0, 0, 0] || expected == [0, 0, 0] {
+                                continue;
+                            }
+                            let dx = (zx + x) * MOVING_SCALE as i32 - renderer.camera.x;
+                            let dy = (zy + y) * MOVING_SCALE as i32 - renderer.camera.y;
+                            let screen =
+                                ((dy as usize * super::LOGICAL_WIDTH as usize) + dx as usize) * 4;
+                            assert_eq!(
+                                &pixels[screen..screen + 3],
+                                expected,
+                                "{direction:?} tick {tick} at ({dx},{dy})"
+                            );
+                            protected_pixels += 1;
+                        }
+                    }
+                }
+            }
+            assert!(
+                protected_pixels > 100,
+                "fixture must exercise the reported overlap"
+            );
+        }
+    }
 
     /// Confirms all production resources decode to their contracted RGBA sizes.
     #[test]
