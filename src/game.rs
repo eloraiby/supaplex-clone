@@ -1334,6 +1334,69 @@ mod tests {
         assert!(game.drawings.is_none());
     }
 
+    /// A blast clears a rolling source outside its wave without clearing its own blast cells.
+    #[test]
+    fn blasts_release_both_rounded_roll_reservations_with_explicit_cleanup() {
+        use crate::actors::{Frame, Horizontal, empty::Reservation, rounded::RoundedPhase};
+        for direction in [Horizontal::Left, Horizontal::Right] {
+            for (frame, reservation) in [
+                (2, Reservation::RollingSource(direction)),
+                (4, Reservation::RoundedCorner(direction)),
+            ] {
+                for infotron in [false, true] {
+                    let phase = RoundedPhase::Rolling {
+                        direction,
+                        frame: Frame::new(frame).unwrap(),
+                    };
+                    let actor = if infotron {
+                        Actor::Infotron(Infotron::from_phase(phase))
+                    } else {
+                        Actor::Zonk(Zonk::from_phase(phase))
+                    };
+                    let (source, center) = match direction {
+                        Horizontal::Left => (Position::new(4, 3), Position::new(2, 3)),
+                        Horizontal::Right => (Position::new(2, 3), Position::new(4, 3)),
+                    };
+                    let destination = Position::new(3, 4);
+                    let mut game = game_with(
+                        &[
+                            (
+                                Position::new(1, 1),
+                                State::new(Actor::Murphy(Murphy::new())),
+                            ),
+                            (Position::new(3, 3), State::new(actor)),
+                            (
+                                source,
+                                State::new(Actor::Empty(Empty::Reserved(reservation))),
+                            ),
+                            (
+                                destination,
+                                State::new(Actor::Empty(Empty::Reserved(
+                                    Reservation::RoundedDestination,
+                                ))),
+                            ),
+                        ],
+                        0,
+                    );
+                    let drawings = game.record_drawings(|game| game.detonate_position(center));
+                    assert!(game.board().state(source).unwrap().is_empty());
+                    assert!(drawings.iter().any(|drawing| drawing.position == source
+                        && matches!(drawing.actor, Actor::Empty(Empty::Space))));
+                    assert!(matches!(
+                        game.board().state(destination).unwrap().actor(),
+                        Actor::Explosion(_)
+                    ));
+                    assert!(
+                        !drawings
+                            .iter()
+                            .any(|drawing| drawing.position == destination
+                                && matches!(drawing.actor, Actor::Empty(_)))
+                    );
+                }
+            }
+        }
+    }
+
     /// Returns the actor at a required fixture coordinate.
     fn actor_at(game: &Game, x: usize, y: usize) -> &Actor {
         game.board()
@@ -2121,6 +2184,17 @@ mod tests {
         for _ in 0..10 {
             game.tick(Input::default());
         }
+        // The final picture reserves the next destination as original state
+        // 70/99. The next callback transfers and consumes falling picture zero.
+        assert_eq!(
+            game.board()
+                .state(Position::new(3, 3))
+                .unwrap()
+                .reservation(),
+            Some(crate::actors::empty::Reservation::RoundedContinuation)
+        );
+        assert!(matches!(actor_at(&game, 3, 2), Actor::Zonk(zonk) if zonk.is_falling()));
+        game.tick(Input::default());
         let continued = game
             .board()
             .state(Position::new(3, 3))
@@ -2130,7 +2204,7 @@ mod tests {
             continued.snapshot().label(),
             format!("Moving({:?})", Direction::Down)
         );
-        assert_eq!(continued.snapshot().frame(), 0);
+        assert_eq!(continued.snapshot().frame(), 1);
         let prior_cell = game
             .board()
             .state(Position::new(3, 2))
@@ -2804,7 +2878,8 @@ mod tests {
             game.tick(Input::default());
         }
         game.freeze_zonks = true;
-        for expected_frame in 1..=7 {
+        // Pictures zero and one already ran during preparation.
+        for expected_frame in 3..=7 {
             game.tick(Input::default());
             let sliding = game
                 .board()

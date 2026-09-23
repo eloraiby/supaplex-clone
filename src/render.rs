@@ -866,10 +866,23 @@ fn zonk_sprite_part(phase: RoundedPhase) -> Option<SpritePart> {
                 }
             })
         }
+        RoundedPhase::PreparingRoll { direction, frame } => {
+            let mut part = zonk_sprite_part(RoundedPhase::Rolling {
+                direction,
+                frame: Frame::new(frame.index()).expect("preparation is a roll prefix"),
+            })
+            .expect("rolls have a sprite");
+            // During preparation the actor still owns its source cell; after
+            // transfer the same atlas rectangle is anchored at the side cell.
+            part.offset_x += match direction {
+                Horizontal::Left => -16,
+                Horizontal::Right => 16,
+            };
+            Some(part)
+        }
         RoundedPhase::Resting
         | RoundedPhase::Momentum
         | RoundedPhase::AwaitingFall
-        | RoundedPhase::PreparingRoll(_)
         | RoundedPhase::Held => None,
     }
 }
@@ -911,10 +924,23 @@ fn infotron_sprite_part(phase: RoundedPhase) -> Option<SpritePart> {
                 }
             })
         }
+        RoundedPhase::PreparingRoll { direction, frame } => {
+            let mut part = infotron_sprite_part(RoundedPhase::Rolling {
+                direction,
+                frame: Frame::new(frame.index()).expect("preparation is a roll prefix"),
+            })
+            .expect("rolls have a sprite");
+            // During preparation the actor still owns its source cell; after
+            // transfer the same atlas rectangle is anchored at the side cell.
+            part.offset_x += match direction {
+                Horizontal::Left => -16,
+                Horizontal::Right => 16,
+            };
+            Some(part)
+        }
         RoundedPhase::Resting
         | RoundedPhase::Momentum
         | RoundedPhase::AwaitingFall
-        | RoundedPhase::PreparingRoll(_)
         | RoundedPhase::Held => None,
     }
 }
@@ -1371,7 +1397,7 @@ fn movement_offset(state: &State) -> (i32, i32) {
         RoundedPhase::Resting
         | RoundedPhase::Momentum
         | RoundedPhase::AwaitingFall
-        | RoundedPhase::PreparingRoll(_)
+        | RoundedPhase::PreparingRoll { .. }
         | RoundedPhase::Held => (0, 0),
     }
 }

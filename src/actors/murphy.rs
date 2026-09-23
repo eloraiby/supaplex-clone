@@ -523,7 +523,7 @@ impl Murphy {
             MurphyPhase::Resuming(_) => {
                 let ready = self.ready();
                 ready.ready_transition(position, world).or_else(|| {
-                    Some(Transition::paint(
+                    Some(Transition::replace(
                         position,
                         State::new(Actor::Murphy(ready)),
                     ))

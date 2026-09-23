@@ -2,9 +2,7 @@
 
 use super::murphy::murphy_is_protected_from_falling_actor;
 use super::rounded::{RoundedActor, RoundedPhase};
-use super::{
-    Actor, CellWrite, Direction, GameEvent, Horizontal, Position, State, Transition, explode_at,
-};
+use super::{Actor, Direction, GameEvent, Position, State, Transition, explode_at};
 use crate::game::{SoundEffect, WorldView};
 
 /// A collectible that falls and rolls with Zonk-like physics.
@@ -31,13 +29,6 @@ impl Infotron {
         State::new(Actor::Infotron(self))
     }
 
-    /// Creates the momentum-bearing state used by completed falls and pushes.
-    pub(super) const fn falling() -> Self {
-        Self {
-            phase: RoundedPhase::Momentum,
-        }
-    }
-
     /// Creates a stationary collectible as read from a level record.
     pub const fn resting() -> Self {
         Self {
@@ -57,39 +48,21 @@ impl Infotron {
         world: &WorldView<'_>,
     ) -> Option<Transition> {
         let below = world.offset(position, Direction::Down)?;
+        if matches!(self.phase, RoundedPhase::Momentum) {
+            let continuation = world.state(below).and_then(State::reservation)
+                == Some(super::empty::Reservation::RoundedContinuation);
+            return (world.is_empty(below) || continuation)
+                .then(|| RoundedActor::Infotron(*self).resume_fall(position, below));
+        }
         if world.is_empty(below) {
-            if self.phase.is_falling() {
-                return Some(Transition::move_actor(
-                    position,
-                    below,
-                    RoundedActor::Infotron(*self),
-                ));
-            }
-
+            // The initiating callback consumes the first arming update (40 ->
+            // 41). The following callback transfers without drawing picture zero.
             return Some(Transition::replace(
                 position,
                 self.in_phase(RoundedPhase::AwaitingFall),
             ));
         }
-
-        if !world.is_rounded_stable_support(below) {
-            return None;
-        }
-
-        for direction in [Horizontal::Left, Horizontal::Right] {
-            let side = world.offset(position, direction.direction())?;
-            let diagonal = world.offset(side, Direction::Down)?;
-            if world.is_empty(side) && world.is_empty(diagonal) {
-                return Some(Transition::prepare_rounded_roll(
-                    position,
-                    side,
-                    RoundedActor::Infotron(*self),
-                    direction,
-                ));
-            }
-        }
-
-        None
+        RoundedActor::Infotron(*self).start_roll(position, world)
     }
 
     /// Starts a resting Infotron fall after its destination survives one update.
@@ -122,7 +95,7 @@ impl Infotron {
                     if murphy_is_protected_from_falling_actor(target) {
                         // Protected push states use the same silent
                         // early return as the Zonk landing routine.
-                        return Transition::paint(
+                        return Transition::replace(
                             position,
                             State::new(Actor::Infotron(Infotron::resting())),
                         );
@@ -144,33 +117,19 @@ impl Infotron {
                     return explode_at(world, below, false);
                 }
             }
-            let still_falling = world.is_empty(below);
-            // A continued vertical transfer remains silent. Only the
-            // first obstructed settle matches `playFallSound`.
-            let events = (!still_falling)
-                .then_some(GameEvent::PlaySound(SoundEffect::Fall))
-                .into_iter()
-                .collect();
-            return Transition::new(
-                vec![CellWrite::new(
-                    position,
-                    State::new(Actor::Infotron(if still_falling {
-                        Infotron::falling()
-                    } else {
-                        Infotron::resting()
-                    })),
-                )],
-                events,
-            )
-            .with_drawing(
-                position,
-                Actor::Infotron(if still_falling {
-                    Infotron::falling()
-                } else {
-                    Infotron::resting()
-                }),
-            );
+            if world.is_empty(below) {
+                return RoundedActor::Infotron(*self).continue_fall(position, below);
+            }
+            let mut transition = RoundedActor::Infotron(*self)
+                .reserve_roll(position, world)
+                .unwrap_or_else(|| {
+                    Transition::replace(position, State::new(Actor::Infotron(Self::resting())))
+                });
+            transition
+                .events
+                .push(GameEvent::PlaySound(SoundEffect::Fall));
+            return transition;
         }
-        Transition::paint(position, self.in_phase(RoundedPhase::Momentum))
+        Transition::replace(position, self.in_phase(RoundedPhase::Resting))
     }
 }

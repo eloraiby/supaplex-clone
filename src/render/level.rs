@@ -11,7 +11,7 @@ use super::{
     snik_snak_sprite_part, sprite_parts, terminal_source_row, upload_texture, zonk_sprite_part,
 };
 use crate::{
-    actors::{Actor, Bug, Drawing, Empty, Position, orange_disk::OrangePhase},
+    actors::{Actor, Bug, Direction, Drawing, Empty, Position, orange_disk::OrangePhase},
     assets::{FIXED_GRAPHICS_PATH, MOVING_GRAPHICS_PATH},
     game::Board,
     platform::{
@@ -169,6 +169,22 @@ fn artwork(actor: &Actor) -> Vec<Blit> {
             | OrangePhase::Held => None,
         },
         Actor::Murphy(actor) => {
+            if let crate::actors::murphy::MurphyPhase::PreparingPush { action, .. } = actor.phase()
+            {
+                return vec![Blit::Moving(SpritePart {
+                    source: SourcePoint {
+                        x: match action.direction() {
+                            Direction::Left => 64,
+                            _ => 97,
+                        },
+                        y: 132,
+                    },
+                    width: 16,
+                    height: 16,
+                    offset_x: 0,
+                    offset_y: 0,
+                })];
+            }
             if let Some((action, frame)) = actor.sprite_pose() {
                 let parts = sprite_parts(action, frame);
                 // Target material and the retained snap pose are already in
@@ -566,9 +582,12 @@ mod tests {
                     }
                     overlaps += 1;
                 }
-                // Keep the existing legal-follow windows; this renderer must
-                // not change collision timing to make its pixel test pass.
-                if tick == 18 {
+                // Upstream releases the rolling source after picture five,
+                // so Murphy first enters it on tick 22, then the next at 30.
+                if tick == 21 {
+                    assert_eq!(game.murphy_position(), Some(Position::new(4, 2)));
+                }
+                if tick == 22 {
                     assert_eq!(
                         game.murphy_position(),
                         Some(Position::new(
@@ -577,7 +596,7 @@ mod tests {
                         ))
                     );
                 }
-                if tick == 26 {
+                if tick == 30 {
                     assert_eq!(
                         game.murphy_position(),
                         Some(Position::new(
@@ -610,7 +629,7 @@ mod tests {
         let mut game = Game::with_random_seed(&level, 0).unwrap();
         let mut saved = bitmap();
         saved.reset(game.board()).unwrap();
-        for _ in 0..10 {
+        for _ in 0..8 {
             saved.apply(&game.tick_with_drawings(Input {
                 direction: Some(Direction::Right),
                 action: false,
@@ -744,6 +763,116 @@ mod tests {
                 });
                 assert!(drawings.iter().all(|d| !matches!(d.actor, Actor::Empty(_))));
                 saved.apply(&drawings);
+            }
+        }
+    }
+
+    /// Match every upstream bitmap while following rocks and revisiting cleared Base.
+    #[test]
+    fn rounded_objects_and_cleared_base_match_opensupaplex_every_tick() {
+        for (reference, returning) in [
+            (
+                include_str!("../../tests/support/opensupaplex_push_trace.txt"),
+                false,
+            ),
+            (
+                include_str!("../../tests/support/opensupaplex_follow_trace.txt"),
+                true,
+            ),
+        ] {
+            for case in reference.split("CASE ").skip(1) {
+                let (description, trace) = case.split_once('\n').unwrap();
+                let (tile, direction_name) = match description.split_once(' ') {
+                    Some((tile, direction)) => (tile.parse::<u8>().unwrap(), direction),
+                    None => (1, description),
+                };
+                let direction = match direction_name {
+                    "left" => Direction::Left,
+                    "right" => Direction::Right,
+                    _ => panic!("invalid case"),
+                };
+                let level = if returning {
+                    let mut record = vec![0; LEVEL_RECORD_SIZE];
+                    record[..60 * 24].fill(6);
+                    for y in 1..7 {
+                        for x in 1..9 {
+                            record[y * LEVEL_WIDTH + x] = 0;
+                        }
+                    }
+                    let (start, object) = match direction {
+                        Direction::Left => (5, 3),
+                        _ => (3, 5),
+                    };
+                    record[2 * LEVEL_WIDTH + start] = 3;
+                    record[2 * LEVEL_WIDTH + 4] = 2;
+                    record[2 * LEVEL_WIDTH + object] = tile;
+                    record[3 * LEVEL_WIDTH + 4] = 6;
+                    record[3 * LEVEL_WIDTH + object] = 5;
+                    LevelSet::new(&record).load(1).unwrap()
+                } else {
+                    push_level(direction)
+                };
+                let mut game = Game::with_random_seed(&level, 0).unwrap();
+                let mut actual = bitmap();
+                actual.reset(game.board()).unwrap();
+                let mut expected = bitmap();
+                expected.reset(game.board()).unwrap();
+                for line in trace.lines().filter(|l| !l.is_empty()) {
+                    let fields = line.split_whitespace().collect::<Vec<_>>();
+                    match fields[0] {
+                        "BLIT" => {
+                            let values = fields[2..]
+                                .iter()
+                                .map(|v| v.parse::<i32>().unwrap())
+                                .collect::<Vec<_>>();
+                            let [sx, sy, width, height, dx, dy] = values[..] else {
+                                panic!("invalid blit");
+                            };
+                            expected.copy(
+                                Position::new(0, 0),
+                                Blit::Moving(SpritePart {
+                                    source: SourcePoint { x: sx, y: sy },
+                                    width: width as u32,
+                                    height: height as u32,
+                                    offset_x: dx,
+                                    offset_y: dy,
+                                }),
+                            );
+                        }
+                        "STATE" => {
+                            let tick = fields[1].parse::<u8>().unwrap();
+                            let direction = if returning && (17..=24).contains(&tick) {
+                                direction.opposite()
+                            } else {
+                                direction
+                            };
+                            actual.apply(&game.tick_with_drawings(Input {
+                                direction: Some(direction),
+                                action: false,
+                            }));
+                            assert_eq!(
+                                game.murphy_position(),
+                                Some(Position::new(
+                                    fields[3].parse().unwrap(),
+                                    fields[4].parse().unwrap()
+                                )),
+                                "{description}, tick {tick}: Murphy"
+                            );
+                            let difference = actual
+                                .pixels
+                                .pixels
+                                .iter()
+                                .zip(&expected.pixels.pixels)
+                                .position(|(a, b)| a != b);
+                            assert!(
+                                difference.is_none(),
+                                "{description}, tick {tick}: first different pixel {:?}",
+                                difference.map(|i| (i / 4 % 960, i / 4 / 960))
+                            );
+                        }
+                        _ => panic!("invalid reference entry"),
+                    }
+                }
             }
         }
     }

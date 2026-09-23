@@ -3,8 +3,8 @@
 use super::murphy::murphy_is_protected_from_falling_actor;
 use super::rounded::{RoundedActor, RoundedPhase};
 use super::{
-    Actor, CellWrite, Direction, Frame, GameEvent, Horizontal, OrangeDisk, Position, State,
-    Transition, explode_at,
+    Actor, CellWrite, Direction, Frame, GameEvent, OrangeDisk, Position, State, Transition,
+    explode_at,
 };
 use crate::game::{SoundEffect, WorldView};
 
@@ -38,13 +38,6 @@ impl Zonk {
         State::new(Actor::Zonk(self))
     }
 
-    /// Creates the momentum-bearing state used by completed falls and pushes.
-    pub(super) const fn falling() -> Self {
-        Self {
-            phase: RoundedPhase::Momentum,
-        }
-    }
-
     /// Creates a stationary Zonk as read from a level record.
     pub const fn resting() -> Self {
         Self {
@@ -69,48 +62,21 @@ impl Zonk {
         }
 
         let below = world.offset(position, Direction::Down)?;
+        if matches!(self.phase, RoundedPhase::Momentum) {
+            let continuation = world.state(below).and_then(State::reservation)
+                == Some(super::empty::Reservation::RoundedContinuation);
+            return (world.is_empty(below) || continuation)
+                .then(|| RoundedActor::Zonk(*self).resume_fall(position, below));
+        }
         if world.is_empty(below) {
-            if self.phase.is_falling() {
-                // Momentum from a completed fall continues directly into the
-                // next cell. The one-update arming delay belongs only to a
-                // stable Zonk beginning a new fall from rest.
-                return Some(Transition::move_actor(
-                    position,
-                    below,
-                    RoundedActor::Zonk(*self),
-                ));
-            }
-
-            // The original engine changes a resting Zonk to pre-fall state
-            // `0x41` on this callback and transfers it only on the following
-            // callback. That distinction lets Murphy move first when his old
-            // source opens directly below a trailing Zonk.
+            // The initiating callback consumes the first arming update (40 ->
+            // 41). The following callback transfers without drawing picture zero.
             return Some(Transition::replace(
                 position,
                 self.in_phase(RoundedPhase::AwaitingFall),
             ));
         }
-
-        // Only a stable rounded support permits a diagonal roll. Inspecting the
-        // support animation prevents rolling from a Zonk that is itself moving.
-        if !world.is_rounded_stable_support(below) {
-            return None;
-        }
-
-        for direction in [Horizontal::Left, Horizontal::Right] {
-            let side = world.offset(position, direction.direction())?;
-            let diagonal = world.offset(side, Direction::Down)?;
-            if world.is_empty(side) && world.is_empty(diagonal) {
-                return Some(Transition::prepare_rounded_roll(
-                    position,
-                    side,
-                    RoundedActor::Zonk(*self),
-                    direction,
-                ));
-            }
-        }
-
-        None
+        RoundedActor::Zonk(*self).start_roll(position, world)
     }
 
     /// Starts the armed fall when its destination survived the intervening tick.
@@ -141,7 +107,7 @@ impl Zonk {
     /// Resolves crushes, landing sounds, and retained momentum after a full fall.
     pub(super) fn land(&self, position: Position, world: &WorldView<'_>) -> Transition {
         if world.freeze_zonks() {
-            return Transition::paint(position, State::new(Actor::Zonk(Self::resting())));
+            return Transition::replace(position, State::new(Actor::Zonk(Self::resting())));
         }
         if let Some(below) = world.offset(position, Direction::Down) {
             if let Some(target) = world.state(below) {
@@ -151,7 +117,7 @@ impl Zonk {
                         // 0x26/0x28/0x29 are explicit original crush
                         // exceptions. The DOS routine returns before
                         // its later Fall-sound call on this path.
-                        return Transition::paint(
+                        return Transition::replace(
                             position,
                             State::new(Actor::Zonk(Zonk::resting())),
                         );
@@ -176,34 +142,26 @@ impl Zonk {
                                 CellWrite::new(below, orange),
                             ],
                             Vec::new(),
-                        )
-                        .with_drawing(position, Actor::Zonk(Zonk::resting()));
+                        );
                     }
                     _ => {}
                 }
             }
             if world.is_empty(below) {
-                // Retained momentum begins the next cell transfer on
-                // this completion callback. Only the first unsupported
-                // resting state uses `ZonkPreFall`; inserting an idle
-                // update here would make a long fall visibly stutter.
-                return Transition::move_actor(
-                    position,
-                    below,
-                    RoundedActor::Zonk(Zonk::falling()),
-                );
+                return RoundedActor::Zonk(*self).continue_fall(position, below);
             }
-            // Landing on a non-reactive occupant is the one safe Zonk
-            // terminal path that selects the original Fall effect.
-            return Transition::new(
-                vec![CellWrite::new(
-                    position,
-                    State::new(Actor::Zonk(Zonk::resting())),
-                )],
-                vec![GameEvent::PlaySound(SoundEffect::Fall)],
-            )
-            .with_drawing(position, Actor::Zonk(Zonk::resting()));
+            // Landing can reserve a new roll, but its first picture belongs to
+            // the following callback. The current callback still draws fall 7.
+            let mut transition = RoundedActor::Zonk(*self)
+                .reserve_roll(position, world)
+                .unwrap_or_else(|| {
+                    Transition::replace(position, State::new(Actor::Zonk(Self::resting())))
+                });
+            transition
+                .events
+                .push(GameEvent::PlaySound(SoundEffect::Fall));
+            return transition;
         }
-        Transition::paint(position, self.in_phase(RoundedPhase::Momentum))
+        Transition::replace(position, self.in_phase(RoundedPhase::Resting))
     }
 }

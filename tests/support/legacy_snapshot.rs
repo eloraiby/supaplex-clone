@@ -1,6 +1,6 @@
-// Test-only serialization for the pre-refactor replay fixtures. These historical
-// text labels are not a model enum, are never stored in a board cell, and are not
-// consumed by rendering. Keeping the encoding preserves independent old hashes.
+// Test-only semantic serialization. Historical labels remain for unchanged phases;
+// corrected rounded preparation and reservation phases have explicit encodings.
+// These labels are never stored in board cells or consumed by rendering.
 use self::model::{Actor, Bug, Empty, State, enemy::EnemyPhase, rounded::RoundedPhase};
 use std::borrow::Cow;
 
@@ -41,7 +41,7 @@ fn rounded(phase: RoundedPhase, arming_label: &'static str) -> Snapshot {
     match phase {
         RoundedPhase::Resting | RoundedPhase::Momentum => Snapshot::new("Idle", 0, 1),
         RoundedPhase::AwaitingFall => Snapshot::new(arming_label, 0, 1),
-        RoundedPhase::PreparingRoll(direction) => Snapshot::new(format!("RoundedPreRoll({:?})", direction.direction()), 0, 1),
+        RoundedPhase::PreparingRoll { direction, frame } => Snapshot::new(format!("RoundedPreRoll({:?})", direction.direction()), frame.index(), 2),
         RoundedPhase::Rolling { direction, frame } => Snapshot::new(format!("Rolling({:?})", direction.direction()), frame.index(), 8),
         RoundedPhase::Falling(frame) => Snapshot::new("Moving(Down)", frame.index(), 8),
         RoundedPhase::Held => Snapshot::new("MurphyPushTarget", 0, 1),
@@ -63,6 +63,9 @@ impl SnapshotExt for State {
         match self.actor() {
             Actor::Empty(Empty::Space) => Snapshot::new("Idle", 0, 1),
             Actor::Empty(Empty::Reserved(reservation)) => match reservation {
+                Reservation::RollingSource(direction) => Snapshot::new(format!("RollingSource({direction:?})"), 0, 1),
+                Reservation::RoundedCorner(direction) => Snapshot::new(format!("RoundedCorner({direction:?})"), 0, 1),
+                Reservation::RoundedContinuation => Snapshot::new("RoundedContinuation", 0, 1),
                 Reservation::Vacating { direction, duration } => Snapshot::new(format!("Vacating({direction:?})"), 0, duration.frames()),
                 Reservation::SnikSnakSource(direction) => Snapshot::new(format!("SnikSnakVacating({direction:?})"), 0, 1),
                 Reservation::ElectronSource(direction) => Snapshot::new(format!("ElectronVacating({direction:?})"), 0, 1),

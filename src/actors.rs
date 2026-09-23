@@ -9,7 +9,8 @@
 //! mapping accept only the concrete families whose rules they implement.
 //!
 //! Actor callbacks inspect an immutable world and return owned replacement
-//! values. The game applies each transition with exclusive board access before
+//! values and explicit typed pictures, including terminal frames that no longer
+//! survive in cell storage. The game commits each transition with exclusive access before
 //! the next callback, preserving Murphy-first, row-major update semantics.
 
 #![warn(missing_docs)]
@@ -150,14 +151,8 @@ impl Actor {
     pub fn is_idle(&self) -> bool {
         match self {
             Self::Empty(empty) => matches!(empty, Empty::Space),
-            Self::Zonk(actor) => matches!(
-                actor.phase(),
-                rounded::RoundedPhase::Resting | rounded::RoundedPhase::Momentum
-            ),
-            Self::Infotron(actor) => matches!(
-                actor.phase(),
-                rounded::RoundedPhase::Resting | rounded::RoundedPhase::Momentum
-            ),
+            Self::Zonk(actor) => matches!(actor.phase(), rounded::RoundedPhase::Resting),
+            Self::Infotron(actor) => matches!(actor.phase(), rounded::RoundedPhase::Resting),
             Self::Base(actor) => matches!(actor, Base::Resting),
             Self::Murphy(actor) => matches!(
                 actor.phase(),

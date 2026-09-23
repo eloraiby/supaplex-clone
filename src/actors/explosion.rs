@@ -83,51 +83,65 @@ fn explosion_state(residue: ExplosionResidue) -> State {
     State::new(actor)
 }
 
-/// Finds the temporary cell owned by one moving Zonk or Infotron phase.
+/// Finds every surviving marker owned by a rounded object's current transfer.
 ///
-/// The original blast dispatcher decodes the actor's state high nibble and
-/// clears the corresponding old, side, or diagonal Space marker. Typed
-/// physical phases carry that same topology here, so cleanup stays phase-specific
-/// instead of reviving autonomous behavior in temporary Empty cells.
-fn rounded_actor_reservation(
+/// A roll owns its source and diagonal destination simultaneously. A falling
+/// object owns its source; a completed fall may also reserve the next cell.
+/// Ownership checks keep cleanup from erasing a cell replaced by another actor.
+fn rounded_actor_reservations(
     world: &WorldView<'_>,
     position: Position,
     state: &State,
-) -> Option<Position> {
+) -> Vec<Position> {
     use super::{empty::Reservation, rounded::RoundedPhase};
-
     let phase = match state.actor() {
         Actor::Zonk(actor) => actor.phase(),
         Actor::Infotron(actor) => actor.phase(),
-        _ => return None,
+        _ => return Vec::new(),
     };
-    let reservation = match phase {
-        RoundedPhase::Falling(_) => world.offset(position, Direction::Up)?,
-        RoundedPhase::PreparingRoll(direction) => world.offset(position, direction.direction())?,
-        RoundedPhase::Rolling { .. } => world.offset(position, Direction::Down)?,
-        RoundedPhase::Resting
-        | RoundedPhase::Momentum
-        | RoundedPhase::AwaitingFall
-        | RoundedPhase::Held => return None,
+    let candidates = match phase {
+        RoundedPhase::Falling(_) => vec![(Direction::Up, None)],
+        RoundedPhase::Momentum => vec![(Direction::Up, None), (Direction::Down, None)],
+        RoundedPhase::PreparingRoll { direction, .. } => vec![(direction.direction(), None)],
+        RoundedPhase::Rolling { direction, .. } => vec![
+            (direction.direction().opposite(), Some(direction)),
+            (Direction::Down, None),
+        ],
+        RoundedPhase::Resting | RoundedPhase::AwaitingFall | RoundedPhase::Held => {
+            return Vec::new();
+        }
     };
-    // Cross-cell ownership must still be checked against the live board: an
-    // earlier blast or mover may have legitimately replaced this marker.
-    let marker = world.state(reservation)?.reservation()?;
-    matches!(
-        (phase, marker),
-        (
-            RoundedPhase::Falling(_),
-            Reservation::Vacating {
-                direction: Direction::Down,
-                ..
-            }
-        ) | (RoundedPhase::PreparingRoll(_), Reservation::RoundedSide)
-            | (
-                RoundedPhase::Rolling { .. },
-                Reservation::RoundedDestination
-            )
-    )
-    .then_some(reservation)
+    candidates
+        .into_iter()
+        .filter_map(|(direction, roll)| {
+            let cell = world.offset(position, direction)?;
+            let marker = world.state(cell)?.reservation()?;
+            let owned = match (phase, direction, marker) {
+                (
+                    RoundedPhase::Falling(_) | RoundedPhase::Momentum,
+                    Direction::Up,
+                    Reservation::Vacating {
+                        direction: Direction::Down,
+                        ..
+                    },
+                ) => true,
+                (RoundedPhase::Momentum, Direction::Down, Reservation::RoundedContinuation) => true,
+                (RoundedPhase::PreparingRoll { .. }, _, Reservation::RoundedSide) => true,
+                (
+                    RoundedPhase::Rolling { .. },
+                    Direction::Down,
+                    Reservation::RoundedDestination,
+                ) => true,
+                (
+                    RoundedPhase::Rolling { .. },
+                    _,
+                    Reservation::RollingSource(owner) | Reservation::RoundedCorner(owner),
+                ) => roll == Some(owner),
+                _ => false,
+            };
+            owned.then_some(cell)
+        })
+        .collect()
 }
 
 /// Builds one immediate 3×3 wave and schedules touched reactive actors.
@@ -172,10 +186,10 @@ fn explode_wave(world: &WorldView<'_>, center: Position, electron_wave: bool) ->
                 continue;
             }
 
-            if let Some(reservation) = rounded_actor_reservation(world, position, state)
-                && !rounded_cleanup.contains(&reservation)
-            {
-                rounded_cleanup.push(reservation);
+            for reservation in rounded_actor_reservations(world, position, state) {
+                if !rounded_cleanup.contains(&reservation) {
+                    rounded_cleanup.push(reservation);
+                }
             }
 
             let is_murphy = matches!(state.actor(), Actor::Murphy(_));
@@ -222,6 +236,10 @@ fn explode_wave(world: &WorldView<'_>, center: Position, electron_wave: bool) ->
     // encounters. Only out-of-wave markers become ordinary empty space.
     for reservation in rounded_cleanup {
         if !writes.iter().any(|write| write.position == reservation) {
+            drawings.push(Drawing {
+                position: reservation,
+                actor: Actor::Empty(super::Empty::Space),
+            });
             writes.push(CellWrite::new(reservation, State::empty()));
         }
     }

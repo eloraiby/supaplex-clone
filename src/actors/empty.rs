@@ -29,6 +29,12 @@ pub enum Reservation {
     ElectronSource(Direction),
     /// Empty endpoint held by a Murphy push or port traversal.
     MurphyDestination,
+    /// Old cell during the first half of a horizontal rounded-object transfer.
+    RollingSource(super::Horizontal),
+    /// Old roll cell after picture four; diagonal candidates may use this marker.
+    RoundedCorner(super::Horizontal),
+    /// Next downward cell reserved by a completed fall carrying momentum.
+    RoundedContinuation,
     /// Side cell held while a rounded actor prepares a roll.
     RoundedSide,
     /// Cell below a rolling rock or falling Orange Disk.

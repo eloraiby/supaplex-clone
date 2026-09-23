@@ -136,22 +136,22 @@ impl Transition {
         self
     }
 
-    /// Begins a downward transfer for one of the two rounded actor types.
+    /// Transfers a rounded actor without consuming its first falling picture.
     pub(super) fn move_actor(
         source: Position,
         destination: Position,
         actor: super::rounded::RoundedActor,
     ) -> Self {
-        let state = actor.in_phase(super::rounded::RoundedPhase::Falling(super::Frame::first()));
-        let picture = state.actor().clone();
         Self::new(
             vec![
                 CellWrite::new(source, State::vacating(Direction::Down)),
-                CellWrite::new(destination, state),
+                CellWrite::new(
+                    destination,
+                    actor.in_phase(super::rounded::RoundedPhase::Falling(super::Frame::first())),
+                ),
             ],
             Vec::new(),
         )
-        .with_drawing(destination, picture)
     }
 
     /// Begins a Snik Snak transfer with a destination-owned source marker.
@@ -228,24 +228,5 @@ impl Transition {
             events,
         )
         .with_drawing(destination, picture)
-    }
-
-    /// Begins a lateral roll only for rounded actors and horizontal directions.
-    pub(super) fn prepare_rounded_roll(
-        source: Position,
-        side: Position,
-        actor: super::rounded::RoundedActor,
-        direction: super::Horizontal,
-    ) -> Self {
-        Self::new(
-            vec![
-                CellWrite::new(
-                    source,
-                    actor.in_phase(super::rounded::RoundedPhase::PreparingRoll(direction)),
-                ),
-                CellWrite::new(side, State::rounded_side()),
-            ],
-            Vec::new(),
-        )
     }
 }

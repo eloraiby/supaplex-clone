@@ -1,4 +1,5 @@
-# OpenSupaplex bad56a4e174e628643995284ea55d4c49af3137c: eat Base, return, cross cleared Base.
+# Captured from OpenSupaplex bad56a4e174e628643995284ea55d4c49af3137c.
+# See opensupaplex_traces.md for reproduction and scenario definitions.
 
 CASE up
 BLIT 1 48 66 16 18 64 46

@@ -1,7 +1,5 @@
 # Captured from OpenSupaplex bad56a4e174e628643995284ea55d4c49af3137c.
-# See opensupaplex_snap_trace.md for setup and instrumentation.
-# BLIT tick source_x source_y width height destination_x destination_y
-# STATE tick target_tile remaining_infotrons
+# See opensupaplex_traces.md for reproduction and scenario definitions.
 
 CASE 4 up
 BLIT 1 160 64 16 16 64 48
