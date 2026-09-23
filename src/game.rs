@@ -28,6 +28,20 @@ pub struct Input {
     pub action: bool,
 }
 
+/// One committed cell change in simulation order, before later callbacks run.
+///
+/// Consumers can retain presentation history without treating a final board
+/// snapshot as a drawing schedule. These values contain no renderer resources.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct BoardChange {
+    /// Cell changed by the current callback or one of its immediate events.
+    pub position: Position,
+    /// Complete state immediately before this write, including reservations.
+    pub before: State,
+    /// Replacement, even when another callback changes this cell again.
+    pub after: State,
+}
+
 /// Contiguous two-dimensional storage using only `width * y + x` indexing.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct Board {
@@ -37,6 +51,8 @@ pub struct Board {
     height: usize,
     /// Complete cell states in row-major order.
     cells: Vec<State>,
+    /// Scoped recording; ordinary headless ticks retain no change history.
+    changes: Option<Vec<BoardChange>>,
 }
 
 impl Board {
@@ -58,6 +74,7 @@ impl Board {
             width,
             height,
             cells,
+            changes: None,
         })
     }
 
@@ -215,6 +232,17 @@ impl Board {
         let index = self
             .index(position)
             .ok_or(BoardError::OutOfBounds(position))?;
+        // Capture immediate events here too, including chained explosions. Do
+        // not coalesce successive writes: a cell can change twice in one tick.
+        if self.cells[index] != state
+            && let Some(changes) = &mut self.changes
+        {
+            changes.push(BoardChange {
+                position,
+                before: self.cells[index].clone(),
+                after: state.clone(),
+            });
+        }
         self.cells[index] = state;
         Ok(())
     }
@@ -522,6 +550,29 @@ impl Game {
         // timers, the explosion sound, death status, and exit delay all follow
         // exactly the same rules as an enemy or falling-object collision.
         self.detonate_position(position);
+    }
+
+    /// Advances one tick and returns its cell changes in committed callback order.
+    pub fn tick_with_changes(&mut self, input: Input) -> Vec<BoardChange> {
+        // Use the same simulation path as headless replay: observing mutations
+        // must not change callback scheduling, reservations, or random values.
+        self.record_changes(|game| game.tick(input))
+    }
+
+    /// Records an explicit death request, including its immediate blast writes.
+    pub fn destroy_murphy_with_changes(&mut self) -> Vec<BoardChange> {
+        self.record_changes(Self::destroy_murphy)
+    }
+
+    /// Owns the recording scope so unused histories cannot grow between ticks.
+    fn record_changes(&mut self, operation: impl FnOnce(&mut Self)) -> Vec<BoardChange> {
+        debug_assert!(self.board.changes.is_none(), "recording scopes cannot nest");
+        self.board.changes = Some(Vec::new());
+        operation(self);
+        self.board
+            .changes
+            .take()
+            .expect("recording scope remains active")
     }
 
     /// Applies one Murphy-first, row-major simulation step to the live board.
@@ -1211,6 +1262,81 @@ mod tests {
             quit_countdown: 0,
             pending_sound_effects: Vec::new(),
         }
+    }
+
+    /// A journal preserves repeated writes and leaves no hidden history behind.
+    #[test]
+    fn change_recording_retains_immediate_events_and_resets_its_scope() {
+        let position = Position::new(2, 2);
+        let initial = State::new(Actor::Bug(Bug::new()));
+        let mut game = game_with(&[(position, initial.clone())], 0);
+        let changes = game.record_changes(|game| {
+            game.board.set(position, State::dormant_bug(1)).unwrap();
+            game.apply_event(crate::actors::GameEvent::RandomizeBug(position));
+        });
+        assert_eq!(changes.len(), 2);
+        assert_eq!(changes[0].position, position);
+        assert_eq!(changes[0].before, initial);
+        assert_eq!(changes[0].after, changes[1].before);
+        assert_eq!(&changes[1].after, game.board.state(position).unwrap());
+        assert!(game.board.changes.is_none());
+        assert!(game.record_changes(|_| {}).is_empty());
+        game.tick(Input::default());
+        assert!(game.board.changes.is_none());
+    }
+
+    /// Murphy's callback precedes even an actor at a smaller linear board index.
+    #[test]
+    fn recorded_changes_use_callback_order_instead_of_destination_order() {
+        let rock = Position::new(2, 2);
+        let murphy = Position::new(4, 3);
+        let mut game = game_with(
+            &[
+                (rock, State::new(Actor::Zonk(Zonk::resting()))),
+                (murphy, State::new(Actor::Murphy(Murphy::new()))),
+            ],
+            0,
+        );
+        let changes = game.tick_with_changes(Input {
+            direction: Some(Direction::Right),
+            action: false,
+        });
+        let player_write = changes
+            .iter()
+            .position(|change| matches!(change.after.actor(), Actor::Murphy(_)))
+            .unwrap();
+        let rock_write = changes
+            .iter()
+            .position(|change| matches!(change.after.actor(), Actor::Zonk(_)))
+            .unwrap();
+        assert!(player_write < rock_write);
+        assert!(
+            game.board.index(changes[player_write].position)
+                > game.board.index(changes[rock_write].position)
+        );
+    }
+
+    /// Escape's immediate blast is observable even when no fixed tick is due.
+    #[test]
+    fn explicit_death_records_all_blast_cells_without_advancing_time() {
+        let mut game = game_with(
+            &[(
+                Position::new(3, 3),
+                State::new(Actor::Murphy(Murphy::new())),
+            )],
+            0,
+        );
+        let changes = game.destroy_murphy_with_changes();
+        assert_eq!(game.tick_count(), 0);
+        assert_eq!(game.status(), GameStatus::Dead);
+        assert_eq!(changes.len(), 9);
+        assert!(
+            changes
+                .iter()
+                .all(|change| matches!(change.after.actor(), Actor::Explosion(_)))
+        );
+        assert!(game.destroy_murphy_with_changes().is_empty());
+        assert!(game.board.changes.is_none());
     }
 
     /// Returns the actor at a required fixture coordinate.

@@ -71,11 +71,28 @@ fn all_original_demo_histories_preserve_actor_and_render_timing() {
         let demo = Demo::decode(&bytes, levels.level_count().unwrap()).unwrap();
         let level = levels.load(demo.level_number()).unwrap();
         let mut game = Game::with_random_seed(&level, 0).unwrap();
+        let mut observed = Game::with_random_seed(&level, 0).unwrap();
         let mut history = Fingerprint::new();
         // Cache presentation-name hashes so static cells do not allocate on every tick.
         let mut labels = std::collections::HashMap::<String, u64>::new();
         for input in demo.playback() {
             game.tick(input);
+            // Recording must observe the same game, not introduce a second
+            // simulation algorithm. Keep the original history oracle below.
+            let changes = observed.tick_with_changes(input);
+            assert_eq!(observed.board(), game.board());
+            assert_eq!(observed.tick_count(), game.tick_count());
+            assert_eq!(observed.status(), game.status());
+            assert_eq!(observed.remaining_infotrons(), game.remaining_infotrons());
+            assert_eq!(observed.red_disks(), game.red_disks());
+            assert_eq!(observed.gravity(), game.gravity());
+            assert_eq!(observed.freeze_zonks(), game.freeze_zonks());
+            assert_eq!(observed.freeze_enemies(), game.freeze_enemies());
+            assert_eq!(
+                observed.terminal_transition_ready(),
+                game.terminal_transition_ready()
+            );
+            assert!(changes.iter().all(|change| change.before != change.after));
             history.number(game.tick_count());
             history.number(u64::from(game.remaining_infotrons()));
             history.number(u64::from(game.red_disks()));
@@ -84,7 +101,9 @@ fn all_original_demo_histories_preserve_actor_and_render_timing() {
             history.byte(u8::from(game.freeze_enemies()));
             history.byte(u8::from(game.terminal_transition_ready()));
             history.text(&format!("{:?}", game.status()));
-            history.text(&format!("{:?}", game.take_sound_effects()));
+            let sounds = game.take_sound_effects();
+            assert_eq!(observed.take_sound_effects(), sounds);
+            history.text(&format!("{sounds:?}"));
             for cell in game.board().cells() {
                 let view = cell.snapshot();
                 let kind = match labels.get(view.label()) {
