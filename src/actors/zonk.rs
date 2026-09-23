@@ -141,7 +141,7 @@ impl Zonk {
     /// Resolves crushes, landing sounds, and retained momentum after a full fall.
     pub(super) fn land(&self, position: Position, world: &WorldView<'_>) -> Transition {
         if world.freeze_zonks() {
-            return Transition::replace(position, State::new(Actor::Zonk(Self::resting())));
+            return Transition::paint(position, State::new(Actor::Zonk(Self::resting())));
         }
         if let Some(below) = world.offset(position, Direction::Down) {
             if let Some(target) = world.state(below) {
@@ -151,7 +151,7 @@ impl Zonk {
                         // 0x26/0x28/0x29 are explicit original crush
                         // exceptions. The DOS routine returns before
                         // its later Fall-sound call on this path.
-                        return Transition::replace(
+                        return Transition::paint(
                             position,
                             State::new(Actor::Zonk(Zonk::resting())),
                         );
@@ -176,7 +176,8 @@ impl Zonk {
                                 CellWrite::new(below, orange),
                             ],
                             Vec::new(),
-                        );
+                        )
+                        .with_drawing(position, Actor::Zonk(Zonk::resting()));
                     }
                     _ => {}
                 }
@@ -200,8 +201,9 @@ impl Zonk {
                     State::new(Actor::Zonk(Zonk::resting())),
                 )],
                 vec![GameEvent::PlaySound(SoundEffect::Fall)],
-            );
+            )
+            .with_drawing(position, Actor::Zonk(Zonk::resting()));
         }
-        Transition::replace(position, self.in_phase(RoundedPhase::Momentum))
+        Transition::paint(position, self.in_phase(RoundedPhase::Momentum))
     }
 }

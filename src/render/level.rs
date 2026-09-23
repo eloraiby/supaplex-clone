@@ -1,4 +1,4 @@
-//! Persistent level pixels, changed only by simulation-ordered opaque copies.
+//! Persistent level pixels, changed only by explicit actor pictures in callback order.
 //!
 //! OpenSupaplex's `drawMovingSpriteFrameInLevel` copies directly into its saved
 //! level bitmap. Black bytes erase earlier drawings, including other actors.
@@ -11,9 +11,9 @@ use super::{
     snik_snak_sprite_part, sprite_parts, terminal_source_row, upload_texture, zonk_sprite_part,
 };
 use crate::{
-    actors::{Actor, Bug, Empty, Position, orange_disk::OrangePhase},
+    actors::{Actor, Bug, Drawing, Empty, Position, orange_disk::OrangePhase},
     assets::{FIXED_GRAPHICS_PATH, MOVING_GRAPHICS_PATH},
-    game::{Board, BoardChange},
+    game::Board,
     platform::{
         rect::Rect,
         render::{BlendMode, Canvas, Texture, TextureCreator},
@@ -87,7 +87,7 @@ impl LevelBitmap {
             pixels: [0, 0, 0, 255].repeat(size / 4),
         };
         // Seed terrain once, then loaded moving enemies. Subsequent simulation
-        // changes never use these initialization passes as their draw schedule.
+        // callbacks emit their own pictures instead of repeating these passes.
         for (index, state) in board.cells().iter().enumerate() {
             let position = board.position(index).expect("enumerated cell is in bounds");
             let tile = match state.actor() {
@@ -106,35 +106,20 @@ impl LevelBitmap {
         Ok(())
     }
 
-    /// Applies each committed change immediately, retaining all intervening copies.
-    fn apply(&mut self, changes: &[BoardChange]) {
-        for change in changes {
-            match (change.before.actor(), change.after.actor()) {
-                // A reservation release changes collision data only. Repainting
-                // Space here could erase Murphy after he has entered the cell.
-                (Actor::Explosion(_), Actor::Empty(Empty::Space)) => {
-                    self.copy(change.position, fixed_tile(0));
-                }
-                (_, Actor::Empty(_) | Actor::InvisibleWall(_)) => {}
-                (before, after) => {
-                    let next = artwork(after);
-                    if next == artwork(before) {
-                        // Fuse counters, held flags, and randomized waits can
-                        // change without causing a new drawing in the bitmap.
-                        continue;
-                    }
-                    if let Actor::Murphy(murphy) = after
-                        && let Some((action, frame)) = murphy.sprite_pose()
-                        && let Some(retained) = sprite_parts(action, frame).retained
-                    {
-                        // The original snap handler paints this pose once at
-                        // entry. Red Disk snapping keeps the already saved pose.
-                        self.copy(change.position, Blit::Moving(retained));
-                    }
-                    for blit in next {
-                        self.copy(change.position, blit);
-                    }
-                }
+    /// Applies the exact pictures emitted by actors, including their terminal frames.
+    fn apply(&mut self, drawings: &[Drawing]) {
+        for drawing in drawings {
+            // A snap entry can include a one-time pose before its target strip.
+            // Completion drawings use their original anchor even when the actor
+            // has already moved or vanished from the simulation's current board.
+            if let Actor::Murphy(murphy) = drawing.actor
+                && let Some((action, frame)) = murphy.sprite_pose()
+                && let Some(retained) = sprite_parts(action, frame).retained
+            {
+                self.copy(drawing.position, Blit::Moving(retained));
+            }
+            for blit in artwork(&drawing.actor) {
+                self.copy(drawing.position, blit);
             }
         }
     }
@@ -172,7 +157,8 @@ impl LevelBitmap {
 /// Selects only this actor's current copies, never neighboring background layers.
 fn artwork(actor: &Actor) -> Vec<Blit> {
     let part = match actor {
-        Actor::Empty(_) | Actor::InvisibleWall(_) => return Vec::new(),
+        Actor::Empty(Empty::Space) | Actor::InvisibleWall(_) => return vec![fixed_tile(0)],
+        Actor::Empty(Empty::Reserved(_)) => return Vec::new(),
         Actor::Zonk(actor) => zonk_sprite_part(actor.phase()),
         Actor::Infotron(actor) => infotron_sprite_part(actor.phase()),
         Actor::OrangeDisk(actor) => match actor.phase() {
@@ -281,12 +267,12 @@ impl<'textures> LevelRenderer<'textures> {
     }
 
     /// Consumes a simulation batch before another tick may advance the game.
-    pub(super) fn apply(&mut self, changes: &[BoardChange]) {
+    pub(super) fn apply(&mut self, drawings: &[Drawing]) {
         assert!(
             self.texture.is_some(),
             "begin_level must precede gameplay updates"
         );
-        self.bitmap.apply(changes);
+        self.bitmap.apply(drawings);
     }
 
     /// Presents the saved pixels at the camera offset; no actors are visited here.
@@ -329,7 +315,7 @@ mod tests {
 
     use super::*;
     use crate::{
-        actors::{Direction, State, Zonk, rounded::RoundedPhase},
+        actors::{Direction, State, rounded::RoundedPhase},
         assets,
         game::{Game, Input},
         level::{LEVEL_RECORD_SIZE, LEVEL_WIDTH, Level, LevelSet},
@@ -398,7 +384,7 @@ mod tests {
         renderer.draw(&mut canvas, &game, 1, 50).unwrap();
         let initial_screen = canvas.read_pixels(None, PixelFormatEnum::RGBA32).unwrap();
         for tick in 1..=40 {
-            renderer.apply_board_changes(&game.tick_with_changes(Input {
+            renderer.apply_drawings(&game.tick_with_drawings(Input {
                 direction: Some(Direction::Right),
                 action: false,
             }));
@@ -454,7 +440,7 @@ mod tests {
         );
         // An Escape blast must be visible before another fixed update occurs.
         let tick = game.tick_count();
-        renderer.apply_board_changes(&game.destroy_murphy_with_changes());
+        renderer.apply_drawings(&game.destroy_murphy_with_drawings());
         assert!(renderer.level.bitmap.dirty);
         renderer.draw(&mut canvas, &game, 1, 50).unwrap();
         assert_ne!(
@@ -493,30 +479,6 @@ mod tests {
                 .iter()
                 .all(|p| p[3] == 255)
         );
-    }
-
-    /// A collision-marker release cannot erase an actor already drawn there.
-    #[test]
-    fn releasing_a_source_retains_its_saved_pixels() {
-        let mut saved = bitmap();
-        saved
-            .reset(&Board::new(1, 1, vec![State::empty()]).unwrap())
-            .unwrap();
-        saved.copy(Position::new(0, 0), fixed_tile(3));
-        let before = saved.pixels.clone();
-        saved.dirty = false;
-        saved.apply(&[BoardChange {
-            position: Position::new(0, 0),
-            before: State::new(Actor::Empty(Empty::Reserved(
-                crate::actors::empty::Reservation::Vacating {
-                    direction: Direction::Down,
-                    duration: crate::actors::empty::SourceDuration::Eight,
-                },
-            ))),
-            after: State::empty(),
-        }]);
-        assert_eq!(saved.pixels, before);
-        assert!(!saved.dirty);
     }
 
     /// Clipping keeps source and destination aligned at all four outer edges.
@@ -565,27 +527,27 @@ mod tests {
             let mut pending = Vec::new();
             let mut overlaps = 0;
             for tick in 1..=40 {
-                let changes = game.tick_with_changes(Input {
+                let drawings = game.tick_with_drawings(Input {
                     direction: Some(direction),
                     action: false,
                 });
-                saved.apply(&changes);
-                pending.extend(changes.iter().cloned());
+                saved.apply(&drawings);
+                pending.extend(drawings.iter().cloned());
                 // A final board scan would order a left-side rock before Murphy.
                 // The committed stream always retains Murphy's callback first.
-                let player = changes
+                let player = drawings
                     .iter()
-                    .position(|c| matches!(c.after.actor(), Actor::Murphy(_)));
-                let rock = changes.iter().rposition(|c| matches!(c.after.actor(), Actor::Zonk(z) if matches!(z.phase(), RoundedPhase::Rolling { .. } | RoundedPhase::Falling(_))));
+                    .position(|c| matches!(c.actor, Actor::Murphy(_)));
+                let rock = drawings.iter().rposition(|c| matches!(c.actor, Actor::Zonk(z) if matches!(z.phase(), RoundedPhase::Rolling { .. } | RoundedPhase::Falling(_))));
                 if let (Some(player), Some(rock)) = (player, rock) {
                     assert!(player < rock, "{direction:?} tick {tick}");
-                    let change = &changes[rock];
-                    let Actor::Zonk(zonk) = change.after.actor() else {
+                    let drawing = &drawings[rock];
+                    let Actor::Zonk(zonk) = &drawing.actor else {
                         unreachable!()
                     };
                     let part = zonk_sprite_part(zonk.phase()).unwrap();
-                    let x = change.position.x as i32 * 16 + part.offset_x;
-                    let y = change.position.y as i32 * 16 + part.offset_y;
+                    let x = drawing.position.x as i32 * 16 + part.offset_x;
+                    let y = drawing.position.y as i32 * 16 + part.offset_y;
                     // Verify the *entire* original rectangle, including black.
                     // Zero-overlap assertions would disagree with upstream's
                     // opaque memcpy: later Zonk erase bytes can cover Murphy.
@@ -649,7 +611,7 @@ mod tests {
         let mut saved = bitmap();
         saved.reset(game.board()).unwrap();
         for _ in 0..10 {
-            saved.apply(&game.tick_with_changes(Input {
+            saved.apply(&game.tick_with_drawings(Input {
                 direction: Some(Direction::Right),
                 action: false,
             }));
@@ -676,31 +638,261 @@ mod tests {
         }
     }
 
-    /// Nonvisual state changes do not restore a fixed tile over later drawings.
+    /// Push, port, and Exit completion must emit their last picture before removal.
     #[test]
-    fn a_held_rock_keeps_its_previous_artwork_without_repainting() {
-        let mut saved = bitmap();
-        saved
-            .reset(&Board::new(1, 1, vec![State::new(Actor::Zonk(Zonk::resting()))]).unwrap())
-            .unwrap();
-        saved.pixels.pixels = [17, 31, 47, 255].repeat(16 * 16);
-        saved.dirty = false;
-        saved.apply(&[BoardChange {
-            position: Position::new(0, 0),
-            before: State::new(Actor::Zonk(Zonk::resting())),
-            after: State::new(Actor::Zonk(Zonk::from_phase(RoundedPhase::Held))),
-        }]);
-        assert!(!saved.dirty);
-        assert!(
-            saved
-                .pixels
-                .pixels
-                .as_chunks::<4>()
-                .0
-                .iter()
-                .all(|p| *p == [17, 31, 47, 255])
-        );
+    fn completed_actions_emit_every_picture_and_erase_their_source() {
+        use crate::actors::MurphyAnimation;
+        for direction in Direction::ALL {
+            for tile in [1, 8, 18, 7, 23] {
+                if matches!(tile, 1 | 8) && !direction.is_horizontal() {
+                    continue;
+                }
+                let origin = Position::new(4, 4);
+                let (target, destination) = match direction {
+                    Direction::Up => (Position::new(4, 3), Position::new(4, 2)),
+                    Direction::Down => (Position::new(4, 5), Position::new(4, 6)),
+                    Direction::Left => (Position::new(3, 4), Position::new(2, 4)),
+                    Direction::Right => (Position::new(5, 4), Position::new(6, 4)),
+                };
+                let mut record = vec![0; LEVEL_RECORD_SIZE];
+                record[..60 * 24].fill(6);
+                record[origin.y * LEVEL_WIDTH + origin.x] = 3;
+                record[target.y * LEVEL_WIDTH + target.x] = tile;
+                record[destination.y * LEVEL_WIDTH + destination.x] = 0;
+                let level = LevelSet::new(&record).load(1).unwrap();
+                let mut game = Game::with_random_seed(&level, 0).unwrap();
+                let mut saved = bitmap();
+                saved.reset(game.board()).unwrap();
+                let (ticks, length) = match tile {
+                    7 => (40, 40),
+                    23 => (8, 8),
+                    _ => (16, 8),
+                };
+                let mut frames = Vec::new();
+                for _ in 0..ticks {
+                    let drawings = game.tick_with_drawings(Input {
+                        direction: Some(direction),
+                        action: false,
+                    });
+                    for drawing in &drawings {
+                        if let Actor::Murphy(murphy) = drawing.actor
+                            && let Some((action, frame)) = murphy.sprite_pose()
+                            && matches!(
+                                action,
+                                MurphyAnimation::Push { .. }
+                                    | MurphyAnimation::Port { .. }
+                                    | MurphyAnimation::Exit
+                            )
+                        {
+                            assert_eq!(
+                                drawing.position, origin,
+                                "terminal picture must keep the action's original anchor"
+                            );
+                            frames.push(frame);
+                        }
+                    }
+                    saved.apply(&drawings);
+                }
+                assert_eq!(
+                    frames,
+                    (0..length).collect::<Vec<_>>(),
+                    "tile {tile}, {direction:?}: missing or repeated pictures"
+                );
+                assert!(game.board().state(origin).unwrap().is_empty());
+                for y in 0..16 {
+                    for x in 0..16 {
+                        assert_eq!(
+                            pixel(&saved.pixels, origin.x * 16 + x, origin.y * 16 + y),
+                            [0, 0, 0, 255],
+                            "tile {tile}, {direction:?}: source remnant at ({x}, {y})"
+                        );
+                    }
+                }
+            }
+        }
     }
+
+    /// Preparation reserves the held rock without repainting it over Murphy's strip.
+    #[test]
+    fn preparation_and_reservation_release_emit_no_target_erase() {
+        for direction in [Direction::Left, Direction::Right] {
+            let level = push_level(direction);
+            let mut game = Game::with_random_seed(&level, 0).unwrap();
+            let mut saved = bitmap();
+            saved.reset(game.board()).unwrap();
+            for _ in 0..8 {
+                let drawings = game.tick_with_drawings(Input {
+                    direction: Some(direction),
+                    action: false,
+                });
+                assert!(drawings.iter().all(|d| d.position != Position::new(4, 2)));
+                saved.apply(&drawings);
+            }
+            for y in 0..16 {
+                for x in 0..16 {
+                    assert_eq!(
+                        pixel(&saved.pixels, 4 * 16 + x, 2 * 16 + y),
+                        pixel(&saved.fixed, 16 + x, y)
+                    );
+                }
+            }
+            // Later source releases mutate Space but emit only actor pictures.
+            for _ in 0..32 {
+                let drawings = game.tick_with_drawings(Input {
+                    direction: Some(direction),
+                    action: false,
+                });
+                assert!(drawings.iter().all(|d| !matches!(d.actor, Actor::Empty(_))));
+                saved.apply(&drawings);
+            }
+        }
+    }
+
+    /// Eating Base and reversing through cleared cells must match every upstream frame.
+    #[test]
+    fn walking_back_through_eaten_base_matches_opensupaplex_pixels() {
+        let reference = include_str!("../../tests/support/opensupaplex_walk_trace.txt");
+        for case in reference.split("CASE ").skip(1) {
+            let (description, trace) = case.split_once('\n').unwrap();
+            let (direction, target) = match description {
+                "up" => (Direction::Up, Position::new(4, 2)),
+                "left" => (Direction::Left, Position::new(3, 3)),
+                "down" => (Direction::Down, Position::new(4, 4)),
+                "right" => (Direction::Right, Position::new(5, 3)),
+                _ => panic!("unknown reference direction"),
+            };
+            let mut record = vec![0; LEVEL_RECORD_SIZE];
+            record[..60 * 24].fill(6);
+            record[3 * LEVEL_WIDTH + 4] = 3;
+            record[target.y * LEVEL_WIDTH + target.x] = 2;
+            let level = LevelSet::new(&record).load(1).unwrap();
+            let mut game = Game::with_random_seed(&level, 0).unwrap();
+            let mut actual = bitmap();
+            actual.reset(game.board()).unwrap();
+            let mut expected = bitmap();
+            expected.reset(game.board()).unwrap();
+            for line in trace.lines().filter(|line| !line.is_empty()) {
+                let (kind, values) = line.split_once(' ').unwrap();
+                let values = values
+                    .split_whitespace()
+                    .map(|v| v.parse::<i32>().unwrap())
+                    .collect::<Vec<_>>();
+                match kind {
+                    "BLIT" => {
+                        let [_, sx, sy, width, height, dx, dy] = values[..] else {
+                            panic!("invalid upstream copy");
+                        };
+                        expected.copy(
+                            Position::new(0, 0),
+                            Blit::Moving(SpritePart {
+                                source: SourcePoint { x: sx, y: sy },
+                                width: width as u32,
+                                height: height as u32,
+                                offset_x: dx,
+                                offset_y: dy,
+                            }),
+                        );
+                    }
+                    "STATE" => {
+                        let tick = values[0];
+                        let direction = if (9..=16).contains(&tick) {
+                            direction.opposite()
+                        } else {
+                            direction
+                        };
+                        actual.apply(&game.tick_with_drawings(Input {
+                            direction: Some(direction),
+                            action: false,
+                        }));
+                        let position = game.murphy_position().unwrap();
+                        assert_eq!(
+                            (position.y * LEVEL_WIDTH + position.x) as i32,
+                            values[1],
+                            "{description}, tick {tick}"
+                        );
+                        let difference = actual
+                            .pixels
+                            .pixels
+                            .iter()
+                            .zip(&expected.pixels.pixels)
+                            .position(|(a, b)| a != b);
+                        assert!(
+                            difference.is_none(),
+                            "{description}, tick {tick}: first different pixel {:?}",
+                            difference.map(|i| (i / 4 % 960, i / 4 / 960))
+                        );
+                    }
+                    _ => panic!("unknown reference entry"),
+                }
+            }
+        }
+    }
+
+    /// Compare actual emitted copies and completion timing with an independent C trace.
+    #[test]
+    fn snap_drawing_sequences_match_opensupaplex() {
+        let reference = include_str!("../../tests/support/opensupaplex_snap_trace.txt");
+        for case in reference.split("CASE ").skip(1) {
+            let (description, expected) = case.split_once('\n').unwrap();
+            let (tile, direction) = description.split_once(' ').unwrap();
+            let tile = tile.parse::<u8>().unwrap();
+            let (direction, target) = match direction {
+                "up" => (Direction::Up, Position::new(4, 2)),
+                "left" => (Direction::Left, Position::new(3, 3)),
+                "down" => (Direction::Down, Position::new(4, 4)),
+                "right" => (Direction::Right, Position::new(5, 3)),
+                _ => panic!("unknown reference direction"),
+            };
+            // Match the upstream harness: all hardware except Murphy (4,3) and
+            // one adjacent collectible. No other actor can affect the trace.
+            let mut record = vec![0; LEVEL_RECORD_SIZE];
+            record[..60 * 24].fill(6);
+            record[3 * LEVEL_WIDTH + 4] = 3;
+            record[target.y * LEVEL_WIDTH + target.x] = tile;
+            let level = LevelSet::new(&record).load(1).unwrap();
+            let mut game = Game::with_random_seed(&level, 0).unwrap();
+            let mut actual = Vec::new();
+            for tick in 1..=8 {
+                for drawing in game.tick_with_drawings(Input {
+                    direction: Some(direction),
+                    action: true,
+                }) {
+                    // Include the one-time retained pose and every emitted
+                    // rectangle in order. An extra fixed-tile erase must fail
+                    // this comparison, even if it produces the same black pixels.
+                    let mut copies = Vec::new();
+                    if let Actor::Murphy(murphy) = drawing.actor
+                        && let Some((action, frame)) = murphy.sprite_pose()
+                        && let Some(retained) = sprite_parts(action, frame).retained
+                    {
+                        copies.push(Blit::Moving(retained));
+                    }
+                    copies.extend(artwork(&drawing.actor));
+                    for copy in copies {
+                        let Blit::Moving(part) = copy else {
+                            panic!("unexpected fixed-tile cleanup for {description}");
+                        };
+                        actual.push(format!(
+                            "BLIT {tick} {} {} {} {} {} {}",
+                            part.source.x,
+                            part.source.y,
+                            part.width,
+                            part.height,
+                            drawing.position.x as i32 * 16 + part.offset_x,
+                            drawing.position.y as i32 * 16 + part.offset_y,
+                        ));
+                    }
+                }
+                actual.push(format!(
+                    "STATE {tick} {} {}",
+                    game.board().state(target).unwrap().actor().tile_code(),
+                    game.remaining_infotrons(),
+                ));
+            }
+            assert_eq!(actual.join("\n"), expected.trim(), "{description}");
+        }
+    }
+
     /// A completed adjacent collection must leave its entire target cell black.
     #[test]
     fn every_snap_finishes_with_no_target_pixels() {
@@ -722,12 +914,24 @@ mod tests {
                 let mut game = Game::with_random_seed(&level, 0).unwrap();
                 let mut saved = bitmap();
                 saved.reset(game.board()).unwrap();
+                let mut frames = Vec::new();
                 for _ in 0..12 {
-                    saved.apply(&game.tick_with_changes(Input {
+                    let drawings = game.tick_with_drawings(Input {
                         direction: Some(direction),
                         action: true,
-                    }));
+                    });
+                    for drawing in &drawings {
+                        if let Actor::Murphy(murphy) = drawing.actor
+                            && let Some((crate::actors::MurphyAnimation::Snap { .. }, frame)) =
+                                murphy.sprite_pose()
+                        {
+                            frames.push(frame);
+                        }
+                    }
+                    saved.apply(&drawings);
                 }
+                let length = if tile == 4 { 7 } else { 8 };
+                assert_eq!(frames, (0..length).collect::<Vec<_>>());
                 assert!(game.board().state(target).unwrap().is_empty());
                 let mut remaining = Vec::new();
                 for y in 0..16 {

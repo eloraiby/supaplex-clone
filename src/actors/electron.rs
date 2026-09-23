@@ -40,7 +40,7 @@ impl Electron {
             EnemyPhase::Moving { direction, frame } => match frame.index() {
                 6 => Some(self.advance_penultimate_movement(position, direction, world)),
                 _ => Some(match frame.next() {
-                    Some(frame) => Transition::replace(
+                    Some(frame) => Transition::paint(
                         position,
                         self.in_phase(EnemyPhase::Moving { direction, frame }),
                     ),
@@ -84,7 +84,7 @@ impl Electron {
             // As with the original state byte, retain the selected cycle's high
             // group while its low three bits wrap from seven back to zero.
             let next_frame = (frame.index() + 1) & 7;
-            return Some(Transition::replace(
+            return Some(Transition::paint(
                 position,
                 self.in_phase(EnemyPhase::Turning {
                     turn,
@@ -142,7 +142,15 @@ impl Electron {
             writes.push(CellWrite::new(source, State::empty()));
         }
 
-        Transition::new(writes, Vec::new())
+        Transition::new(writes, Vec::new()).with_drawing(
+            position,
+            self.in_phase(EnemyPhase::Moving {
+                direction,
+                frame: Frame::last(),
+            })
+            .actor()
+            .clone(),
+        )
     }
 
     /// Resolves left, forward, right, then turn-around after a completed move.
@@ -196,7 +204,7 @@ impl Electron {
 
     /// Builds the odd intermediate frame preceding one side candidate.
     fn begin_turn(&self, position: Position, turn: EnemyTurn, candidate: Direction) -> Transition {
-        Transition::replace(
+        Transition::paint(
             position,
             self.in_phase(EnemyPhase::Turning {
                 turn,

@@ -82,10 +82,14 @@ impl Bug {
             .then_some(GameEvent::PlaySound(SoundEffect::Bug))
             .into_iter()
             .collect();
-        Some(Transition::new(
+        let transition = Transition::new(
             vec![CellWrite::new(position, State::new(Actor::Bug(next)))],
             events,
-        ))
+        );
+        Some(match next {
+            Self::Active(_) => transition.with_drawing(position, Actor::Bug(next)),
+            Self::Dormant(_) | Self::Held => transition,
+        })
     }
 }
 

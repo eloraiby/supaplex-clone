@@ -11,10 +11,10 @@ use crate::actors::{empty::Reservation, murphy::MurphyPhase};
 
 use crate::{
     actors::{
-        Actor, Base, Bug, CHAIN_REACTION_FRAMES, Direction, Electron, Empty, Exit, GameEvent,
-        Hardware, Infotron, InvisibleWall, Murphy, OrangeDisk, Port, PortDirections, Position,
-        RED_DISK_DETONATION_COUNTDOWN, RamChip, RamChipShape, RedDisk, SnikSnak, State, Terminal,
-        Transition, YellowDisk, Zonk,
+        Actor, Base, Bug, CHAIN_REACTION_FRAMES, Direction, Drawing, Electron, Empty, Exit,
+        GameEvent, Hardware, Infotron, InvisibleWall, Murphy, OrangeDisk, Port, PortDirections,
+        Position, RED_DISK_DETONATION_COUNTDOWN, RamChip, RamChipShape, RedDisk, SnikSnak, State,
+        Terminal, Transition, YellowDisk, Zonk,
     },
     level::{LEVEL_HEIGHT, LEVEL_WIDTH, Level, SpecialPort},
 };
@@ -28,20 +28,6 @@ pub struct Input {
     pub action: bool,
 }
 
-/// One committed cell change in simulation order, before later callbacks run.
-///
-/// Consumers can retain presentation history without treating a final board
-/// snapshot as a drawing schedule. These values contain no renderer resources.
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub struct BoardChange {
-    /// Cell changed by the current callback or one of its immediate events.
-    pub position: Position,
-    /// Complete state immediately before this write, including reservations.
-    pub before: State,
-    /// Replacement, even when another callback changes this cell again.
-    pub after: State,
-}
-
 /// Contiguous two-dimensional storage using only `width * y + x` indexing.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct Board {
@@ -51,8 +37,6 @@ pub struct Board {
     height: usize,
     /// Complete cell states in row-major order.
     cells: Vec<State>,
-    /// Scoped recording; ordinary headless ticks retain no change history.
-    changes: Option<Vec<BoardChange>>,
 }
 
 impl Board {
@@ -74,7 +58,6 @@ impl Board {
             width,
             height,
             cells,
-            changes: None,
         })
     }
 
@@ -232,17 +215,6 @@ impl Board {
         let index = self
             .index(position)
             .ok_or(BoardError::OutOfBounds(position))?;
-        // Capture immediate events here too, including chained explosions. Do
-        // not coalesce successive writes: a cell can change twice in one tick.
-        if self.cells[index] != state
-            && let Some(changes) = &mut self.changes
-        {
-            changes.push(BoardChange {
-                position,
-                before: self.cells[index].clone(),
-                after: state.clone(),
-            });
-        }
         self.cells[index] = state;
         Ok(())
     }
@@ -358,6 +330,8 @@ fn clock_random_seed() -> u16 {
 pub struct Game {
     /// Current live board mutated by the linear actor pass.
     board: Board,
+    /// Scoped output of explicit pictures; ordinary headless ticks retain none.
+    drawings: Option<Vec<Drawing>>,
     /// Level title used by the SDL HUD and window title.
     title: String,
     /// Required Infotrons not yet collected.
@@ -431,6 +405,7 @@ impl Game {
 
         Ok(Self {
             board,
+            drawings: None,
             title: level.title().to_owned(),
             remaining_infotrons,
             red_disks: 0,
@@ -552,27 +527,33 @@ impl Game {
         self.detonate_position(position);
     }
 
-    /// Advances one tick and returns its cell changes in committed callback order.
-    pub fn tick_with_changes(&mut self, input: Input) -> Vec<BoardChange> {
-        // Use the same simulation path as headless replay: observing mutations
-        // must not change callback scheduling, reservations, or random values.
-        self.record_changes(|game| game.tick(input))
+    /// Advances one tick and returns explicit pictures in callback execution order.
+    pub fn tick_with_drawings(&mut self, input: Input) -> Vec<Drawing> {
+        // Execute exactly the ordinary simulation, retaining its drawing effects
+        // for the caller instead of inferring them from changed board cells.
+        self.record_drawings(|game| game.tick(input))
     }
 
-    /// Records an explicit death request, including its immediate blast writes.
-    pub fn destroy_murphy_with_changes(&mut self) -> Vec<BoardChange> {
-        self.record_changes(Self::destroy_murphy)
+    /// Records an explicit death request's immediate blast pictures without a tick.
+    pub fn destroy_murphy_with_drawings(&mut self) -> Vec<Drawing> {
+        self.record_drawings(Self::destroy_murphy)
     }
 
-    /// Owns the recording scope so unused histories cannot grow between ticks.
-    fn record_changes(&mut self, operation: impl FnOnce(&mut Self)) -> Vec<BoardChange> {
-        debug_assert!(self.board.changes.is_none(), "recording scopes cannot nest");
-        self.board.changes = Some(Vec::new());
+    /// Scopes presentation output so unused histories cannot grow between ticks.
+    fn record_drawings(&mut self, operation: impl FnOnce(&mut Self)) -> Vec<Drawing> {
+        debug_assert!(self.drawings.is_none(), "recording scopes cannot nest");
+        self.drawings = Some(Vec::new());
         operation(self);
-        self.board
-            .changes
+        self.drawings
             .take()
             .expect("recording scope remains active")
+    }
+
+    /// Appends a session-owned picture at the exact point its event occurs.
+    fn draw_actor(&mut self, position: Position, actor: Actor) {
+        if let Some(drawings) = &mut self.drawings {
+            drawings.push(Drawing { position, actor });
+        }
     }
 
     /// Applies one Murphy-first, row-major simulation step to the live board.
@@ -678,6 +659,11 @@ impl Game {
     fn apply_transition(&mut self, transition: Transition) {
         // Actor helpers construct only bounded coordinates. Keeping writes in
         // one value ensures no other actor can observe a partially moved actor.
+        // An action can draw its last picture and complete in this callback.
+        // Retain that effect before its writes replace the stored actor phase.
+        if let Some(drawings) = &mut self.drawings {
+            drawings.extend(transition.drawings);
+        }
         for write in transition.writes {
             self.board
                 .set(write.position, write.state)
@@ -753,8 +739,10 @@ impl Game {
                     .state(position)
                     .is_some_and(|state| matches!(state.actor(), Actor::Bug(_)))
                 {
+                    let state = State::dormant_bug(delay);
+                    self.draw_actor(position, state.actor().clone());
                     self.board
-                        .set(position, State::dormant_bug(delay))
+                        .set(position, state)
                         .expect("scheduled Bug position remains in bounds");
                 }
             }
@@ -771,11 +759,10 @@ impl Game {
                 let Actor::Terminal(terminal) = state.actor() else {
                     return;
                 };
+                let actor = Actor::Terminal(terminal.after_scroll(delay));
+                self.draw_actor(position, actor.clone());
                 self.board
-                    .set(
-                        position,
-                        State::new(Actor::Terminal(terminal.after_scroll(delay))),
-                    )
+                    .set(position, State::new(actor))
                     .expect("scheduled Terminal position remains in bounds");
             }
             GameEvent::ScheduleExplosion { position, electron } => {
@@ -878,8 +865,10 @@ impl Game {
             Actor::Empty(Empty::Space) | Actor::RedDisk(RedDisk::Planted(_)) => {
                 // A visible State exposes the current animation frame, while
                 // this retained record lets Murphy cross without losing time.
+                let state = State::planted_red_disk(planted.countdown);
+                self.draw_actor(planted.position, state.actor().clone());
                 self.board
-                    .set(planted.position, State::planted_red_disk(planted.countdown))
+                    .set(planted.position, state)
                     .expect("stored planted-disk position must remain in bounds");
                 self.planted_red_disk = Some(planted);
             }
@@ -1245,6 +1234,7 @@ mod tests {
 
         Game {
             board: Board::new(width, height, cells).expect("fixture dimensions should match"),
+            drawings: None,
             title: "TEST".to_owned(),
             remaining_infotrons: required_infotrons,
             red_disks: 0,
@@ -1264,55 +1254,60 @@ mod tests {
         }
     }
 
-    /// A journal preserves repeated writes and leaves no hidden history behind.
+    /// Board writes are silent; immediate events explicitly emit their pictures.
     #[test]
-    fn change_recording_retains_immediate_events_and_resets_its_scope() {
+    fn drawing_scopes_record_effects_without_interpreting_cell_mutations() {
         let position = Position::new(2, 2);
-        let initial = State::new(Actor::Bug(Bug::new()));
-        let mut game = game_with(&[(position, initial.clone())], 0);
-        let changes = game.record_changes(|game| {
+        let mut game = game_with(&[(position, State::new(Actor::Bug(Bug::new())))], 0);
+        let drawings = game.record_drawings(|game| {
             game.board.set(position, State::dormant_bug(1)).unwrap();
             game.apply_event(crate::actors::GameEvent::RandomizeBug(position));
         });
-        assert_eq!(changes.len(), 2);
-        assert_eq!(changes[0].position, position);
-        assert_eq!(changes[0].before, initial);
-        assert_eq!(changes[0].after, changes[1].before);
-        assert_eq!(&changes[1].after, game.board.state(position).unwrap());
-        assert!(game.board.changes.is_none());
-        assert!(game.record_changes(|_| {}).is_empty());
+        assert_eq!(drawings.len(), 1);
+        assert_eq!(drawings[0].position, position);
+        assert_eq!(
+            &drawings[0].actor,
+            game.board.state(position).unwrap().actor()
+        );
+        assert!(game.drawings.is_none());
+        assert!(game.record_drawings(|_| {}).is_empty());
         game.tick(Input::default());
-        assert!(game.board.changes.is_none());
+        assert!(game.drawings.is_none());
     }
 
     /// Murphy's callback precedes even an actor at a smaller linear board index.
     #[test]
-    fn recorded_changes_use_callback_order_instead_of_destination_order() {
+    fn drawings_preserve_callback_order_even_across_board_indices() {
         let rock = Position::new(2, 2);
         let murphy = Position::new(4, 3);
         let mut game = game_with(
             &[
-                (rock, State::new(Actor::Zonk(Zonk::resting()))),
+                (
+                    rock,
+                    State::new(Actor::Zonk(Zonk::from_phase(
+                        crate::actors::rounded::RoundedPhase::Falling(crate::actors::Frame::first()),
+                    ))),
+                ),
                 (murphy, State::new(Actor::Murphy(Murphy::new()))),
             ],
             0,
         );
-        let changes = game.tick_with_changes(Input {
+        let drawings = game.tick_with_drawings(Input {
             direction: Some(Direction::Right),
             action: false,
         });
-        let player_write = changes
+        let player_picture = drawings
             .iter()
-            .position(|change| matches!(change.after.actor(), Actor::Murphy(_)))
+            .position(|drawing| matches!(drawing.actor, Actor::Murphy(_)))
             .unwrap();
-        let rock_write = changes
+        let rock_picture = drawings
             .iter()
-            .position(|change| matches!(change.after.actor(), Actor::Zonk(_)))
+            .position(|drawing| matches!(drawing.actor, Actor::Zonk(_)))
             .unwrap();
-        assert!(player_write < rock_write);
+        assert!(player_picture < rock_picture);
         assert!(
-            game.board.index(changes[player_write].position)
-                > game.board.index(changes[rock_write].position)
+            game.board.index(drawings[player_picture].position)
+                > game.board.index(drawings[rock_picture].position)
         );
     }
 
@@ -1326,17 +1321,17 @@ mod tests {
             )],
             0,
         );
-        let changes = game.destroy_murphy_with_changes();
+        let drawings = game.destroy_murphy_with_drawings();
         assert_eq!(game.tick_count(), 0);
         assert_eq!(game.status(), GameStatus::Dead);
-        assert_eq!(changes.len(), 9);
+        assert_eq!(drawings.len(), 9);
         assert!(
-            changes
+            drawings
                 .iter()
-                .all(|change| matches!(change.after.actor(), Actor::Explosion(_)))
+                .all(|drawing| matches!(drawing.actor, Actor::Explosion(_)))
         );
-        assert!(game.destroy_murphy_with_changes().is_empty());
-        assert!(game.board.changes.is_none());
+        assert!(game.destroy_murphy_with_drawings().is_empty());
+        assert!(game.drawings.is_none());
     }
 
     /// Returns the actor at a required fixture coordinate.

@@ -90,7 +90,7 @@ impl OrangeDisk {
                 None => self.begin_fall(position, world),
             },
             OrangePhase::Falling(frame) => match frame.next() {
-                Some(frame) => Some(Transition::replace(
+                Some(frame) => Some(Transition::paint(
                     position,
                     self.in_phase(OrangePhase::Falling(frame)),
                 )),
@@ -121,7 +121,7 @@ impl OrangeDisk {
                 State::new(Actor::OrangeDisk(OrangeDisk::resting())),
             ));
         }
-        Some(Transition::replace(
+        Some(Transition::paint(
             position,
             self.in_phase(OrangePhase::Falling(Frame::first())),
         ))
@@ -145,33 +145,44 @@ impl OrangeDisk {
         let landing_cell = world.offset(destination, Direction::Down);
         if landing_cell.is_some_and(|cell| world.is_empty(cell)) {
             let landing_cell = landing_cell.expect("validated landing cell exists");
-            return Some(Transition::new(
-                vec![
-                    CellWrite::new(position, State::empty()),
-                    CellWrite::new(
-                        destination,
-                        self.in_phase(OrangePhase::Falling(Frame::first())),
-                    ),
-                    CellWrite::new(landing_cell, State::rounded_destination()),
-                ],
-                Vec::new(),
-            ));
+            return Some(
+                Transition::new(
+                    vec![
+                        CellWrite::new(position, State::empty()),
+                        CellWrite::new(
+                            destination,
+                            self.in_phase(OrangePhase::Falling(Frame::first())),
+                        ),
+                        CellWrite::new(landing_cell, State::rounded_destination()),
+                    ],
+                    Vec::new(),
+                )
+                .with_drawing(
+                    destination,
+                    self.in_phase(OrangePhase::Falling(Frame::first()))
+                        .actor()
+                        .clone(),
+                ),
+            );
         }
 
         if landing_cell
             .and_then(|cell| world.state(cell))
             .is_some_and(|state| matches!(state.actor(), Actor::Explosion(_)))
         {
-            return Some(Transition::new(
-                vec![
-                    CellWrite::new(position, State::empty()),
-                    CellWrite::new(
-                        destination,
-                        State::new(Actor::OrangeDisk(OrangeDisk::resting())),
-                    ),
-                ],
-                Vec::new(),
-            ));
+            return Some(
+                Transition::new(
+                    vec![
+                        CellWrite::new(position, State::empty()),
+                        CellWrite::new(
+                            destination,
+                            State::new(Actor::OrangeDisk(OrangeDisk::resting())),
+                        ),
+                    ],
+                    Vec::new(),
+                )
+                .with_drawing(destination, Actor::OrangeDisk(OrangeDisk::resting())),
+            );
         }
 
         let mut explosion = explode_at(world, destination, false);

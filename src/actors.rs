@@ -25,6 +25,7 @@ pub use enemy::EnemyTurn;
 pub use frame::Frame;
 pub use geometry::{Direction, Horizontal, Position};
 pub use state::State;
+pub use transition::Drawing;
 pub(crate) use transition::{CellWrite, GameEvent, Transition};
 
 pub mod base;

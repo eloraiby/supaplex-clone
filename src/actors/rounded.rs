@@ -94,7 +94,7 @@ impl RoundedActor {
             },
             RoundedPhase::PreparingRoll(direction) => self.begin_slide(position, direction, world),
             RoundedPhase::Rolling { direction, frame } => match frame.next() {
-                Some(frame) => Some(Transition::replace(
+                Some(frame) => Some(Transition::paint(
                     position,
                     self.in_phase(RoundedPhase::Rolling { direction, frame }),
                 )),
@@ -123,7 +123,10 @@ impl RoundedActor {
                     {
                         writes.push(CellWrite::new(source, State::empty()));
                     }
-                    Some(Transition::new(writes, Vec::new()))
+                    Some(Transition::new(writes, Vec::new()).with_drawing(
+                        position,
+                        self.in_phase(RoundedPhase::Falling(next)).actor().clone(),
+                    ))
                 }
                 None => Some(match self {
                     Self::Zonk(a) => a.land(position, world),
@@ -153,8 +156,8 @@ impl RoundedActor {
                 )
             });
         match (reserved, side, diagonal) {
-            (true, Some(side), Some(diagonal)) if world.is_empty(diagonal) => {
-                Some(Transition::new(
+            (true, Some(side), Some(diagonal)) if world.is_empty(diagonal) => Some(
+                Transition::new(
                     vec![
                         CellWrite::new(position, State::empty()),
                         CellWrite::new(
@@ -167,8 +170,17 @@ impl RoundedActor {
                         CellWrite::new(diagonal, State::rounded_destination()),
                     ],
                     Vec::new(),
-                ))
-            }
+                )
+                .with_drawing(
+                    side,
+                    self.in_phase(RoundedPhase::Rolling {
+                        direction,
+                        frame: Frame::first(),
+                    })
+                    .actor()
+                    .clone(),
+                ),
+            ),
             // A blocked diagonal leaves original state 0x51 sticky.
             (true, _, _) => None,
             // A blast can consume the side marker; do not overwrite its replacement.
@@ -191,16 +203,24 @@ impl RoundedActor {
                 )
             })
         {
-            return Some(Transition::new(
-                vec![
-                    CellWrite::new(position, State::empty()),
-                    CellWrite::new(
-                        destination,
-                        self.in_phase(RoundedPhase::Falling(Frame::first())),
-                    ),
-                ],
-                Vec::new(),
-            ));
+            return Some(
+                Transition::new(
+                    vec![
+                        CellWrite::new(position, State::empty()),
+                        CellWrite::new(
+                            destination,
+                            self.in_phase(RoundedPhase::Falling(Frame::first())),
+                        ),
+                    ],
+                    Vec::new(),
+                )
+                .with_drawing(
+                    destination,
+                    self.in_phase(RoundedPhase::Falling(Frame::first()))
+                        .actor()
+                        .clone(),
+                ),
+            );
         }
         Some(Transition::replace(
             position,

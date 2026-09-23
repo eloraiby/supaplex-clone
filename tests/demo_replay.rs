@@ -79,7 +79,7 @@ fn all_original_demo_histories_preserve_actor_and_render_timing() {
             game.tick(input);
             // Recording must observe the same game, not introduce a second
             // simulation algorithm. Keep the original history oracle below.
-            let changes = observed.tick_with_changes(input);
+            let drawings = observed.tick_with_drawings(input);
             assert_eq!(observed.board(), game.board());
             assert_eq!(observed.tick_count(), game.tick_count());
             assert_eq!(observed.status(), game.status());
@@ -92,7 +92,11 @@ fn all_original_demo_histories_preserve_actor_and_render_timing() {
                 observed.terminal_transition_ready(),
                 game.terminal_transition_ready()
             );
-            assert!(changes.iter().all(|change| change.before != change.after));
+            assert!(
+                drawings
+                    .iter()
+                    .all(|drawing| game.board().index(drawing.position).is_some())
+            );
             history.number(game.tick_count());
             history.number(u64::from(game.remaining_infotrons()));
             history.number(u64::from(game.red_disks()));

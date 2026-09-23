@@ -122,7 +122,7 @@ impl Infotron {
                     if murphy_is_protected_from_falling_actor(target) {
                         // Protected push states use the same silent
                         // early return as the Zonk landing routine.
-                        return Transition::replace(
+                        return Transition::paint(
                             position,
                             State::new(Actor::Infotron(Infotron::resting())),
                         );
@@ -161,8 +161,16 @@ impl Infotron {
                     })),
                 )],
                 events,
+            )
+            .with_drawing(
+                position,
+                Actor::Infotron(if still_falling {
+                    Infotron::falling()
+                } else {
+                    Infotron::resting()
+                }),
             );
         }
-        Transition::replace(position, self.in_phase(RoundedPhase::Momentum))
+        Transition::paint(position, self.in_phase(RoundedPhase::Momentum))
     }
 }

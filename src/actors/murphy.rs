@@ -388,6 +388,17 @@ impl Snap {
         }
     }
 
+    /// Selects the bounded terminal picture emitted on the collection callback.
+    fn last_picture(self) -> Self {
+        // The picture outlives this action only in the drawing stream. It is
+        // never installed as a new active snap, so collection is not delayed.
+        match self {
+            Self::Base(direction, _) => Self::Base(direction, Frame::last()),
+            Self::Infotron(direction, _) => Self::Infotron(direction, Frame::last()),
+            Self::RedDisk(direction, _) => Self::RedDisk(direction, Frame::last()),
+        }
+    }
+
     /// Advances the target's own strip using Murphy's immediate-first-picture rule.
     fn next(self) -> Option<Self> {
         Some(match self {
@@ -505,49 +516,76 @@ impl Murphy {
             }
             MurphyPhase::Moving(travel) => Some(match travel.next() {
                 Some(travel) => {
-                    Transition::replace(position, self.in_phase(MurphyPhase::Moving(travel)))
+                    Transition::paint(position, self.in_phase(MurphyPhase::Moving(travel)))
                 }
                 None => self.finish_move(position, travel.pose().0, world),
             }),
             MurphyPhase::Resuming(_) => {
                 let ready = self.ready();
                 ready.ready_transition(position, world).or_else(|| {
-                    Some(Transition::replace(
+                    Some(Transition::paint(
                         position,
                         State::new(Actor::Murphy(ready)),
                     ))
                 })
             }
             MurphyPhase::Snapping(snap) => match snap.next() {
-                Some(snap) => Some(Transition::replace(
+                Some(snap) => Some(Transition::paint(
                     position,
                     self.in_phase(MurphyPhase::Snapping(snap)),
                 )),
                 None => {
                     let (direction, target, _) = snap.pose();
                     self.finish_snap(position, direction, target, world)
+                        .map(|transition| {
+                            // Completion removes the held actor, but its terminal
+                            // snap picture must be drawn before those cell writes.
+                            let picture = self.in_phase(MurphyPhase::Snapping(snap.last_picture()));
+                            transition.after_drawing(position, picture.actor().clone())
+                        })
                 }
             },
             MurphyPhase::Pushing { action, frame } => match next_action_frame(frame) {
-                Some(frame) => Some(Transition::replace(
+                Some(frame) => Some(Transition::paint(
                     position,
                     self.in_phase(MurphyPhase::Pushing { action, frame }),
                 )),
-                None => self.finish_push(position, action.direction(), action.target(), world),
+                None => self
+                    .finish_push(position, action.direction(), action.target(), world)
+                    .map(|transition| {
+                        let picture = self.in_phase(MurphyPhase::Pushing {
+                            action,
+                            frame: Frame::last(),
+                        });
+                        transition.after_drawing(position, picture.actor().clone())
+                    }),
             },
             MurphyPhase::CrossingPort { direction, frame } => match next_action_frame(frame) {
-                Some(frame) => Some(Transition::replace(
+                Some(frame) => Some(Transition::paint(
                     position,
                     self.in_phase(MurphyPhase::CrossingPort { direction, frame }),
                 )),
-                None => self.finish_port(position, direction, world),
+                None => self
+                    .finish_port(position, direction, world)
+                    .map(|transition| {
+                        let picture = self.in_phase(MurphyPhase::CrossingPort {
+                            direction,
+                            frame: Frame::last(),
+                        });
+                        transition.after_drawing(position, picture.actor().clone())
+                    }),
             },
             MurphyPhase::Exiting(frame) => Some(match next_action_frame(frame) {
                 Some(frame) => {
-                    Transition::replace(position, self.in_phase(MurphyPhase::Exiting(frame)))
+                    Transition::paint(position, self.in_phase(MurphyPhase::Exiting(frame)))
                 }
                 // Completion was recorded at entry; only the sprite disappears here.
-                None => Transition::replace(position, State::empty()),
+                None => Transition::replace(position, State::empty()).after_drawing(
+                    position,
+                    self.in_phase(MurphyPhase::Exiting(Frame::last()))
+                        .actor()
+                        .clone(),
+                ),
             }),
         }
     }
@@ -611,10 +649,13 @@ impl Murphy {
                 remaining: Frame::last(),
             };
             let murphy = State::new(Actor::Murphy(next_murphy));
-            return Some(Transition::new(
-                vec![CellWrite::new(position, murphy)],
-                vec![GameEvent::BeginPlantRedDisk(position)],
-            ));
+            return Some(
+                Transition::new(
+                    vec![CellWrite::new(position, murphy)],
+                    vec![GameEvent::BeginPlantRedDisk(position)],
+                )
+                .with_drawing(position, Actor::Murphy(next_murphy)),
+            );
         }
 
         if let Some(direction) = input.direction {
@@ -669,6 +710,16 @@ impl Murphy {
                         }),
                     )],
                     vec![GameEvent::PlaySound(SoundEffect::Push)],
+                )
+                .with_drawing(
+                    position,
+                    moving
+                        .in_phase(MurphyPhase::Pushing {
+                            action,
+                            frame: Frame::first(),
+                        })
+                        .actor()
+                        .clone(),
                 );
             }
 
@@ -707,7 +758,7 @@ impl Murphy {
         }) {
             writes.push(CellWrite::new(destination, State::empty()));
         }
-        Transition::new(writes, Vec::new())
+        Transition::new(writes, Vec::new()).with_drawing(position, Actor::Murphy(cancelled))
     }
 
     /// Advances, completes, or cancels the 64-update Space-only plant action.
@@ -728,7 +779,8 @@ impl Murphy {
                     State::new(Actor::Murphy(cancelled)),
                 )],
                 vec![GameEvent::CancelPlantRedDisk],
-            );
+            )
+            .with_drawing(position, Actor::Murphy(cancelled));
         }
 
         if remaining.index() == 0 {
@@ -741,14 +793,15 @@ impl Murphy {
                     State::new(Actor::Murphy(completed)),
                 )],
                 vec![GameEvent::FinishPlantRedDisk],
-            );
+            )
+            .with_drawing(position, Actor::Murphy(completed));
         }
 
         let mut planting = *self;
         planting.phase = MurphyPhase::PlantingRedDisk {
             remaining: Frame::new(remaining.index() - 1).unwrap(),
         };
-        Transition::replace(position, State::new(Actor::Murphy(planting)))
+        Transition::paint(position, State::new(Actor::Murphy(planting)))
     }
 
     /// Reports whether gravity must override Murphy's current player command.
@@ -820,13 +873,16 @@ impl Murphy {
         let state = self
             .looking(direction)
             .in_phase(MurphyPhase::Snapping(Snap::new(direction, target_kind)));
-        Some(Transition::new(
-            vec![
-                CellWrite::new(position, state),
-                CellWrite::new(target, held_state),
-            ],
-            sound.into_iter().map(GameEvent::PlaySound).collect(),
-        ))
+        Some(
+            Transition::new(
+                vec![
+                    CellWrite::new(position, state.clone()),
+                    CellWrite::new(target, held_state),
+                ],
+                sound.into_iter().map(GameEvent::PlaySound).collect(),
+            )
+            .with_drawing(position, state.actor().clone()),
+        )
     }
 
     /// Moves, collects, pushes, crosses a port, or activates an adjacent actor.
@@ -903,19 +959,28 @@ impl Murphy {
                 direction,
                 MurphyMoveTarget::RedDisk,
             )),
-            Actor::Exit(_) if world.remaining_infotrons() == 0 => Some(Transition::new(
-                vec![CellWrite::new(
+            Actor::Exit(_) if world.remaining_infotrons() == 0 => Some(
+                Transition::new(
+                    vec![CellWrite::new(
+                        position,
+                        murphy_actor.in_phase(MurphyPhase::Exiting(Frame::first())),
+                    )],
+                    // The original sets its successful-level flag as soon as the
+                    // unlocked Exit is selected. The forty pictures are a terminal
+                    // disappearance sequence, not a deferred success condition.
+                    vec![
+                        GameEvent::Completed,
+                        GameEvent::PlaySound(SoundEffect::Exit),
+                    ],
+                )
+                .with_drawing(
                     position,
-                    murphy_actor.in_phase(MurphyPhase::Exiting(Frame::first())),
-                )],
-                // The original sets its successful-level flag as soon as the
-                // unlocked Exit is selected. The forty pictures are a terminal
-                // disappearance sequence, not a deferred success condition.
-                vec![
-                    GameEvent::Completed,
-                    GameEvent::PlaySound(SoundEffect::Exit),
-                ],
-            )),
+                    murphy_actor
+                        .in_phase(MurphyPhase::Exiting(Frame::first()))
+                        .actor()
+                        .clone(),
+                ),
+            ),
             Actor::Zonk(_) if direction.is_horizontal() && target_state.is_idle() => {
                 self.prepare_push(position, target, direction, world, MurphyPushTarget::Zonk)
             }
@@ -998,7 +1063,7 @@ impl Murphy {
             CellWrite::new(destination, State::murphy_destination()),
         ];
 
-        Some(Transition::new(writes, Vec::new()))
+        Some(Transition::new(writes, Vec::new()).with_drawing(position, Actor::Murphy(preparing)))
     }
 
     /// Atomically moves Murphy through a passable port into the cell beyond it.
@@ -1018,19 +1083,31 @@ impl Murphy {
         // Murphy remains logically at the source until frame eight. The empty
         // cell beyond the port is reserved so no falling actor can enter it;
         // special-port metadata is deliberately deferred to completion.
-        Some(Transition::new(
-            vec![
-                CellWrite::new(
-                    position,
-                    murphy_actor.in_phase(MurphyPhase::CrossingPort {
+        Some(
+            Transition::new(
+                vec![
+                    CellWrite::new(
+                        position,
+                        murphy_actor.in_phase(MurphyPhase::CrossingPort {
+                            direction,
+                            frame: Frame::first(),
+                        }),
+                    ),
+                    CellWrite::new(destination, State::murphy_destination()),
+                ],
+                Vec::new(),
+            )
+            .with_drawing(
+                position,
+                murphy_actor
+                    .in_phase(MurphyPhase::CrossingPort {
                         direction,
                         frame: Frame::first(),
-                    }),
-                ),
-                CellWrite::new(destination, State::murphy_destination()),
-            ],
-            Vec::new(),
-        ))
+                    })
+                    .actor()
+                    .clone(),
+            ),
+        )
     }
 
     /// Updates only the horizontal look flag when input points left or right.
@@ -1266,7 +1343,10 @@ impl Murphy {
             MurphyMoveTarget::Infotron => vec![GameEvent::CollectInfotron],
             MurphyMoveTarget::RedDisk => vec![GameEvent::CollectRedDisk],
         };
-        Transition::new(writes, events)
+        Transition::new(writes, events).with_drawing(
+            position,
+            self.in_phase(MurphyPhase::Resuming(pose)).actor().clone(),
+        )
     }
 }
 

@@ -20,14 +20,14 @@ use crate::actors::{
 };
 
 use crate::{
-    actors::{Actor, Direction, EnemyTurn, MurphyAnimation, State},
+    actors::{Actor, Direction, Drawing, EnemyTurn, MurphyAnimation, State},
     assets::{
         self, AssetError, BACK_GRAPHICS_PATH, CONTROLS_GRAPHICS_PATH, FONT_GRAPHICS_PATH,
         GFX_TUTOR_GRAPHICS_PATH, MENU_FONT_GRAPHICS_PATH, MENU_GRAPHICS_PATH, PANEL_GRAPHICS_PATH,
         TITLE_GRAPHICS_PATH,
     },
     frontend::{ControlsTarget, MainMenuTarget},
-    game::{BoardChange, Game, GameStatus},
+    game::{Game, GameStatus},
     murphy_animation::{SourcePoint, SpritePart, sprite_parts},
 };
 
@@ -550,9 +550,9 @@ impl<'textures> Renderer<'textures> {
         self.level.reset(game.board())
     }
 
-    /// Applies committed changes immediately after each simulation operation.
-    pub fn apply_board_changes(&mut self, changes: &[BoardChange]) {
-        self.level.apply(changes);
+    /// Applies explicit actor pictures immediately after each simulation operation.
+    pub fn apply_drawings(&mut self, drawings: &[Drawing]) {
+        self.level.apply(drawings);
     }
 
     /// Draws the original panel and its live values at their historical positions.

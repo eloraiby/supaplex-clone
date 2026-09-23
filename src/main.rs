@@ -604,7 +604,7 @@ fn play_level(
         if destroy_murphy {
             // The simulation owns blast construction and terminal timing. A
             // repeated Escape during the death sequence is an intentional no-op.
-            renderer.apply_board_changes(&game.destroy_murphy_with_changes());
+            renderer.apply_drawings(&game.destroy_murphy_with_drawings());
         }
 
         let mut processed_steps = 0;
@@ -615,7 +615,7 @@ fn play_level(
                 action: keyboard.is_scancode_pressed(Scancode::Space)
                     || keyboard.is_scancode_pressed(Scancode::LAlt),
             };
-            renderer.apply_board_changes(&game.tick_with_changes(input));
+            renderer.apply_drawings(&game.tick_with_drawings(input));
             if game.status() == GameStatus::Completed && completion_tick.is_none() {
                 // Capture the instant completion first appears so the original
                 // terminal delay does not inflate persistent player time.
@@ -767,7 +767,7 @@ fn play_demo(
         let mut processed_steps = 0;
         while accumulator >= step && processed_steps < MAX_STEPS_PER_FRAME && !stream_finished {
             if let Some(input) = playback.next() {
-                renderer.apply_board_changes(&game.tick_with_changes(input));
+                renderer.apply_drawings(&game.tick_with_drawings(input));
                 if let Some(audio) = audio.as_mut() {
                     // Demo effects pass through the same one-channel priority
                     // gate as live play while recorded input remains immutable.
