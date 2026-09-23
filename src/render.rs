@@ -1059,17 +1059,30 @@ fn zonk_sprite_part(phase: RoundedPhase) -> Option<SpritePart> {
             offset_x: 0,
             offset_y: -16 + i32::from(frame.index()) * 2,
         }),
-        RoundedPhase::Rolling { direction, frame } => Some(rounded_roll_part(
-            SourcePoint {
-                x: i32::from(frame.index()) * 32,
-                y: match direction {
-                    Horizontal::Left => 84,
-                    Horizontal::Right => 100,
-                },
-            },
-            direction,
-            frame,
-        )),
+        RoundedPhase::Rolling { direction, frame } => {
+            let frame = frame.index();
+            Some({
+                let source_y = if direction == Horizontal::Left {
+                    84
+                } else {
+                    100
+                };
+                SpritePart {
+                    source: crate::murphy_animation::SourcePoint {
+                        x: i32::from(frame) * 32,
+                        y: source_y,
+                    },
+                    width: 32,
+                    height: 16,
+                    offset_x: if direction == Horizontal::Right {
+                        -16
+                    } else {
+                        0
+                    },
+                    offset_y: 0,
+                }
+            })
+        }
         RoundedPhase::Resting
         | RoundedPhase::Momentum
         | RoundedPhase::AwaitingFall
@@ -1089,66 +1102,37 @@ fn infotron_sprite_part(phase: RoundedPhase) -> Option<SpritePart> {
             offset_y: -16 + i32::from(frame.index()) * 2,
         }),
         RoundedPhase::Rolling { direction, frame } => {
-            // Preserve the original left-strip pointer, including frame four.
-            const LEFT_X: [i32; 8] = [0, 32, 64, 96, 8, 160, 192, 224];
-            let source = match direction {
-                Horizontal::Left => SourcePoint {
-                    x: LEFT_X[usize::from(frame.index())],
-                    y: 164,
-                },
-                Horizontal::Right => SourcePoint {
-                    x: i32::from(frame.index()) * 32,
-                    y: 180,
-                },
-            };
-            Some(rounded_roll_part(source, direction, frame))
+            let frame = frame.index();
+            Some({
+                // Frame four of the left strip really begins at x=8 in the
+                // original pointer table. Preserve that historical coordinate.
+                const LEFT_X: [i32; 8] = [0, 32, 64, 96, 8, 160, 192, 224];
+                let (source_x, source_y) = if direction == Horizontal::Left {
+                    (LEFT_X[usize::from(frame)], 164)
+                } else {
+                    (i32::from(frame) * 32, 180)
+                };
+                SpritePart {
+                    source: crate::murphy_animation::SourcePoint {
+                        x: source_x,
+                        y: source_y,
+                    },
+                    width: 32,
+                    height: 16,
+                    offset_x: if direction == Horizontal::Right {
+                        -16
+                    } else {
+                        0
+                    },
+                    offset_y: 0,
+                }
+            })
         }
         RoundedPhase::Resting
         | RoundedPhase::Momentum
         | RoundedPhase::AwaitingFall
         | RoundedPhase::PreparingRoll(_)
         | RoundedPhase::Held => None,
-    }
-}
-
-/// Maps a rounded roll to the cells its current picture still needs to paint.
-fn rounded_roll_part(
-    mut source: SourcePoint,
-    direction: Horizontal,
-    frame: Frame<8>,
-) -> SpritePart {
-    // At the last picture the object fits wholly inside its destination. The
-    // other half of the DOS rectangle only erased the previous framebuffer;
-    // that source is now available to another actor. A freshly cleared scene
-    // must draw the destination picture without repeating that obsolete erase.
-    match (frame.index(), direction) {
-        (7, Horizontal::Left) => SpritePart {
-            source,
-            width: 16,
-            height: 16,
-            offset_x: 0,
-            offset_y: 0,
-        },
-        (7, Horizontal::Right) => {
-            source.x += 16;
-            SpritePart {
-                source,
-                width: 16,
-                height: 16,
-                offset_x: 0,
-                offset_y: 0,
-            }
-        }
-        (_, direction) => SpritePart {
-            source,
-            width: 32,
-            height: 16,
-            offset_x: match direction {
-                Horizontal::Left => 0,
-                Horizontal::Right => -16,
-            },
-            offset_y: 0,
-        },
     }
 }
 
@@ -1806,144 +1790,6 @@ mod tests {
         assets,
     };
 
-    /// Replays both push/roll/drop directions against the actual sprite pixels.
-    #[test]
-    fn pushed_zonk_roll_and_drop_do_not_paint_over_murphy() {
-        use crate::{
-            actors::Actor,
-            game::{Game, Input},
-            level::{LEVEL_RECORD_SIZE, LEVEL_WIDTH, LevelSet},
-        };
-        let graphics = assets::load_graphics().unwrap();
-        let mut opaque = decode_png(graphics.moving.as_ref()).unwrap();
-        apply_black_pixel_policy(&mut opaque.pixels, BlackPixelPolicy::Opaque);
-
-        for direction in [Direction::Left, Direction::Right] {
-            let mut bytes = vec![0; LEVEL_RECORD_SIZE];
-            bytes[..60 * 24].fill(6);
-            for y in 1..7 {
-                for x in 1..9 {
-                    bytes[y * LEVEL_WIDTH + x] = 0;
-                }
-            }
-            let (start, support) = match direction {
-                Direction::Left => (5, 3),
-                Direction::Right => (3, 5),
-                _ => unreachable!(),
-            };
-            // Push the rock off hardware onto a RAM chip; continued movement
-            // follows it through a roll and into its newly released fall source.
-            bytes[2 * LEVEL_WIDTH + start] = 3;
-            bytes[2 * LEVEL_WIDTH + 4] = 1;
-            bytes[3 * LEVEL_WIDTH + 4] = 6;
-            bytes[3 * LEVEL_WIDTH + support] = 5;
-            let level = LevelSet::new(&bytes).load(1).unwrap();
-            let mut game = Game::with_random_seed(&level, 0).unwrap();
-            let mut checked_fall = false;
-            let mut checked_roll = false;
-            for _ in 0..32 {
-                game.tick(Input {
-                    direction: Some(direction),
-                    action: false,
-                });
-                let position = game.murphy_position().unwrap();
-                let murphy_actor = game.board().state(position).unwrap().actor();
-                let Actor::Murphy(murphy) = murphy_actor else {
-                    unreachable!()
-                };
-                let Some((action, frame)) = murphy.sprite_pose() else {
-                    continue;
-                };
-                let player = crate::murphy_animation::sprite_parts(action, frame).primary;
-                let mx = position.x as i32 * 16 + player.offset_x;
-                let my = position.y as i32 * 16 + player.offset_y;
-                for (index, state) in game.board().cells().iter().enumerate() {
-                    let Actor::Zonk(zonk) = state.actor() else {
-                        continue;
-                    };
-                    let Some(part) = zonk_sprite_part(zonk.phase()) else {
-                        continue;
-                    };
-                    let zpos = game.board().position(index).unwrap();
-                    let zx = zpos.x as i32 * 16 + part.offset_x;
-                    let zy = zpos.y as i32 * 16 + part.offset_y;
-                    match zonk.phase() {
-                        RoundedPhase::Falling(_) => checked_fall = true,
-                        RoundedPhase::Rolling { .. } => checked_roll = true,
-                        _ => unreachable!(),
-                    }
-                    // The ordinary renderer uses opaque copies in board order.
-                    // A later Zonk must never erase a colored Murphy pixel.
-                    if index < game.board().index(position).unwrap() {
-                        continue;
-                    }
-                    let rows = part.height as i32;
-                    for y in 0..rows {
-                        for x in 0..part.width as i32 {
-                            let px = zx + x - mx;
-                            let py = zy + y - my;
-                            if px < 0
-                                || py < 0
-                                || px >= player.width as i32
-                                || py >= player.height as i32
-                            {
-                                continue;
-                            }
-                            let rock_offset =
-                                (((part.source.y + y) * 320 + part.source.x + x) * 4) as usize;
-                            let player_offset =
-                                (((player.source.y + py) * 320 + player.source.x + px) * 4)
-                                    as usize;
-                            let rock = &opaque.pixels[rock_offset..rock_offset + 4];
-                            let player_pixel = &opaque.pixels[player_offset..player_offset + 4];
-                            assert!(
-                                rock[..3] != [0, 0, 0] || player_pixel[..3] == [0, 0, 0],
-                                "{direction:?}: {:?} erases Murphy",
-                                zonk.phase()
-                            );
-                        }
-                    }
-                }
-            }
-            assert!(checked_roll, "fixture must reach the final roll frame");
-            assert!(checked_fall, "fixture must exercise the drop after rolling");
-        }
-    }
-
-    /// Terminal roll pictures omit only black erase data from a released cell.
-    #[test]
-    fn completed_rounded_rolls_draw_only_the_destination_cell() {
-        let graphics = assets::load_graphics().unwrap();
-        let image = decode_png(graphics.moving.as_ref()).unwrap();
-        for direction in [Horizontal::Left, Horizontal::Right] {
-            let phase = RoundedPhase::Rolling {
-                direction,
-                frame: Frame::new(7).unwrap(),
-            };
-            for part in [
-                zonk_sprite_part(phase).unwrap(),
-                infotron_sprite_part(phase).unwrap(),
-            ] {
-                assert_eq!(
-                    (part.width, part.height, part.offset_x, part.offset_y),
-                    (16, 16, 0, 0)
-                );
-                let erased_x = match direction {
-                    Horizontal::Left => part.source.x + 16,
-                    Horizontal::Right => part.source.x - 16,
-                };
-                // This is a descriptor-boundary correction, not a colorkey:
-                // the discarded half contains no actor artwork of any color.
-                for y in part.source.y..part.source.y + 16 {
-                    for x in erased_x..erased_x + 16 {
-                        let offset = ((y * image.width as i32 + x) * 4) as usize;
-                        assert_eq!(image.pixels[offset..offset + 3], [0, 0, 0]);
-                    }
-                }
-            }
-        }
-    }
-
     /// Confirms all production resources decode to their contracted RGBA sizes.
     #[test]
     fn production_render_assets_are_valid_rgba_pngs() {
@@ -2330,21 +2176,8 @@ mod tests {
             record(infotron_sprite_part(RoundedPhase::Falling(frame)).unwrap());
             record(orange_sprite_part(frame));
             for direction in [Horizontal::Left, Horizontal::Right] {
-                for mut part in [
-                    zonk_sprite_part(RoundedPhase::Rolling { direction, frame }).unwrap(),
-                    infotron_sprite_part(RoundedPhase::Rolling { direction, frame }).unwrap(),
-                ] {
-                    // Normalize the four terminal pictures to the historical
-                    // erase rectangle; a separate test checks their safe bounds.
-                    if index == 7 {
-                        part.width = 32;
-                        if direction == Horizontal::Right {
-                            part.source.x -= 16;
-                            part.offset_x = -16;
-                        }
-                    }
-                    record(part);
-                }
+                record(zonk_sprite_part(RoundedPhase::Rolling { direction, frame }).unwrap());
+                record(infotron_sprite_part(RoundedPhase::Rolling { direction, frame }).unwrap());
             }
             for turn in [EnemyTurn::Left, EnemyTurn::Right] {
                 record(snik_snak_sprite_part(EnemyPhase::Turning { turn, frame }));

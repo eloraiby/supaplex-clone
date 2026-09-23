@@ -265,19 +265,14 @@ drawn as empty space, and has no reveal-on-touch transition.
 Logical movement occupies the destination at animation start while its source
 becomes an invisible `Vacating` reservation. The destination sprite is offset
 toward that source and owns the reservation's release; temporary Space markers
-do not receive autonomous callbacks. Zonk and Infotron rolls reserve both the
-horizontal source and the cell below the destination. Their trailing source
-remains blocked through pictures zero to five and is released at picture six.
-The following drop uses the same atomic source-reserving transfer as a straight
-fall; it cannot expose its source at animation start. Falling sources likewise
-release at picture six (original state `0x16`). Murphy releases his
+do not receive autonomous original callbacks. Falling Zonks and Infotrons clear
+their source on state `0x16`, before their last two pictures. Murphy releases his
 old cell while retaining the final moving pose, and processes new direction
 input on his next update. A trailing Zonk that sees the newly opened cell later
 in the same pass first enters `RoundedPhase::AwaitingFall`; it transfers only on the following
 pass, after Murphy has received that next input. Explosions that replace a
-moving or rolling Zonk/Infotron clear all surviving reservations owned by that
-phase, including both cells held during a roll. Cleanup checks the live marker
-before clearing it, so an explosion or another replacement occupant survives. Murphy may collect only idle Infotrons when snapping or
+moving or rolling Zonk/Infotron clear the reservation selected by that actor's
+live movement phase. Murphy may collect only idle Infotrons when snapping or
 moving up, left, or right; ordinary downward movement retains the original
 tile-only collision check.
 
@@ -335,31 +330,27 @@ event timing, effect priorities, direct `BLASTER.SND` VOC extraction, direct
 `ADLIB.SND` validation, sequencing and synthesis, and fixed-strip bounds.
 Compile-fail documentation tests reject mismatched actor phases, vertical rolls
 and rock pushes, wrong-length frame payloads, unchecked frame construction, and
-arbitrary actor/animation pairing. `tests/demo_replay.rs` checks all ten demo
-histories over 46,199 input ticks, including every cell's sprite timing and
-collision state, game counters, and emitted sounds. Its current fingerprints
-include the rounded-source ownership correction. Earlier fingerprints preserved
-prematurely released roll and drop sources; they are retained in Git history,
-not asserted as correct behavior. These checks do not establish full upstream
-parity or imply that every bundled demo completes its level.
+arbitrary actor/animation pairing. `tests/demo_replay.rs` compares all ten demo
+histories with pre-refactor fixtures over 46,199 input ticks, including every
+cell's sprite timing and collision state, game counters, and emitted sounds.
+These fixtures preserve existing behavior; they do not assert that every legacy
+demo currently completes its level. Rendering tests also compare all 182 original
+gravity, enemy, Bug, and explosion rectangles with a pre-refactor fingerprint,
+and check terrain layering and camera interpolation directly from typed phases.
 
-Focused movement tests independently verify source lifetime for both rounded
-actors in both directions and reservation cleanup after destruction. A mirrored
-push–roll–fall fixture checks the actual opaque sprite pixels against Murphy's
-pixels. It fails if either the source reservations are removed or the obsolete
-final-roll erase is restored. Verification uses simulation and pixel data rather
-than an interactive window capture.
+Source release and animation completion are distinct events. In
+[OpenSupaplex's rounded-object update routines](https://github.com/sergiou87/open-supaplex/blob/master/src/supaplex.c),
+roll sources release at states `0x26`/`0x36` and falling sources at `0x16`,
+before their final pictures. The routines draw the current picture before
+advancing the state, and the preparation pictures belong to the roll's eight
+pictures. These counters must not be treated as interchangeable with a
+post-update snapshot frame without checking the full transition sequence.
 
-The renderer retains opaque original artwork and its ordinary terrain/movement
-passes. The final horizontal roll picture fits entirely within the destination;
-its extra DOS source-clearing half is omitted because that cell has been released
-for another actor. This rule applies to both Zonks and Infotrons. No Zonk-specific
-texture, transparency heuristic, or priority pass is needed. Atlas tests verify
-that the four omitted halves contain only black erase data; the 182-rectangle
-historical fingerprint is checked after restoring those halves for comparison.
-
-The source reservation sequence is corroborated by the upstream
-[`updateZonkTiles` and `updateInfotronTiles` implementation](https://github.com/sergiou87/open-supaplex/blob/master/src/supaplex.c).
+Known rendering issue: when Murphy follows a pushed Zonk through a roll and
+fall, opaque animation erase rectangles can paint over him. The gameplay
+following window must be preserved when correcting this presentation issue.
+The replay fingerprints verify existing behavior, not full OpenSupaplex parity
+or the correctness of every rendered frame.
 
 Format and mapping references:
 
@@ -367,5 +358,5 @@ Format and mapping references:
 - [OpenSupaplex tile and level definitions](https://github.com/sergiou87/open-supaplex/blob/master/src/globals.h)
 
 The historical replay fixture encoding lives only in `tests/support/legacy_snapshot.rs`.
-It translates typed state into the historical fixture vocabulary. Production
-simulation and rendering do not use that encoding.
+It translates typed state into the original fixture text so the pre-refactor
+fingerprints remain unchanged; production simulation and rendering do not use it.
