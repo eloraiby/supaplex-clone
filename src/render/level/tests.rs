@@ -693,3 +693,114 @@ fn every_snap_finishes_with_no_target_pixels() {
     }
     assert!(failures.is_empty(), "{}", failures.join("\n"));
 }
+
+/// Submitting an already resolved board preserves both allocations and displayed pixels.
+#[test]
+fn repeated_frame_submission_does_not_swap_or_advance_pictures() {
+    let level = push_level(Direction::Right);
+    let mut game = Game::with_random_seed(&level, 0).unwrap();
+    let mut saved = bitmap();
+    saved.reset(game.board()).unwrap();
+    for _ in 0..40 {
+        game.tick(Input {
+            direction: Some(Direction::Right),
+            action: false,
+        });
+        saved.update(&game);
+        let pixels = saved.pixels.clone();
+        let frames = saved.frames.as_ref().unwrap();
+        let previous = frames.previous.cells().as_ptr();
+        let current = frames.current.cells().as_ptr();
+        // Model the texture upload: a repeated submission must not dirty it again.
+        saved.dirty = false;
+        saved.update(&game);
+        let frames = saved.frames.as_ref().unwrap();
+        assert_eq!(frames.previous.cells().as_ptr(), previous);
+        assert_eq!(frames.current.cells().as_ptr(), current);
+        assert_eq!(saved.pixels, pixels);
+        assert!(!saved.dirty);
+    }
+}
+
+/// An Escape blast between ticks changes its cells without consuming distant fall frames.
+#[test]
+fn immediate_death_preserves_unaffected_actors_at_the_same_tick() {
+    let mut record = vec![0; LEVEL_RECORD_SIZE];
+    record[..60 * 24].fill(6);
+    record[2 * LEVEL_WIDTH + 2] = 3;
+    record[2 * LEVEL_WIDTH + 7] = 1;
+    for y in 3..8 {
+        record[y * LEVEL_WIDTH + 7] = 0;
+    }
+    let level = LevelSet::new(&record).load(1).unwrap();
+    // Include the pending first picture and every remaining in-flight picture.
+    for steps in 2..10 {
+        let mut game = Game::with_random_seed(&level, 0).unwrap();
+        let mut saved = bitmap();
+        saved.reset(game.board()).unwrap();
+        for _ in 0..steps {
+            game.tick(Input::default());
+            saved.update(&game);
+        }
+        let before = saved.pixels.clone();
+        let tick = game.tick_count();
+        game.destroy_murphy();
+        saved.update(&game);
+        assert_eq!(game.tick_count(), tick);
+        assert_ne!(saved.pixels, before, "the immediate blast must be visible");
+        assert_eq!(&saved.frames.as_ref().unwrap().previous, game.board());
+        for y in 0..before.height as usize {
+            for x in 7 * 16..8 * 16 {
+                assert_eq!(
+                    pixel(&saved.pixels, x, y),
+                    pixel(&before, x, y),
+                    "death at tick {steps} advanced the distant rock at ({x}, {y})"
+                );
+            }
+        }
+    }
+}
+
+/// A Terminal's single cached sprite exactly retains the original scanline scroll.
+#[test]
+fn terminal_cache_matches_every_original_scroll_phase() {
+    let saved = bitmap();
+    let mut terminal = crate::actors::Terminal::new();
+    for phase in 0..7 {
+        let parts = actor_sprites(&Actor::Terminal(terminal));
+        let sprites = parts.iter().collect::<Vec<_>>();
+        assert_eq!(sprites.len(), 1);
+        let Blit::Terminal(part) = sprites[0] else {
+            panic!("a Terminal must resolve to its complete cached tile");
+        };
+        assert_eq!(part.width, 16);
+        assert_eq!(part.height, 16);
+        assert_eq!(part.source.x, phase * 16);
+        for y in 0..16 {
+            // Original scrolls cycle seven pattern rows and repeat the top row
+            // in the eighth screen line. The initial tile uses its original row 2.
+            let rows = [
+                [2, 3, 4, 5, 6, 7, 8, 9],
+                [3, 4, 5, 6, 7, 8, 9, 3],
+                [4, 5, 6, 7, 8, 9, 3, 4],
+                [5, 6, 7, 8, 9, 3, 4, 5],
+                [6, 7, 8, 9, 3, 4, 5, 6],
+                [7, 8, 9, 3, 4, 5, 6, 7],
+                [8, 9, 3, 4, 5, 6, 7, 8],
+            ];
+            let source_y = if (2..=9).contains(&y) {
+                rows[phase as usize][y - 2]
+            } else {
+                y
+            };
+            for x in 0..16 {
+                assert_eq!(
+                    pixel(&saved.terminal, phase as usize * 16 + x, y),
+                    pixel(&saved.fixed, 19 * 16 + x, source_y),
+                    "phase {phase}, ({x}, {y})"
+                );
+            }
+        }
+        terminal = terminal.after_scroll(-1);
+    }
+}

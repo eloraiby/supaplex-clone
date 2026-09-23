@@ -397,3 +397,6 @@ pub(super) fn cell_sprites(
         _ => actor_sprites(after),
     }
 }
+
+#[cfg(test)]
+mod tests;
