@@ -213,9 +213,10 @@ Shared responsibilities are separated by concern:
 | `actors/enemy.rs` | Legal enemy phases and eight-picture turn mapping |
 | `actors/empty.rs` | Explicit source, side, and destination reservations |
 | `render.rs` | Front-end drawing, camera, HUD, and typed sprite geometry |
-| `render/level.rs` | Persistent level bitmap consuming explicit actor pictures in callback order |
+| `render/cell.rs` | Pure previous/current cell selectors returning at most two opaque sprites |
+| `render/level.rs` | Reusable cell buffers, frame swapping, level bitmap, and texture upload |
 | `actors/state.rs` | Complete cell values and level/session construction boundaries |
-| `actors/transition.rs` | Explicit typed pictures, atomic cell writes, and session events |
+| `actors/transition.rs` | Atomic cell writes and session events |
 
 Murphy's preparation, planting, movement, snapping, pushing, port traversal, and
 exit sequence belong to one phase enum. They cannot coexist as independent
@@ -230,10 +231,10 @@ shared animation-kind enum, generic animation object, or `State::animation()`
 API. Enemy sprite selectors accept `EnemyPhase`; rock selectors accept
 `RoundedPhase`; Bug and explosion tables take their own bounded frames.
 Murphy's own artwork descriptor selects the original composite sprite tables.
-Gameplay stores actor-owned state; rendering consumes the typed pictures explicitly
-emitted by actor transitions. A terminal picture can be emitted even when the
-actor completes or transfers in that callback. `Frame<N>`
-rejects external indices outside its strip, and its private representation
+Gameplay stores actor-owned state. Rendering compares previous and current cell
+states to select each actor's one or two sprites. The previous state retains the
+phase needed to resolve the last picture when an action completes or transfers.
+`Frame<N>` rejects external indices outside its strip, and its private representation
 prevents unchecked construction. Runtime checks still handle board occupancy,
 bounds, and reservations replaced by earlier actors; these depend on the live
 world rather than on an individual actor's type.
@@ -242,9 +243,9 @@ Actor callbacks take `&self` because they compute owned replacement states from
 an immutable world view. The game applies transitions with exclusive mutable
 access to the board. No `Any`, downcasting, `Cell`, or `RefCell` is needed.
 When adding an actor, define its legal phases and completion behavior in its
-own module, add its typed sprite selector, and wire its identity into dispatch and
-collision queries. Scheduling, shared RNG, and the position-owned planted Red
-Disk fuse remain in `game.rs`.
+own module, add its typed sprite selector and previous/current cell cases, and
+wire its identity into dispatch and collision queries. Scheduling, shared RNG,
+and the position-owned planted Red Disk fuse remain in `game.rs`.
 
 Every fixed tick follows the original deterministic linear order:
 
@@ -350,17 +351,25 @@ advancing the state, and the preparation pictures belong to the roll's eight
 pictures. These counters must not be treated as interchangeable with a
 post-update snapshot frame without checking the full transition sequence.
 
-Actor transitions produce three separate effects: typed `Drawing` pictures,
-atomic cell writes, and immediate session events. `Game::tick_with_drawings`
-retains pictures in execution order: Murphy first, then the captured row-major
-callbacks and their events, then session timers. `Board::set` does not imply a
-picture. Ordinary `Game::tick` uses the same simulation without retaining output.
+Actor transitions produce atomic cell writes and immediate session events.
+`Game::tick` performs the Murphy-first simulation without producing graphics.
+`render/cell.rs` borrows the previous and current typed boards and resolves each
+actor to `Sprites::None`, `One`, or `Two`. Atlas coordinates, transfer anchors,
+and completion pictures belong to these pure selectors; the simulation has no
+`Drawing` type or recording API.
 
-Drawing and completion occur in the same callback. For example, Infotron snapping
-emits the final original rectangle at `(304, 148)` before it removes the held
-Infotron and records collection. That empty picture erases the preceding frame's
-ten remaining colored pixels. The same contract preserves terminal push, port,
-and exit pictures at their original anchors. No extra completion tick is needed.
+`render/level.rs` owns two reusable cell buffers. A level start initializes both
+from the loaded board. After each tick, it copies the live board into the current
+buffer, resolves Murphy and then the remaining cells in row-major order, and
+swaps the buffers **after** applying their opaque sprites. Copying reuses the
+existing cell allocations. The game retains exclusive ownership of its live board.
+
+Both cell states matter at completion. For example, when Infotron snapping
+changes from `Snapping` to `Ready`, the previous action selects its final original
+rectangle at `(304, 148)`, even though the current target is already empty. That
+picture erases the preceding frame's ten remaining colored pixels. Push, port,
+and exit completion likewise keep the previous action's descriptor and anchor.
+No synthetic actor or extra completion tick is needed.
 
 Rounded-object frames identify the **next picture to draw**. Preparation consumes
 the first two pictures of the eight-picture roll while the actor still owns its
@@ -373,19 +382,22 @@ continued falls reserve the next destination and resume on the next callback.
 This follows the original collision windows instead of opening cells early to
 match a renderer's post-update snapshot.
 
-`render/level.rs` applies emitted pictures to one persistent board bitmap at the
-original 16-pixel tile resolution. Copies are opaque, including all black erase
-pixels. Normal reservation release is silent; destruction of moving artwork by
-a blast explicitly emits its cleanup. Target material and held push targets stay
-in the bitmap until the original action strip erases them. Stopping at a wall
-retains the completed movement picture until an actor emits another picture.
+The selected sprites update one persistent level bitmap at the original
+16-pixel tile resolution. Copies include all original black erase pixels.
+Normal reservation release contributes no separate Space sprite. When a blast
+destroys the reservation's owner, the cell pair instead resolves the released
+footprint; cells occupied by explosions retain their explosion artwork. Held
+material stays until the action strip erases it. Terminals select one complete
+tile from seven cached scroll phases.
 
-The application initializes the bitmap before each level's entry fade, applies
-pictures after every fixed tick, and replaces the bitmap on restart. Demos use
-the same path. Escape uses `destroy_murphy_with_drawings` so its immediate blast
-appears even when no fixed tick is due. Display refreshes upload changed pixels
-and copy the camera's view. Catch-up ticks preserve every intervening copy while
-sharing one texture upload; camera movement never replays actor drawings.
+Live play and demos call `Renderer::update_level(&game)` after every simulation
+tick, including every catch-up tick before a display refresh. Escape calls the
+same method after `Game::destroy_murphy`; changed cells are resolved immediately,
+while unchanged actors keep their current picture because no tick elapsed.
+Submitting the same tick and board again leaves the buffers and pixels unchanged.
+Restart initializes both buffers and replaces the bitmap. Display refreshes only
+upload changed pixels and copy the camera's view, so moving the camera or drawing
+the display twice cannot advance an actor or swap the cell buffers.
 
 The callback order and opaque-copy contract follow
 [OpenSupaplex's simulation](https://github.com/sergiou87/open-supaplex/blob/bad56a4e174e628643995284ea55d4c49af3137c/src/supaplex.c)
@@ -403,8 +415,11 @@ order, reservation destruction, retained material, clipping, restart, and six
 ticks accumulated before presentation. A hidden SDL software renderer compares
 displayed pixels with the saved bitmap, checks repeated display frames and camera
 movement, and verifies immediate death rendering. The 182 sprite-rectangle
-fingerprint remains unchanged. Each bundled demo also runs with and without
-drawing capture and compares boards, counters, toggles, status, and sounds.
+fingerprint remains unchanged. Additional cell-buffer tests verify allocation reuse
+and swapping, idempotent frame submission, frozen preparation, replaced actors,
+single-sprite transfers, and every cached Terminal phase. Immediate death tests
+also verify that a distant falling actor's pixels do not advance between ticks.
+The ten bundled demo hashes remain unchanged by this rendering refactor.
 
 Format and mapping references:
 

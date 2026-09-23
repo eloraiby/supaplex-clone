@@ -53,3 +53,14 @@ The original clone replay hashes cannot serve as an oracle for these corrections
 they encoded the early source release and old rounded timing. Updated hashes in
 `demo_replay.rs` guard the corrected behavior across all bundled inputs. They do
 not replace these independent reference traces or claim full upstream parity.
+
+The renderer tests now use ordinary `Game::tick` updates and compare consecutive
+typed cell buffers. The snap fixture checks the bounded sprites selected from
+those pairs; the walk, push, and follow fixtures compare the complete resulting
+bitmap after each tick. Production code consumes each cell's sprites immediately
+and swaps the two reusable buffers when the frame is complete. The test-only
+collection used for literal `BLIT` comparisons is not a simulation graphics queue.
+
+These fixtures and demo hashes were kept unchanged when replacing the Drawing
+API with cell-buffer rendering. Separate tests cover buffer reuse, repeated frame
+submission, immediate commands without a tick, and Terminal sprite caching.
