@@ -701,4 +701,51 @@ mod tests {
                 .all(|p| *p == [17, 31, 47, 255])
         );
     }
+    /// A completed adjacent collection must leave its entire target cell black.
+    #[test]
+    fn every_snap_finishes_with_no_target_pixels() {
+        let mut failures = Vec::new();
+        for tile in [4, 2, 20] {
+            for direction in Direction::ALL {
+                let mut record = vec![0; LEVEL_RECORD_SIZE];
+                record[..60 * 24].fill(6);
+                let origin = Position::new(4, 3);
+                let target = match direction {
+                    Direction::Up => Position::new(4, 2),
+                    Direction::Down => Position::new(4, 4),
+                    Direction::Left => Position::new(3, 3),
+                    Direction::Right => Position::new(5, 3),
+                };
+                record[origin.y * LEVEL_WIDTH + origin.x] = 3;
+                record[target.y * LEVEL_WIDTH + target.x] = tile;
+                let level = LevelSet::new(&record).load(1).unwrap();
+                let mut game = Game::with_random_seed(&level, 0).unwrap();
+                let mut saved = bitmap();
+                saved.reset(game.board()).unwrap();
+                for _ in 0..12 {
+                    saved.apply(&game.tick_with_changes(Input {
+                        direction: Some(direction),
+                        action: true,
+                    }));
+                }
+                assert!(game.board().state(target).unwrap().is_empty());
+                let mut remaining = Vec::new();
+                for y in 0..16 {
+                    for x in 0..16 {
+                        if pixel(&saved.pixels, target.x * 16 + x, target.y * 16 + y)
+                            != [0, 0, 0, 255]
+                        {
+                            remaining.push((x, y));
+                        }
+                    }
+                }
+                if !remaining.is_empty() {
+                    failures.push(format!(
+                        "tile {tile}, {direction:?}: remaining {remaining:?}"
+                    ));
+                }
+            }
+        }
+        assert!(failures.is_empty(), "{}", failures.join("\n"));
+    }
 }
