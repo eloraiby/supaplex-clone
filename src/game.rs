@@ -11,10 +11,10 @@ use crate::actors::{empty::Reservation, murphy::MurphyPhase};
 
 use crate::{
     actors::{
-        Actor, Base, Bug, CHAIN_REACTION_FRAMES, Direction, Drawing, Electron, Empty, Exit,
-        GameEvent, Hardware, Infotron, InvisibleWall, Murphy, OrangeDisk, Port, PortDirections,
-        Position, RED_DISK_DETONATION_COUNTDOWN, RamChip, RamChipShape, RedDisk, SnikSnak, State,
-        Terminal, Transition, YellowDisk, Zonk,
+        Actor, Base, Bug, CHAIN_REACTION_FRAMES, Direction, Electron, Empty, Exit, GameEvent,
+        Hardware, Infotron, InvisibleWall, Murphy, OrangeDisk, Port, PortDirections, Position,
+        RED_DISK_DETONATION_COUNTDOWN, RamChip, RamChipShape, RedDisk, SnikSnak, State, Terminal,
+        Transition, YellowDisk, Zonk,
     },
     level::{LEVEL_HEIGHT, LEVEL_WIDTH, Level, SpecialPort},
 };
@@ -59,6 +59,16 @@ impl Board {
             height,
             cells,
         })
+    }
+
+    /// Copies a same-size frame into reusable storage without reallocating its cells.
+    pub(crate) fn copy_from(&mut self, source: &Self) {
+        assert_eq!(
+            (self.width, self.height),
+            (source.width, source.height),
+            "a level change requires new frame buffers"
+        );
+        self.cells.clone_from(&source.cells);
     }
 
     /// Converts an already validated level's raw tile codes into actor states.
@@ -330,8 +340,6 @@ fn clock_random_seed() -> u16 {
 pub struct Game {
     /// Current live board mutated by the linear actor pass.
     board: Board,
-    /// Scoped output of explicit pictures; ordinary headless ticks retain none.
-    drawings: Option<Vec<Drawing>>,
     /// Level title used by the SDL HUD and window title.
     title: String,
     /// Required Infotrons not yet collected.
@@ -405,7 +413,6 @@ impl Game {
 
         Ok(Self {
             board,
-            drawings: None,
             title: level.title().to_owned(),
             remaining_infotrons,
             red_disks: 0,
@@ -527,35 +534,6 @@ impl Game {
         self.detonate_position(position);
     }
 
-    /// Advances one tick and returns explicit pictures in callback execution order.
-    pub fn tick_with_drawings(&mut self, input: Input) -> Vec<Drawing> {
-        // Execute exactly the ordinary simulation, retaining its drawing effects
-        // for the caller instead of inferring them from changed board cells.
-        self.record_drawings(|game| game.tick(input))
-    }
-
-    /// Records an explicit death request's immediate blast pictures without a tick.
-    pub fn destroy_murphy_with_drawings(&mut self) -> Vec<Drawing> {
-        self.record_drawings(Self::destroy_murphy)
-    }
-
-    /// Scopes presentation output so unused histories cannot grow between ticks.
-    fn record_drawings(&mut self, operation: impl FnOnce(&mut Self)) -> Vec<Drawing> {
-        debug_assert!(self.drawings.is_none(), "recording scopes cannot nest");
-        self.drawings = Some(Vec::new());
-        operation(self);
-        self.drawings
-            .take()
-            .expect("recording scope remains active")
-    }
-
-    /// Appends a session-owned picture at the exact point its event occurs.
-    fn draw_actor(&mut self, position: Position, actor: Actor) {
-        if let Some(drawings) = &mut self.drawings {
-            drawings.push(Drawing { position, actor });
-        }
-    }
-
     /// Applies one Murphy-first, row-major simulation step to the live board.
     pub fn tick(&mut self, input: Input) {
         // A terminal status becomes final only after the original countdown.
@@ -659,11 +637,6 @@ impl Game {
     fn apply_transition(&mut self, transition: Transition) {
         // Actor helpers construct only bounded coordinates. Keeping writes in
         // one value ensures no other actor can observe a partially moved actor.
-        // An action can draw its last picture and complete in this callback.
-        // Retain that effect before its writes replace the stored actor phase.
-        if let Some(drawings) = &mut self.drawings {
-            drawings.extend(transition.drawings);
-        }
         for write in transition.writes {
             self.board
                 .set(write.position, write.state)
@@ -740,7 +713,6 @@ impl Game {
                     .is_some_and(|state| matches!(state.actor(), Actor::Bug(_)))
                 {
                     let state = State::dormant_bug(delay);
-                    self.draw_actor(position, state.actor().clone());
                     self.board
                         .set(position, state)
                         .expect("scheduled Bug position remains in bounds");
@@ -760,7 +732,6 @@ impl Game {
                     return;
                 };
                 let actor = Actor::Terminal(terminal.after_scroll(delay));
-                self.draw_actor(position, actor.clone());
                 self.board
                     .set(position, State::new(actor))
                     .expect("scheduled Terminal position remains in bounds");
@@ -866,7 +837,6 @@ impl Game {
                 // A visible State exposes the current animation frame, while
                 // this retained record lets Murphy cross without losing time.
                 let state = State::planted_red_disk(planted.countdown);
-                self.draw_actor(planted.position, state.actor().clone());
                 self.board
                     .set(planted.position, state)
                     .expect("stored planted-disk position must remain in bounds");
@@ -1234,7 +1204,6 @@ mod tests {
 
         Game {
             board: Board::new(width, height, cells).expect("fixture dimensions should match"),
-            drawings: None,
             title: "TEST".to_owned(),
             remaining_infotrons: required_infotrons,
             red_disks: 0,
@@ -1254,89 +1223,9 @@ mod tests {
         }
     }
 
-    /// Board writes are silent; immediate events explicitly emit their pictures.
+    /// Destroying a rolling actor releases the old source and preserves blast cells.
     #[test]
-    fn drawing_scopes_record_effects_without_interpreting_cell_mutations() {
-        let position = Position::new(2, 2);
-        let mut game = game_with(&[(position, State::new(Actor::Bug(Bug::new())))], 0);
-        let drawings = game.record_drawings(|game| {
-            game.board.set(position, State::dormant_bug(1)).unwrap();
-            game.apply_event(crate::actors::GameEvent::RandomizeBug(position));
-        });
-        assert_eq!(drawings.len(), 1);
-        assert_eq!(drawings[0].position, position);
-        assert_eq!(
-            &drawings[0].actor,
-            game.board.state(position).unwrap().actor()
-        );
-        assert!(game.drawings.is_none());
-        assert!(game.record_drawings(|_| {}).is_empty());
-        game.tick(Input::default());
-        assert!(game.drawings.is_none());
-    }
-
-    /// Murphy's callback precedes even an actor at a smaller linear board index.
-    #[test]
-    fn drawings_preserve_callback_order_even_across_board_indices() {
-        let rock = Position::new(2, 2);
-        let murphy = Position::new(4, 3);
-        let mut game = game_with(
-            &[
-                (
-                    rock,
-                    State::new(Actor::Zonk(Zonk::from_phase(
-                        crate::actors::rounded::RoundedPhase::Falling(crate::actors::Frame::first()),
-                    ))),
-                ),
-                (murphy, State::new(Actor::Murphy(Murphy::new()))),
-            ],
-            0,
-        );
-        let drawings = game.tick_with_drawings(Input {
-            direction: Some(Direction::Right),
-            action: false,
-        });
-        let player_picture = drawings
-            .iter()
-            .position(|drawing| matches!(drawing.actor, Actor::Murphy(_)))
-            .unwrap();
-        let rock_picture = drawings
-            .iter()
-            .position(|drawing| matches!(drawing.actor, Actor::Zonk(_)))
-            .unwrap();
-        assert!(player_picture < rock_picture);
-        assert!(
-            game.board.index(drawings[player_picture].position)
-                > game.board.index(drawings[rock_picture].position)
-        );
-    }
-
-    /// Escape's immediate blast is observable even when no fixed tick is due.
-    #[test]
-    fn explicit_death_records_all_blast_cells_without_advancing_time() {
-        let mut game = game_with(
-            &[(
-                Position::new(3, 3),
-                State::new(Actor::Murphy(Murphy::new())),
-            )],
-            0,
-        );
-        let drawings = game.destroy_murphy_with_drawings();
-        assert_eq!(game.tick_count(), 0);
-        assert_eq!(game.status(), GameStatus::Dead);
-        assert_eq!(drawings.len(), 9);
-        assert!(
-            drawings
-                .iter()
-                .all(|drawing| matches!(drawing.actor, Actor::Explosion(_)))
-        );
-        assert!(game.destroy_murphy_with_drawings().is_empty());
-        assert!(game.drawings.is_none());
-    }
-
-    /// A blast clears a rolling source outside its wave without clearing its own blast cells.
-    #[test]
-    fn blasts_release_both_rounded_roll_reservations_with_explicit_cleanup() {
+    fn blasts_release_both_rounded_roll_reservations() {
         use crate::actors::{Frame, Horizontal, empty::Reservation, rounded::RoundedPhase};
         for direction in [Horizontal::Left, Horizontal::Right] {
             for (frame, reservation) in [
@@ -1378,20 +1267,12 @@ mod tests {
                         ],
                         0,
                     );
-                    let drawings = game.record_drawings(|game| game.detonate_position(center));
+                    game.detonate_position(center);
                     assert!(game.board().state(source).unwrap().is_empty());
-                    assert!(drawings.iter().any(|drawing| drawing.position == source
-                        && matches!(drawing.actor, Actor::Empty(Empty::Space))));
                     assert!(matches!(
                         game.board().state(destination).unwrap().actor(),
                         Actor::Explosion(_)
                     ));
-                    assert!(
-                        !drawings
-                            .iter()
-                            .any(|drawing| drawing.position == destination
-                                && matches!(drawing.actor, Actor::Empty(_)))
-                    );
                 }
             }
         }

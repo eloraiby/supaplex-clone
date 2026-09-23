@@ -138,14 +138,7 @@ impl RoundedActor {
                         _ => {}
                     }
                 }
-                Some(
-                    transition.after_drawing(
-                        position,
-                        self.in_phase(RoundedPhase::Rolling { direction, frame })
-                            .actor()
-                            .clone(),
-                    ),
-                )
+                Some(transition)
             }
             RoundedPhase::Falling(frame) => {
                 let mut transition = match frame.next() {
@@ -171,17 +164,14 @@ impl RoundedActor {
                         .writes
                         .push(CellWrite::new(source, State::empty()));
                 }
-                // Drawing precedes state advancement, source release, and any
-                // landing blast. The last frame never requires an extra update.
-                Some(transition.after_drawing(
-                    position,
-                    self.in_phase(RoundedPhase::Falling(frame)).actor().clone(),
-                ))
+                // Completion, source release, and landing effects belong to
+                // this update; the previous cell retains the completed phase.
+                Some(transition)
             }
         }
     }
 
-    /// Paints the first two roll pictures before transferring logical ownership.
+    /// Advances the two source-owned preparation frames before transferring.
     fn prepare_slide(
         self,
         position: Position,
@@ -189,10 +179,6 @@ impl RoundedActor {
         frame: Frame<2>,
         world: &WorldView<'_>,
     ) -> Option<Transition> {
-        let picture = self
-            .in_phase(RoundedPhase::PreparingRoll { direction, frame })
-            .actor()
-            .clone();
         let waiting = self.in_phase(RoundedPhase::PreparingRoll {
             direction,
             frame: Frame::last(),
@@ -226,7 +212,7 @@ impl RoundedActor {
                 Vec::new(),
             ),
         };
-        Some(transition.after_drawing(position, picture))
+        Some(transition)
     }
 
     /// Ends the eighth roll picture by reserving the source of the pending fall.
@@ -290,14 +276,7 @@ impl RoundedActor {
         world: &WorldView<'_>,
     ) -> Option<Transition> {
         let (direction, side) = self.roll_candidate(position, world)?;
-        let picture = self.in_phase(RoundedPhase::PreparingRoll {
-            direction,
-            frame: Frame::first(),
-        });
-        Some(
-            self.reserve_roll_at(position, side, direction, Frame::last())
-                .with_drawing(position, picture.actor().clone()),
-        )
+        Some(self.reserve_roll_at(position, side, direction, Frame::last()))
     }
 
     /// Records source-owned preparation and its side marker as one atomic change.
@@ -334,7 +313,7 @@ impl RoundedActor {
         )
     }
 
-    /// Transfers a continuation and paints its first falling picture immediately.
+    /// Transfers a continuation after consuming its first falling phase.
     pub(super) fn resume_fall(self, position: Position, below: Position) -> Transition {
         Transition::new(
             vec![
@@ -347,12 +326,6 @@ impl RoundedActor {
                 ),
             ],
             Vec::new(),
-        )
-        .with_drawing(
-            below,
-            self.in_phase(RoundedPhase::Falling(Frame::first()))
-                .actor()
-                .clone(),
         )
     }
 }

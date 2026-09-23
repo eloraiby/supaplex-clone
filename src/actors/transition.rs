@@ -1,25 +1,11 @@
-//! Explicit pictures, atomic board writes, and session events emitted by actors.
+//! Atomic board writes and session events emitted by actor state machines.
 //!
 //! Actors inspect an immutable world and return replacement values. The game
-//! records pictures and commits writes and events before the next scheduled actor.
-//! A picture can describe the final animation frame while its writes complete the
-//! action. Cell changes alone never imply drawing; reservation releases are silent.
+//! commits each transition before invoking the next scheduled actor. Rendering
+//! compares complete previous/current frames and does not participate here.
 
-use super::{Actor, Direction, MurphyMoveTarget, Position, State};
+use super::{Direction, MurphyMoveTarget, Position, State};
 use crate::{game::SoundEffect, level::SpecialPort};
-
-/// An actor picture emitted during a simulation callback, independent of cell storage.
-///
-/// The actor owns its bounded phase, including a final picture which need not
-/// remain on the board after completion. Positions use original board cells;
-/// atlas coordinates and pixel copies belong exclusively to the renderer.
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub struct Drawing {
-    /// Anchor used by this picture, even if the actor transfers before tick end.
-    pub position: Position,
-    /// Complete typed picture; Space explicitly paints an empty cell.
-    pub actor: Actor,
-}
 
 /// One atomic write included in an actor's immediate board transition.
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -82,58 +68,19 @@ pub(crate) enum GameEvent {
 pub(crate) struct Transition {
     /// Cell replacements committed together before the next actor is updated.
     pub(crate) writes: Vec<CellWrite>,
-    /// Pictures emitted before completion writes and their immediate events.
-    pub(crate) drawings: Vec<Drawing>,
     /// Side effects applied after all cell replacements in this transition.
     pub(crate) events: Vec<GameEvent>,
 }
 
 impl Transition {
-    /// Creates a silent board transition; its owner adds pictures explicitly.
+    /// Groups cell replacements with their immediate session effects.
     pub(super) fn new(writes: Vec<CellWrite>, events: Vec<GameEvent>) -> Self {
-        Self {
-            writes,
-            drawings: Vec::new(),
-            events,
-        }
+        Self { writes, events }
     }
 
-    /// Commits a blast's separately constructed cell writes and ordered pictures.
-    pub(super) fn blast(
-        writes: Vec<CellWrite>,
-        events: Vec<GameEvent>,
-        drawings: Vec<Drawing>,
-    ) -> Self {
-        // The wave builder knows which cells explode and which are reservations
-        // being released. No consumer needs to infer that distinction afterward.
-        Self {
-            writes,
-            drawings,
-            events,
-        }
-    }
-
-    /// Replaces one cell without implying any change to the saved level pixels.
+    /// Replaces one cell as a complete, actor-owned state value.
     pub(super) fn replace(position: Position, state: State) -> Self {
         Self::new(vec![CellWrite::new(position, state)], Vec::new())
-    }
-
-    /// Replaces a cell and deliberately paints its new actor on this callback.
-    pub(super) fn paint(position: Position, state: State) -> Self {
-        let actor = state.actor().clone();
-        Self::replace(position, state).with_drawing(position, actor)
-    }
-
-    /// Adds an explicit picture without requiring that picture to survive in a cell.
-    pub(super) fn with_drawing(mut self, position: Position, actor: Actor) -> Self {
-        self.drawings.push(Drawing { position, actor });
-        self
-    }
-
-    /// Paints a terminal action picture before any completion or blast drawings.
-    pub(super) fn after_drawing(mut self, position: Position, actor: Actor) -> Self {
-        self.drawings.insert(0, Drawing { position, actor });
-        self
     }
 
     /// Transfers a rounded actor without consuming its first falling picture.
@@ -165,7 +112,6 @@ impl Transition {
             direction,
             frame: super::Frame::first(),
         });
-        let picture = state.actor().clone();
         Self::new(
             vec![
                 CellWrite::new(source, State::loaded_snik_snak_source(direction)),
@@ -173,7 +119,6 @@ impl Transition {
             ],
             Vec::new(),
         )
-        .with_drawing(destination, picture)
     }
 
     /// Begins an Electron transfer with its own source marker family.
@@ -187,7 +132,6 @@ impl Transition {
             direction,
             frame: super::Frame::first(),
         });
-        let picture = state.actor().clone();
         Self::new(
             vec![
                 CellWrite::new(source, State::loaded_electron_source(direction)),
@@ -195,7 +139,6 @@ impl Transition {
             ],
             Vec::new(),
         )
-        .with_drawing(destination, picture)
     }
 
     /// Starts a material-specific Murphy step without session side effects.
@@ -219,7 +162,6 @@ impl Transition {
         events: Vec<GameEvent>,
     ) -> Self {
         let (destination_state, duration) = actor.moving(direction, target);
-        let picture = destination_state.actor().clone();
         Self::new(
             vec![
                 CellWrite::new(source, State::vacating_for(direction, duration)),
@@ -227,6 +169,5 @@ impl Transition {
             ],
             events,
         )
-        .with_drawing(destination, picture)
     }
 }

@@ -9,8 +9,8 @@
 //! mapping accept only the concrete families whose rules they implement.
 //!
 //! Actor callbacks inspect an immutable world and return owned replacement
-//! values and explicit typed pictures, including terminal frames that no longer
-//! survive in cell storage. The game commits each transition with exclusive access before
+//! values. The renderer compares previous/current cell states independently.
+//! The game commits each transition with exclusive access before
 //! the next callback, preserving Murphy-first, row-major update semantics.
 
 #![warn(missing_docs)]
@@ -26,7 +26,6 @@ pub use enemy::EnemyTurn;
 pub use frame::Frame;
 pub use geometry::{Direction, Horizontal, Position};
 pub use state::State;
-pub use transition::Drawing;
 pub(crate) use transition::{CellWrite, GameEvent, Transition};
 
 pub mod base;

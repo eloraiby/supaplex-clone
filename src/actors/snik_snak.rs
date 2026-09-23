@@ -41,7 +41,7 @@ impl SnikSnak {
             EnemyPhase::Moving { direction, frame } => match frame.index() {
                 6 => Some(self.advance_penultimate_movement(position, direction, world)),
                 _ => Some(match frame.next() {
-                    Some(frame) => Transition::paint(
+                    Some(frame) => Transition::replace(
                         position,
                         self.in_phase(EnemyPhase::Moving { direction, frame }),
                     ),
@@ -85,7 +85,7 @@ impl SnikSnak {
             // The original draws the current turn picture and then increments
             // its low three state bits, wrapping within the selected cycle.
             let next_frame = (frame.index() + 1) & 7;
-            return Some(Transition::paint(
+            return Some(Transition::replace(
                 position,
                 self.in_phase(EnemyPhase::Turning {
                     turn,
@@ -141,15 +141,7 @@ impl SnikSnak {
             writes.push(CellWrite::new(source, State::empty()));
         }
 
-        Transition::new(writes, Vec::new()).with_drawing(
-            position,
-            self.in_phase(EnemyPhase::Moving {
-                direction,
-                frame: Frame::last(),
-            })
-            .actor()
-            .clone(),
-        )
+        Transition::new(writes, Vec::new())
     }
 
     /// Resolves left, forward, right, then turn-around after a completed move.
@@ -206,7 +198,7 @@ impl SnikSnak {
 
     /// Builds the odd intermediate frame preceding one side candidate.
     fn begin_turn(&self, position: Position, turn: EnemyTurn, candidate: Direction) -> Transition {
-        Transition::paint(
+        Transition::replace(
             position,
             self.in_phase(EnemyPhase::Turning {
                 turn,

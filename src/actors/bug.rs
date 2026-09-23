@@ -86,10 +86,7 @@ impl Bug {
             vec![CellWrite::new(position, State::new(Actor::Bug(next)))],
             events,
         );
-        Some(match next {
-            Self::Active(_) => transition.with_drawing(position, Actor::Bug(next)),
-            Self::Dormant(_) | Self::Held => transition,
-        })
+        Some(transition)
     }
 }
 

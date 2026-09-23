@@ -2,6 +2,7 @@
 
 use std::{error::Error, fmt, io::Cursor};
 
+mod cell;
 mod level;
 use level::LevelRenderer;
 
@@ -20,7 +21,7 @@ use crate::actors::{
 };
 
 use crate::{
-    actors::{Actor, Direction, Drawing, EnemyTurn, MurphyAnimation, State},
+    actors::{Actor, Direction, EnemyTurn, MurphyAnimation, State},
     assets::{
         self, AssetError, BACK_GRAPHICS_PATH, CONTROLS_GRAPHICS_PATH, FONT_GRAPHICS_PATH,
         GFX_TUTOR_GRAPHICS_PATH, MENU_FONT_GRAPHICS_PATH, MENU_GRAPHICS_PATH, PANEL_GRAPHICS_PATH,
@@ -550,9 +551,9 @@ impl<'textures> Renderer<'textures> {
         self.level.reset(game.board())
     }
 
-    /// Applies explicit actor pictures immediately after each simulation operation.
-    pub fn apply_drawings(&mut self, drawings: &[Drawing]) {
-        self.level.apply(drawings);
+    /// Resolves previous/current cell states, renders the frame, then swaps buffers.
+    pub fn update_level(&mut self, game: &Game) {
+        self.level.update(game);
     }
 
     /// Draws the original panel and its live values at their historical positions.

@@ -1,6 +1,6 @@
 //! Explosion residue and ordered blast propagation with reservation cleanup.
 
-use super::{Actor, CellWrite, Direction, Drawing, GameEvent, Position, State, Transition};
+use super::{Actor, CellWrite, Direction, GameEvent, Position, State, Transition};
 use crate::game::SoundEffect;
 use crate::game::WorldView;
 
@@ -56,7 +56,7 @@ impl Explosion {
             return None;
         }
         Some(match self.frame.next() {
-            Some(frame) => Transition::paint(
+            Some(frame) => Transition::replace(
                 position,
                 State::new(Actor::Explosion(Self { frame, ..*self })),
             ),
@@ -68,10 +68,9 @@ impl Explosion {
                     }
                 };
                 Transition::new(
-                    vec![CellWrite::new(position, state.clone())],
+                    vec![CellWrite::new(position, state)],
                     vec![GameEvent::ExplosionFinished],
                 )
-                .with_drawing(position, state.actor().clone())
             }
         })
     }
@@ -163,7 +162,6 @@ fn explode_wave(world: &WorldView<'_>, center: Position, electron_wave: bool) ->
         ExplosionResidue::Empty
     };
     let mut writes = Vec::new();
-    let mut drawings = Vec::new();
     let mut rounded_cleanup = Vec::new();
     // The original engine uses one global flag for explosion sound and camera
     // shake rather than counting live cells.  Every emitted wave sets it again.
@@ -223,10 +221,6 @@ fn explode_wave(world: &WorldView<'_>, center: Position, electron_wave: bool) ->
                 incoming_residue
             };
             let state = explosion_state(residue);
-            drawings.push(Drawing {
-                position,
-                actor: state.actor().clone(),
-            });
             writes.push(CellWrite::new(position, state));
         }
     }
@@ -236,13 +230,9 @@ fn explode_wave(world: &WorldView<'_>, center: Position, electron_wave: bool) ->
     // encounters. Only out-of-wave markers become ordinary empty space.
     for reservation in rounded_cleanup {
         if !writes.iter().any(|write| write.position == reservation) {
-            drawings.push(Drawing {
-                position: reservation,
-                actor: Actor::Empty(super::Empty::Space),
-            });
             writes.push(CellWrite::new(reservation, State::empty()));
         }
     }
 
-    Transition::blast(writes, events, drawings)
+    Transition::new(writes, events)
 }
