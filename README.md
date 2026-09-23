@@ -212,8 +212,8 @@ Shared responsibilities are separated by concern:
 | `actors/rounded.rs` | Legal Zonk/Infotron phases, roll reservations, and shared falling mechanics |
 | `actors/enemy.rs` | Legal enemy phases and eight-picture turn mapping |
 | `actors/empty.rs` | Explicit source, side, and destination reservations |
-| `render.rs` | Direct sprite selection from actor-specific phases and bounded frames |
-| `render/composite.rs` | Actor-local bitmap composition and cached scene-ready frames |
+| `render.rs` | Front-end drawing, camera, HUD, and typed sprite geometry |
+| `render/level.rs` | Persistent level bitmap and opaque copies in simulation order |
 | `actors/state.rs` | Complete cell values and level/session construction boundaries |
 | `actors/transition.rs` | Owned atomic cell writes and game-session events |
 
@@ -337,7 +337,7 @@ cell's sprite timing and collision state, game counters, and emitted sounds.
 These fixtures preserve existing behavior; they do not assert that every legacy
 demo currently completes its level. Rendering tests also compare all 182 original
 gravity, enemy, Bug, and explosion rectangles with a pre-refactor fingerprint,
-and check terrain layering and camera interpolation directly from typed phases.
+and check camera interpolation directly from typed phases.
 
 Source release and animation completion are distinct events. In
 [OpenSupaplex's rounded-object update routines](https://github.com/sergiou87/open-supaplex/blob/master/src/supaplex.c),
@@ -347,32 +347,45 @@ advancing the state, and the preparation pictures belong to the roll's eight
 pictures. These counters must not be treated as interchangeable with a
 post-update snapshot frame without checking the full transition sequence.
 
-Animation rectangles from `MOVING.DAT` include black pixels that erased old
-artwork in the original persistent level bitmap. In this renderer, those copies
-are first assembled on a private surface for each actor frame. Murphy's target
-material, retained picture, and action rectangles are composed there in order.
-Their black pixels can erase that local material without erasing another actor.
-The completed frame is then placed on the freshly drawn scene.
+Gameplay drawing follows the simulation's committed order. `Game::tick_with_changes`
+uses the ordinary tick implementation and returns typed `BoardChange` values in
+write order: Murphy first, then the captured row-major callbacks and their
+immediate events, then the remaining session timers. Intermediate changes to the
+same cell are retained. Ordinary `Game::tick` records nothing, so headless play
+has no growing presentation queue.
 
-Exterior black connected to the completed frame's edges becomes transparent;
-enclosed black details remain opaque. This is one rule for all animated actors,
-not a special Zonk texture or drawing priority. It assumes the original asset
-convention that edge-connected black is background; replacement graphics use
-the same convention. Held targets remain visible during push preparation, then
-are drawn only inside Murphy's active push or snap composite to avoid duplicates.
-Source rectangles, actor phases, collision rules, and movement timing remain
-unchanged. Frames are cached by their bitmap operations, excluding board position
-and camera offset, so composition and texture upload happen once per recipe.
+`render/level.rs` applies those changes to one persistent board bitmap at the
+original 16-pixel tile resolution. Sprite rectangles are opaque copies, including
+all black erase pixels. Collision-only reservation changes do not paint Space.
+Murphy's target material remains in the bitmap until his original strip erases
+it; a snap's initial pose is painted once. Held targets keep their pixels during
+push preparation. Their artwork is not reconstructed over later push frames.
+The renderer uses the original rectangle sizes and actor-owned bounded phases.
 
-A desktop regression uses SDL's hidden software renderer and reads the actual
-screen pixels for both push–roll–fall directions. It verifies the original Murphy
-entry ticks, visibility during push preparation, absence of a duplicate pushed
-rock, and preservation of Murphy under the old erase regions. Pixel tests also
-check local material erasure and opaque enclosed black details. Reinstating
-opaque scene erasure or duplicate target drawing makes the desktop regression
-fail. The original ten-demo fingerprints and 182 sprite rectangles are unchanged.
-This scene-composition rule deliberately removes erase-rectangle overlap; it is
-not a claim of pixel-for-pixel equivalence to OpenSupaplex's persistent bitmap.
+The application initializes the bitmap before each level's entry fade, applies
+changes after every fixed tick, and replaces the bitmap on restart. Demos use
+the same path. Escape uses `destroy_murphy_with_changes` so its immediate blast
+appears even when no fixed tick is due. A display refresh uploads changed pixels
+and copies the camera's view of the saved board. Multiple catch-up ticks preserve
+every intervening copy while sharing one texture upload; repeated display frames
+and camera movement never repaint actors. Fonts retain their existing color key.
+
+This drawing architecture follows
+[OpenSupaplex's `updateMovingObjects` callback order](https://github.com/sergiou87/open-supaplex/blob/master/src/supaplex.c)
+and [its persistent `gLevelBitmapData` copies](https://github.com/sergiou87/open-supaplex/blob/master/src/graphics.c).
+Later opaque rectangles win where they overlap. It does not impose a separate
+actor priority or infer transparency from black. The change preserves this
+clone's existing phase timing and collision behavior; the replay fingerprints
+verify that preservation, not full frame-by-frame equivalence to upstream.
+
+Pixel regressions exercise pushing, rolling, and falling in both directions,
+opaque overlap order, source releases, retained material, clipping, restart, and
+six ticks accumulated before presentation. A hidden SDL software renderer also
+compares displayed pixels with the saved bitmap, checks repeated display frames
+and camera movement, and verifies immediate death rendering. All ten original
+replay fingerprints and the 182 sprite-rectangle fingerprint remain unchanged.
+The replay test additionally compares every observed tick with an ordinary
+headless tick, including the board, status, counters, toggles, and sound events.
 
 Format and mapping references:
 
