@@ -1,8 +1,8 @@
 //! Actor-owned behavior, animation phases, and immediate atomic transitions.
 //!
-//! Every cell stores one complete [`Actor`]. Concrete actors own their legal
-//! phases and bounded progress values. Rendering consumes those same typed phases
-//! directly; there is no parallel animation-kind enum or assignable view.
+//! Every cell stores one complete [`Actor`] and an optional planted fuse.
+//! Concrete actors own their legal phases and bounded progress values. Rendering
+//! consumes those typed phases and the fuse from the same board cells.
 //!
 //! This module only dispatches by actor identity. Each actor's exhaustive match
 //! owns timing and completion behavior. Shared rounded physics and enemy turn

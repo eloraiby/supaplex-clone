@@ -18,21 +18,32 @@ pub enum ExplosionResidue {
 pub struct Explosion {
     /// Actor that replaces this cell after the visual explosion finishes.
     residue: ExplosionResidue,
-    /// Bounded progress through the eight quarter-rate pictures.
-    frame: super::Frame<8>,
+    /// Original low-byte progress: eight picture callbacks, then one
+    /// pictureless Infotron conversion callback.
+    callbacks: u8,
 }
 
 impl Explosion {
-    /// Returns this explosion's bounded progress for direct sprite selection.
+    /// Returns the last picture while the Infotron conversion is pending.
     pub const fn frame(self) -> super::Frame<8> {
-        self.frame
+        let picture = if self.callbacks < 8 {
+            self.callbacks
+        } else {
+            7
+        };
+        super::Frame::new(picture).unwrap()
+    }
+
+    /// Returns the picture copied by the next quarter-rate callback, if any.
+    pub const fn next_picture(self) -> Option<super::Frame<8>> {
+        super::Frame::new(self.callbacks)
     }
 
     /// Creates one explosion cell with an explicit terminal residue.
     pub const fn new(residue: ExplosionResidue) -> Self {
         Self {
             residue,
-            frame: super::Frame::first(),
+            callbacks: 0,
         }
     }
 
@@ -43,7 +54,7 @@ impl Explosion {
 
     /// Reports the original safe tail of a normal explosion for Murphy movement.
     pub const fn is_harmless(self) -> bool {
-        matches!(self.residue, ExplosionResidue::Empty) && self.frame.index() >= 4
+        matches!(self.residue, ExplosionResidue::Empty) && self.frame().index() >= 4
     }
 
     /// Advances the blast on quarter ticks and installs its typed residue at completion.
@@ -55,12 +66,22 @@ impl Explosion {
         if !world.tick_count().is_multiple_of(4) {
             return None;
         }
-        Some(match self.frame.next() {
-            Some(frame) => Transition::replace(
+        Some(match self.callbacks {
+            0..=6 => Transition::replace(
                 position,
-                State::new(Actor::Explosion(Self { frame, ..*self })),
+                State::new(Actor::Explosion(Self {
+                    callbacks: self.callbacks + 1,
+                    ..*self
+                })),
             ),
-            None => {
+            7 if matches!(self.residue, ExplosionResidue::Infotron) => Transition::replace(
+                position,
+                State::new(Actor::Explosion(Self {
+                    callbacks: 8,
+                    ..*self
+                })),
+            ),
+            7 | 8 => {
                 let state = match self.residue {
                     ExplosionResidue::Empty => State::empty(),
                     ExplosionResidue::Infotron => {
@@ -72,6 +93,7 @@ impl Explosion {
                     vec![GameEvent::ExplosionFinished],
                 )
             }
+            _ => unreachable!("explosion callback progress is bounded"),
         })
     }
 }

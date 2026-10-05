@@ -148,9 +148,14 @@ fn sdl_displays_saved_pixels_without_replaying_simulation() {
         canvas.read_pixels(None, PixelFormatEnum::RGBA32).unwrap(),
         initial_screen
     );
-    // An Escape blast must be visible before another fixed update occurs.
+    // An Escape blast installs cells immediately; its first picture is copied
+    // by the next quarter-rate explosion callback.
     let tick = game.tick_count();
     game.destroy_murphy();
+    renderer.update_level(&game);
+    assert!(!renderer.level.bitmap.dirty);
+    assert_eq!(game.tick_count(), tick);
+    game.tick(Input::default());
     renderer.update_level(&game);
     assert!(renderer.level.bitmap.dirty);
     renderer.draw(&mut canvas, &game, 1, 50).unwrap();
@@ -158,7 +163,6 @@ fn sdl_displays_saved_pixels_without_replaying_simulation() {
         canvas.read_pixels(None, PixelFormatEnum::RGBA32).unwrap(),
         initial_screen
     );
-    assert_eq!(game.tick_count(), tick);
 }
 
 /// Black is an opaque write into shared pixels, and later writes win.
@@ -224,9 +228,9 @@ fn clipping_advances_the_source_without_wrapping_rows() {
     }
 }
 
-/// Reuse the two cell buffers across catch-up ticks and reset both on restart.
+/// Reuse both cell buffers across frames and reset them on restart.
 #[test]
-fn frame_buffers_swap_without_reallocating_or_changing_gameplay() {
+fn frame_buffers_reuse_storage_without_changing_gameplay() {
     for direction in [Direction::Left, Direction::Right] {
         let level = push_level(direction);
         let mut game = Game::with_random_seed(&level, 0).unwrap();
@@ -510,6 +514,267 @@ fn rounded_objects_and_cleared_base_match_opensupaplex_every_tick() {
     }
 }
 
+/// A falling Zonk and every quarter-rate blast copy match the original bitmap.
+#[test]
+fn falling_zonk_blast_matches_opensupaplex_every_tick() {
+    let mut record = vec![0; LEVEL_RECORD_SIZE];
+    record[..60 * 24].fill(6);
+    for y in 1..8 {
+        for x in 2..7 {
+            record[y * LEVEL_WIDTH + x] = 0;
+        }
+    }
+    record[2 * LEVEL_WIDTH + 4] = 1;
+    record[4 * LEVEL_WIDTH + 4] = 3;
+    record[5 * LEVEL_WIDTH + 4] = 6;
+    let level = LevelSet::new(&record).load(1).unwrap();
+    let mut game = Game::with_random_seed(&level, 0).unwrap();
+    let mut actual = bitmap();
+    actual.reset(game.board()).unwrap();
+    let mut expected = bitmap();
+    expected.reset(game.board()).unwrap();
+    for line in include_str!("../../../tests/support/opensupaplex_blast_trace.txt")
+        .lines()
+        .skip_while(|line| *line != "CASE falling_zonk")
+        .skip(1)
+    {
+        let fields = line.split_whitespace().collect::<Vec<_>>();
+        match fields.first().copied() {
+            Some("BLIT") => {
+                let values = fields[2..]
+                    .iter()
+                    .map(|v| v.parse::<i32>().unwrap())
+                    .collect::<Vec<_>>();
+                let [sx, sy, width, height, dx, dy] = values[..] else {
+                    panic!("invalid blit")
+                };
+                expected.copy(
+                    Position::new(0, 0),
+                    Blit::Moving(SpritePart {
+                        source: SourcePoint { x: sx, y: sy },
+                        width: width as u32,
+                        height: height as u32,
+                        offset_x: dx,
+                        offset_y: dy,
+                    }),
+                );
+            }
+            Some("STATE") => {
+                let tick = fields[1].parse::<usize>().unwrap();
+                game.tick(Input::default());
+                actual.update(&game);
+                let first = actual
+                    .pixels
+                    .pixels
+                    .iter()
+                    .zip(&expected.pixels.pixels)
+                    .position(|(a, b)| a != b);
+                assert!(
+                    first.is_none(),
+                    "tick {tick}: first different pixel {:?}",
+                    first.map(|i| (i / 4 % 960, i / 4 / 960))
+                );
+            }
+            None => {}
+            _ => panic!("invalid upstream trace"),
+        }
+    }
+}
+
+/// Compare the Orange Disk's source-retained fall and landing blast with upstream.
+#[test]
+fn falling_orange_disk_matches_opensupaplex_pixels() {
+    let mut record = vec![0; LEVEL_RECORD_SIZE];
+    record[..60 * 24].fill(6);
+    for y in 1..9 {
+        for x in 2..7 {
+            record[y * LEVEL_WIDTH + x] = 0;
+        }
+    }
+    record[2 * LEVEL_WIDTH + 2] = 3;
+    record[2 * LEVEL_WIDTH + 4] = 8;
+    record[6 * LEVEL_WIDTH + 4] = 6;
+    let level = LevelSet::new(&record).load(1).unwrap();
+    let mut game = Game::with_random_seed(&level, 0).unwrap();
+    let mut actual = bitmap();
+    actual.reset(game.board()).unwrap();
+    let mut expected = bitmap();
+    expected.reset(game.board()).unwrap();
+    for line in include_str!("../../../tests/support/opensupaplex_orange_trace.txt")
+        .lines()
+        .skip_while(|line| *line != "CASE falling_orange")
+        .skip(1)
+    {
+        let fields = line.split_whitespace().collect::<Vec<_>>();
+        match fields.first().copied() {
+            Some("BLIT") => {
+                let values = fields[2..]
+                    .iter()
+                    .map(|v| v.parse::<i32>().unwrap())
+                    .collect::<Vec<_>>();
+                let [sx, sy, width, height, dx, dy] = values[..] else {
+                    panic!("invalid blit")
+                };
+                expected.copy(
+                    Position::new(0, 0),
+                    Blit::Moving(SpritePart {
+                        source: SourcePoint { x: sx, y: sy },
+                        width: width as u32,
+                        height: height as u32,
+                        offset_x: dx,
+                        offset_y: dy,
+                    }),
+                );
+            }
+            Some("STATE") => {
+                let tick = fields[1].parse::<usize>().unwrap();
+                game.tick(Input::default());
+                actual.update(&game);
+                for y in 16..128 {
+                    for x in 48..96 {
+                        assert_eq!(
+                            pixel(&actual.pixels, x, y),
+                            pixel(&expected.pixels, x, y),
+                            "tick {tick}: Orange Disk pixel ({x}, {y})"
+                        );
+                    }
+                }
+            }
+            None => {}
+            _ => panic!("invalid upstream trace"),
+        }
+    }
+}
+
+/// A Bug changes collision state at cooldown without copying a new picture.
+#[test]
+fn bug_cooldown_preserves_upstream_pixels() {
+    let mut record = vec![0; LEVEL_RECORD_SIZE];
+    record[..60 * 24].fill(6);
+    record[2 * LEVEL_WIDTH + 2] = 3;
+    record[2 * LEVEL_WIDTH + 4] = 25;
+    let level = LevelSet::new(&record).load(1).unwrap();
+    let mut game = Game::with_random_seed(&level, 0).unwrap();
+    let mut actual = bitmap();
+    actual.reset(game.board()).unwrap();
+    let mut expected = bitmap();
+    expected.reset(game.board()).unwrap();
+    for line in include_str!("../../../tests/support/opensupaplex_bug_trace.txt")
+        .lines()
+        .skip_while(|line| *line != "CASE bug_cooldown")
+        .skip(1)
+    {
+        let fields = line.split_whitespace().collect::<Vec<_>>();
+        match fields.first().copied() {
+            Some("BLIT") => {
+                let values = fields[2..]
+                    .iter()
+                    .map(|v| v.parse::<i32>().unwrap())
+                    .collect::<Vec<_>>();
+                let [sx, sy, width, height, dx, dy] = values[..] else {
+                    panic!("invalid blit")
+                };
+                expected.copy(
+                    Position::new(0, 0),
+                    Blit::Moving(SpritePart {
+                        source: SourcePoint { x: sx, y: sy },
+                        width: width as u32,
+                        height: height as u32,
+                        offset_x: dx,
+                        offset_y: dy,
+                    }),
+                );
+            }
+            Some("STATE") => {
+                let tick = fields[1].parse::<usize>().unwrap();
+                game.tick(Input::default());
+                actual.update(&game);
+                for y in 32..48 {
+                    for x in 64..80 {
+                        assert_eq!(
+                            pixel(&actual.pixels, x, y),
+                            pixel(&expected.pixels, x, y),
+                            "tick {tick}: Bug pixel ({x}, {y})"
+                        );
+                    }
+                }
+            }
+            None => {}
+            _ => panic!("invalid upstream trace"),
+        }
+    }
+}
+
+/// Enemy turns copy the old picture before advancing their state byte.
+#[test]
+fn enemy_turns_match_upstream_before_and_after_transfer() {
+    for (tile, case, trace) in [
+        (
+            17,
+            "CASE snik_turn",
+            include_str!("../../../tests/support/opensupaplex_snik_trace.txt"),
+        ),
+        (
+            24,
+            "CASE electron_turn",
+            include_str!("../../../tests/support/opensupaplex_electron_trace.txt"),
+        ),
+    ] {
+        let mut record = vec![0; LEVEL_RECORD_SIZE];
+        record[..60 * 24].fill(6);
+        record[2 * LEVEL_WIDTH + 2] = 3;
+        record[4 * LEVEL_WIDTH + 4] = tile;
+        record[3 * LEVEL_WIDTH + 4] = 0;
+        record[4 * LEVEL_WIDTH + 3] = 0;
+        let level = LevelSet::new(&record).load(1).unwrap();
+        let mut game = Game::with_random_seed(&level, 0).unwrap();
+        let mut actual = bitmap();
+        actual.reset(game.board()).unwrap();
+        let mut expected = bitmap();
+        expected.reset(game.board()).unwrap();
+        for line in trace.lines().skip_while(|line| *line != case).skip(1) {
+            let fields = line.split_whitespace().collect::<Vec<_>>();
+            match fields.first().copied() {
+                Some("BLIT") => {
+                    let values = fields[2..]
+                        .iter()
+                        .map(|v| v.parse::<i32>().unwrap())
+                        .collect::<Vec<_>>();
+                    let [sx, sy, width, height, dx, dy] = values[..] else {
+                        panic!("invalid blit")
+                    };
+                    expected.copy(
+                        Position::new(0, 0),
+                        Blit::Moving(SpritePart {
+                            source: SourcePoint { x: sx, y: sy },
+                            width: width as u32,
+                            height: height as u32,
+                            offset_x: dx,
+                            offset_y: dy,
+                        }),
+                    );
+                }
+                Some("STATE") => {
+                    let tick = fields[1].parse::<usize>().unwrap();
+                    game.tick(Input::default());
+                    actual.update(&game);
+                    for y in 32..96 {
+                        for x in 48..96 {
+                            assert_eq!(
+                                pixel(&actual.pixels, x, y),
+                                pixel(&expected.pixels, x, y),
+                                "tile {tile}, tick {tick}: enemy pixel ({x}, {y})"
+                            );
+                        }
+                    }
+                }
+                None => {}
+                _ => panic!("invalid upstream trace"),
+            }
+        }
+    }
+}
+
 /// Eating Base and reversing through cleared cells must match every upstream frame.
 #[test]
 fn walking_back_through_eaten_base_matches_opensupaplex_pixels() {
@@ -747,7 +1012,10 @@ fn immediate_death_preserves_unaffected_actors_at_the_same_tick() {
         game.destroy_murphy();
         saved.update(&game);
         assert_eq!(game.tick_count(), tick);
-        assert_ne!(saved.pixels, before, "the immediate blast must be visible");
+        assert_eq!(
+            saved.pixels, before,
+            "a newly installed blast has no copied picture yet"
+        );
         assert_eq!(&saved.frames.as_ref().unwrap().previous, game.board());
         for y in 0..before.height as usize {
             for x in 7 * 16..8 * 16 {
@@ -757,6 +1025,130 @@ fn immediate_death_preserves_unaffected_actors_at_the_same_tick() {
                     "death at tick {steps} advanced the distant rock at ({x}, {y})"
                 );
             }
+        }
+    }
+}
+
+/// The independent fuse blit wins over Murphy even while its cell is covered.
+#[test]
+fn planted_red_disk_copies_on_top_of_its_covered_cell() {
+    let mut record = vec![0; LEVEL_RECORD_SIZE];
+    record[..60 * 24].fill(6);
+    let origin = Position::new(3, 2);
+    record[2 * LEVEL_WIDTH + 2] = 3;
+    record[2 * LEVEL_WIDTH + 3] = 20;
+    let level = LevelSet::new(&record).load(1).unwrap();
+    let mut game = Game::with_random_seed(&level, 0).unwrap();
+    let mut saved = bitmap();
+    saved.reset(game.board()).unwrap();
+    for _ in 0..9 {
+        game.tick(Input {
+            direction: Some(Direction::Right),
+            action: false,
+        });
+        saved.update(&game);
+    }
+    assert_eq!(game.red_disks(), 1);
+    game.tick(Input::default());
+    saved.update(&game);
+    let mut copied = false;
+    for _ in 0..70 {
+        game.tick(Input {
+            action: true,
+            ..Input::default()
+        });
+        saved.update(&game);
+        if game.red_disks() == 0 {
+            copied = true;
+            break;
+        }
+    }
+    assert!(copied, "the completed placement should start the fuse blit");
+    let source = saved.moving.clone();
+    for y in 0..16usize {
+        for x in 0..16usize {
+            assert_eq!(
+                pixel(&saved.pixels, origin.x * 16 + x, origin.y * 16 + y),
+                pixel(&source, 256 + x, 164 + y),
+                "covered disk pixel ({x}, {y})"
+            );
+        }
+    }
+    for _ in 0..8 {
+        game.tick(Input {
+            direction: Some(Direction::Left),
+            action: false,
+        });
+        saved.update(&game);
+    }
+    assert!(matches!(
+        game.board().state(origin).unwrap().actor(),
+        Actor::RedDisk(_)
+    ));
+    for y in 0..16usize {
+        for x in 0..16usize {
+            assert_eq!(
+                pixel(&saved.pixels, origin.x * 16 + x, origin.y * 16 + y),
+                pixel(&source, 256 + x, 164 + y),
+                "visible disk pixel ({x}, {y})"
+            );
+        }
+    }
+}
+
+/// The saved final fuse picture needs no second copy when the covered disk detonates.
+#[test]
+fn covered_planted_disk_keeps_its_last_picture_at_detonation() {
+    let mut record = vec![0; LEVEL_RECORD_SIZE];
+    record[..60 * 24].fill(6);
+    let origin = Position::new(3, 2);
+    record[2 * LEVEL_WIDTH + 2] = 3;
+    record[2 * LEVEL_WIDTH + 3] = 20;
+    let level = LevelSet::new(&record).load(1).unwrap();
+    let mut game = Game::with_random_seed(&level, 0).unwrap();
+    let mut saved = bitmap();
+    saved.reset(game.board()).unwrap();
+    for _ in 0..9 {
+        game.tick(Input {
+            direction: Some(Direction::Right),
+            ..Input::default()
+        });
+        saved.update(&game);
+    }
+    game.tick(Input::default());
+    saved.update(&game);
+    for _ in 0..70 {
+        game.tick(Input {
+            action: true,
+            ..Input::default()
+        });
+        saved.update(&game);
+        if game.red_disks() == 0 {
+            break;
+        }
+    }
+    assert!(game.board().state(origin).unwrap().planted_fuse().is_some());
+    let mut detonated = false;
+    for _ in 0..40 {
+        game.tick(Input::default());
+        saved.update(&game);
+        if game.board().state(origin).unwrap().planted_fuse().is_none() {
+            detonated = true;
+            break;
+        }
+    }
+    assert!(detonated);
+    assert!(matches!(
+        game.board().state(origin).unwrap().actor(),
+        Actor::Explosion(_)
+    ));
+    for y in 0..16 {
+        for x in 0..16 {
+            assert_eq!(
+                pixel(&saved.pixels, origin.x * 16 + x, origin.y * 16 + y),
+                pixel(&saved.moving, 256 + x, 164 + y),
+                "final fuse pixel ({x}, {y})"
+            );
         }
     }
 }

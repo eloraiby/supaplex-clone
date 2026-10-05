@@ -51,8 +51,8 @@ fn all_original_demos_preserve_corrected_actor_timing() {
     let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
     let bytes = std::fs::read(root.join("assets/data/levels.dat")).unwrap();
     let levels = LevelSet::new(&bytes);
-    // Rebased after correcting early roll-source release and falling callback
-    // timing. The old ef691ba histories encoded the faulty collision windows.
+    // Rebased after correcting rounded callback timing and the extra terminal
+    // quarter tick of Infotron explosions in the last two demos.
     // Independent OpenSupaplex draw/pixel traces cover the corrected scenarios;
     // these histories guard future changes across all bundled demo input ticks.
     let expected = [
@@ -64,8 +64,8 @@ fn all_original_demos_preserve_corrected_actor_timing() {
         0x8bff1f8c4752515a,
         0xb0eae4ceda2eae9d,
         0xf48b5bdcf2b4e643,
-        0x1d94a164aeb503d1,
-        0x8a58a8ca1bbbbda6,
+        0x92b340ba3fc44d6e,
+        0x76a8a0e568d5148c,
     ];
     let mut actual = Vec::new();
     for demo_index in 0..expected.len() {

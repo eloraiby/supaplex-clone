@@ -96,7 +96,7 @@ impl SnapshotExt for State {
                 model::ExplosionResidue::Empty => "Explosion",
                 model::ExplosionResidue::Infotron => "ElectronExplosion",
             }, actor.frame().index(), 8),
-            Actor::RedDisk(model::RedDisk::Planted(frame)) => Snapshot::new("RedDiskFuse", frame.index(), 40),
+            Actor::RedDisk(model::RedDisk::Planted) => Snapshot::new("RedDiskFuse", self.planted_fuse().expect("visible fuse owns countdown"), 40),
             Actor::Base(_) | Actor::YellowDisk(_) | Actor::RedDisk(_) => match self.actor().is_held() {
                 true => Snapshot::new("MurphyPushTarget", 0, 1),
                 false => Snapshot::new("Idle", 0, 1),

@@ -1,11 +1,11 @@
 //! Complete board-cell values and constructors for movement reservations.
 //!
-//! A cell stores only a complete Actor. Presentation is derived on demand, so
-//! there is no independent animation that could contradict its identity.
+//! Each cell stores one actor and, when planted, its independent Red Disk fuse.
+//! Both gameplay and opaque rendering read the same cell state.
 
 use super::{Actor, Bug, Direction, Electron, Empty, EnemyTurn, RedDisk, SnikSnak};
 
-/// Complete content of one board cell, with no independent animation storage.
+/// Complete content of one board cell, including a fuse beneath its actor.
 ///
 /// An arbitrary actor/animation pair cannot be installed in a cell.
 /// ```compile_fail
@@ -16,12 +16,17 @@ use super::{Actor, Bug, Direction, Electron, Empty, EnemyTurn, RedDisk, SnikSnak
 pub struct State {
     /// Actor-specific identity and persistent behavior data.
     actor: Actor,
+    /// Independent planted fuse in this cell, even while Murphy covers it.
+    planted_fuse: Option<super::Frame<40>>,
 }
 
 impl State {
     /// Wraps a complete actor whose own type determines its legal phases.
     pub fn new(actor: Actor) -> Self {
-        Self { actor }
+        Self {
+            actor,
+            planted_fuse: None,
+        }
     }
 
     /// Creates ordinary traversable Space.
@@ -70,9 +75,24 @@ impl State {
         &self.actor
     }
 
-    /// Restores the session-owned planted fuse from its serialized countdown.
-    pub(crate) fn planted_red_disk(frame: u8) -> Self {
-        Self::new(Actor::RedDisk(RedDisk::planted(frame)))
+    /// Creates one visible planted disk with its authoritative cell countdown.
+    pub(crate) fn planted_red_disk(countdown: u8) -> Self {
+        assert!(countdown >= 2, "visible planted disk must be armed");
+        let mut state = Self::new(Actor::RedDisk(RedDisk::Planted));
+        state.set_planted_fuse(Some(countdown));
+        state
+    }
+
+    /// Returns this cell's planted-fuse countdown, including under Murphy.
+    pub fn planted_fuse(&self) -> Option<u8> {
+        self.planted_fuse.map(super::Frame::index)
+    }
+
+    /// Changes the independent fuse without changing the occupying actor.
+    pub(crate) fn set_planted_fuse(&mut self, countdown: Option<u8>) {
+        self.planted_fuse = countdown.map(|value| {
+            super::Frame::new(value).expect("planted fuse countdown stays below forty")
+        });
     }
 
     /// Starts one safe Bug interval selected by the session RNG.

@@ -214,8 +214,8 @@ Shared responsibilities are separated by concern:
 | `actors/empty.rs` | Explicit source, side, and destination reservations |
 | `render.rs` | Front-end drawing, camera, HUD, and typed sprite geometry |
 | `render/cell.rs` | Pure previous/current cell selectors returning at most two opaque sprites |
-| `render/level.rs` | Reusable cell buffers, frame swapping, level bitmap, and texture upload |
-| `actors/state.rs` | Complete cell values and level/session construction boundaries |
+| `render/level.rs` | Previous/current cell buffers, opaque level bitmap, and texture upload |
+| `actors/state.rs` | Actor and independent fuse state in each board cell |
 | `actors/transition.rs` | Atomic cell writes and session events |
 
 Murphy's preparation, planting, movement, snapping, pushing, port traversal, and
@@ -229,7 +229,7 @@ phase, preserving the update between source release and fresh input.
 Rendering matches the actual actor and its typed phase directly. There is no
 shared animation-kind enum, generic animation object, or `State::animation()`
 API. Enemy sprite selectors accept `EnemyPhase`; rock selectors accept
-`RoundedPhase`; Bug and explosion tables take their own bounded frames.
+`RoundedPhase`; Bug pictures and explosion callbacks use their own bounded progress.
 Murphy's own artwork descriptor selects the original composite sprite tables.
 Gameplay stores actor-owned state. Rendering compares previous and current cell
 states to select each actor's one or two sprites. The previous state retains the
@@ -244,8 +244,9 @@ an immutable world view. The game applies transitions with exclusive mutable
 access to the board. No `Any`, downcasting, `Cell`, or `RefCell` is needed.
 When adding an actor, define its legal phases and completion behavior in its
 own module, add its typed sprite selector and previous/current cell cases, and
-wire its identity into dispatch and collision queries. Scheduling, shared RNG,
-and the position-owned planted Red Disk fuse remain in `game.rs`.
+wire its identity into dispatch and collision queries. Scheduling and shared RNG
+remain in `game.rs`. The independent planted fuse belongs to its board cell,
+including while Murphy occupies that cell.
 
 Every fixed tick follows the original deterministic linear order:
 
@@ -352,17 +353,19 @@ pictures. These counters must not be treated as interchangeable with a
 post-update snapshot frame without checking the full transition sequence.
 
 Actor transitions produce atomic cell writes and immediate session events.
-`Game::tick` performs the Murphy-first simulation without producing graphics.
-`render/cell.rs` borrows the previous and current typed boards and resolves each
-actor to `Sprites::None`, `One`, or `Two`. Atlas coordinates, transfer anchors,
-and completion pictures belong to these pure selectors; the simulation has no
-`Drawing` type or recording API.
+`Game::tick` performs the Murphy-first simulation without graphics or a render
+journal. `render/cell.rs` selects each original rectangle from the previous and
+current typed cells; old phases supply final falling and explosion pictures,
+while current neighbors supply transfer destinations.
 
-`render/level.rs` owns two reusable cell buffers. A level start initializes both
-from the loaded board. After each tick, it copies the live board into the current
-buffer, resolves Murphy and then the remaining cells in row-major order, and
-swaps the buffers **after** applying their opaque sprites. Copying reuses the
-existing cell allocations. The game retains exclusive ownership of its live board.
+`render/level.rs` owns two reusable cell buffers. After each tick it copies the
+live board into the current buffer, resolves Murphy first, then visits the old
+actor cells in row-major order. A destroyed Zonk or Infotron also clears its
+neighboring sprite footprint after its last opaque picture. Newly installed
+Explosion cells wait for their first quarter-rate update before drawing.
+A planted Red Disk's countdown belongs to its board cell even under Murphy;
+its opaque copy follows the actor pass using those same previous/current cells.
+The buffers swap after the frame is resolved.
 
 Both cell states matter at completion. For example, when Infotron snapping
 changes from `Snapping` to `Ready`, the previous action selects its final original
@@ -385,15 +388,16 @@ match a renderer's post-update snapshot.
 The selected sprites update one persistent level bitmap at the original
 16-pixel tile resolution. Copies include all original black erase pixels.
 Normal reservation release contributes no separate Space sprite. When a blast
-destroys the reservation's owner, the cell pair instead resolves the released
-footprint; cells occupied by explosions retain their explosion artwork. Held
-material stays until the action strip erases it. Terminals select one complete
-tile from seven cached scroll phases.
+destroys a rounded actor, its original neighboring clear copies run after
+that actor's last picture. Newly created Explosion cells wait for their own
+callbacks before copying an explosion picture. Held material stays until the
+action strip erases it. Terminals select one complete tile from seven cached
+scroll phases.
 
 Live play and demos call `Renderer::update_level(&game)` after every simulation
 tick, including every catch-up tick before a display refresh. Escape calls the
-same method after `Game::destroy_murphy`; changed cells are resolved immediately,
-while unchanged actors keep their current picture because no tick elapsed.
+same method after `Game::destroy_murphy`; the blast changes collision cells
+immediately, and its first picture waits for the next explosion callback.
 Submitting the same tick and board again leaves the buffers and pixels unchanged.
 Restart initializes both buffers and replaces the bitmap. Display refreshes only
 upload changed pixels and copy the camera's view, so moving the camera or drawing
@@ -402,9 +406,11 @@ the display twice cannot advance an actor or swap the cell buffers.
 The callback order and opaque-copy contract follow
 [OpenSupaplex's simulation](https://github.com/sergiou87/open-supaplex/blob/bad56a4e174e628643995284ea55d4c49af3137c/src/supaplex.c)
 and [saved level bitmap](https://github.com/sergiou87/open-supaplex/blob/bad56a4e174e628643995284ea55d4c49af3137c/src/graphics.c).
-Independent traces cover 22 scenarios: all snap materials/directions, eating Base
+Independent traces cover 27 scenarios: all snap materials/directions, eating Base
 and reversing through cleared cells in all directions, following pushed Zonks,
-and revisiting cleared Base beside rolling/falling Zonks and Infotrons. Tests
+revisiting cleared Base beside rolling/falling Zonks and Infotrons, a falling
+Zonk colliding with Murphy, an Orange Disk falling into Hardware, a Bug
+entering cooldown, and both enemy turn-to-movement paths. Tests
 compare actual rectangles, positions, or complete saved pixels **after each tick**,
 not only at completion. See [trace reproduction instructions](tests/support/opensupaplex_traces.md).
 These scenarios establish specific upstream agreement, not parity of every game
@@ -414,12 +420,14 @@ Additional regressions cover all push/port/exit terminal pictures, opaque overla
 order, reservation destruction, retained material, clipping, restart, and six
 ticks accumulated before presentation. A hidden SDL software renderer compares
 displayed pixels with the saved bitmap, checks repeated display frames and camera
-movement, and verifies immediate death rendering. The 182 sprite-rectangle
-fingerprint remains unchanged. Additional cell-buffer tests verify allocation reuse
-and swapping, idempotent frame submission, frozen preparation, replaced actors,
-single-sprite transfers, and every cached Terminal phase. Immediate death tests
-also verify that a distant falling actor's pixels do not advance between ticks.
-The ten bundled demo hashes remain unchanged by this rendering refactor.
+movement, and verifies explosion timing after an immediate death command. The
+182 sprite-rectangle fingerprint remains unchanged. Additional cell-buffer tests
+verify allocation reuse, idempotent frame submission, frozen preparation,
+replaced actors, single-sprite transfers, the planted Red Disk copy, and every
+cached Terminal phase. Immediate death tests also verify that a distant falling
+actor's pixels do not advance between ticks.
+The last two bundled demo hashes changed because Infotron explosions wait
+one additional quarter-rate callback after their final picture, as in OpenSupaplex.
 
 Format and mapping references:
 

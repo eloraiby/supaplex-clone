@@ -25,7 +25,7 @@ def run(*args, **kwargs):
 
 
 def main():
-    """Compile upstream with one draw-call hook and write the four fixture suites."""
+    """Compile upstream with one draw-call hook and write the nine fixture suites."""
     upstream = Path(sys.argv[1]).resolve()
     assert run("git", "-C", str(upstream), "rev-parse", "HEAD").strip() == REVISION
     with tempfile.TemporaryDirectory(prefix="supaplex-trace-") as directory:
@@ -51,6 +51,23 @@ def main():
             objects.append(str(obj))
         executable = build / "trace"
         run("cc", *objects, *run("sdl2-config", "--libs").split(), "-lm", "-o", str(executable))
+        special = [
+            ("snik", "snik_turn", "Snik Snak turns and begins a movement transfer."),
+            ("electron", "electron_turn", "Electron turns and begins a movement transfer."),
+            ("bug", "bug_cooldown", "Bug advances on quarter ticks and enters its safe interval without a copy."),
+            ("orange", "falling_orange", "Orange Disk falls into Hardware and detonates."),
+            ("blast", "falling_zonk", "Falling Zonk collides with stationary Murphy."),
+        ]
+        for mode, case, description in special:
+            lines = [
+                f"# Captured from OpenSupaplex {REVISION}.",
+                f"# {description} Quarter-rate callbacks use the original global frame counter.",
+                "",
+                f"CASE {case}",
+                run(str(executable), mode, "0", "0").strip(),
+                "",
+            ]
+            (SUPPORT / f"opensupaplex_{mode}_trace.txt").write_text("\n".join(lines))
         directions = [("up", 1), ("left", 2), ("down", 3), ("right", 4)]
         for mode, tiles in [("snap", [4, 2, 20]), ("walk", [2]), ("push", [1]), ("follow", [1, 4])]:
             lines = [f"# Captured from OpenSupaplex {REVISION}.", "# See opensupaplex_traces.md for reproduction and scenario definitions.", ""]

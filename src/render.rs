@@ -551,7 +551,7 @@ impl<'textures> Renderer<'textures> {
         self.level.reset(game.board())
     }
 
-    /// Resolves previous/current cell states, renders the frame, then swaps buffers.
+    /// Resolves previous/current cell states into the persistent opaque bitmap.
     pub fn update_level(&mut self, game: &Game) {
         self.level.update(game);
     }

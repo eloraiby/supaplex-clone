@@ -220,13 +220,32 @@ impl Board {
         self.index(position).and_then(|index| self.cells.get(index))
     }
 
-    /// Replaces one cell after converting its coordinate through the sole index path.
+    /// Replaces an actor while retaining the cell's independent planted fuse.
     fn set(&mut self, position: Position, state: State) -> Result<(), BoardError> {
         let index = self
             .index(position)
             .ok_or(BoardError::OutOfBounds(position))?;
+        let mut state = state;
+        if state.planted_fuse().is_none() {
+            state.set_planted_fuse(self.cells[index].planted_fuse());
+        }
         self.cells[index] = state;
         Ok(())
+    }
+
+    /// Changes the fuse in one existing cell without replacing its actor.
+    fn set_planted_fuse(&mut self, position: Position, countdown: Option<u8>) {
+        let index = self.index(position).expect("fuse cell remains in bounds");
+        self.cells[index].set_planted_fuse(countdown);
+    }
+
+    /// Finds the single planted fuse from the board's own cell states.
+    fn planted_fuse(&self) -> Option<(Position, u8)> {
+        self.cells.iter().enumerate().find_map(|(index, state)| {
+            state
+                .planted_fuse()
+                .map(|countdown| (self.position(index).unwrap(), countdown))
+        })
     }
 }
 
@@ -315,15 +334,6 @@ pub enum SoundEffect {
     Exit,
 }
 
-/// Concealed portion of the single Red Disk fuse planted beneath Murphy.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-struct PlantedRedDisk {
-    /// Board cell where Murphy initiated the planting action.
-    position: Position,
-    /// Original countdown byte, beginning at two after placement completes.
-    countdown: u8,
-}
-
 /// Derives the ordinary-play RNG seed from the current process wall clock.
 fn clock_random_seed() -> u16 {
     // Supaplex seeds normal play from the clock and preserves that stream over
@@ -346,8 +356,6 @@ pub struct Game {
     remaining_infotrons: u16,
     /// Red Disks currently held by Murphy.
     red_disks: u16,
-    /// One position-owned fuse, including while visible or covered by Murphy.
-    planted_red_disk: Option<PlantedRedDisk>,
     /// Current player-gravity toggle.
     gravity: bool,
     /// Current falling-Zonk freeze toggle.
@@ -416,7 +424,6 @@ impl Game {
             title: level.title().to_owned(),
             remaining_infotrons,
             red_disks: 0,
-            planted_red_disk: None,
             gravity: level.gravity(),
             freeze_zonks: level.freeze_zonks(),
             freeze_enemies: false,
@@ -623,7 +630,6 @@ impl Game {
             input,
             self.remaining_infotrons,
             self.red_disks,
-            self.planted_red_disk.map(|disk| disk.position),
             self.gravity,
             self.freeze_zonks,
             self.freeze_enemies,
@@ -657,31 +663,25 @@ impl Game {
                 self.red_disks = self.red_disks.saturating_add(1);
             }
             GameEvent::BeginPlantRedDisk(position) => {
-                // Countdown one is the cancellable, unspent placement state.
-                // The actor retains it only while Space remains held.
-                if self.red_disks > 0 && self.planted_red_disk.is_none() {
-                    self.planted_red_disk = Some(PlantedRedDisk {
-                        position,
-                        countdown: 1,
-                    });
+                // Countdown one is cancellable and remains in Murphy's cell.
+                if self.red_disks > 0 && self.board.planted_fuse().is_none() {
+                    self.board.set_planted_fuse(position, Some(1));
                 }
             }
             GameEvent::CancelPlantRedDisk => {
-                // A completed fuse can no longer be cancelled by player input.
-                if self
-                    .planted_red_disk
-                    .is_some_and(|disk| disk.countdown <= 1)
+                if let Some((position, countdown)) = self.board.planted_fuse()
+                    && countdown <= 1
                 {
-                    self.planted_red_disk = None;
+                    self.board.set_planted_fuse(position, None);
                 }
             }
             GameEvent::FinishPlantRedDisk => {
-                if let Some(disk) = self.planted_red_disk.as_mut()
-                    && disk.countdown <= 1
+                if let Some((position, countdown)) = self.board.planted_fuse()
+                    && countdown <= 1
                     && self.red_disks > 0
                 {
                     self.red_disks -= 1;
-                    disk.countdown = 2;
+                    self.board.set_planted_fuse(position, Some(2));
                     self.pending_sound_effects.push(SoundEffect::Push);
                 }
             }
@@ -803,47 +803,32 @@ impl Game {
         }
     }
 
-    /// Advances the position-owned fuse and reflects its visible/concealed state.
+    /// Advances the one cell-owned fuse beneath either Murphy or a visible disk.
     fn advance_planted_red_disk(&mut self) {
-        let Some(mut planted) = self.planted_red_disk.take() else {
+        let Some((position, countdown)) = self.board.planted_fuse() else {
             return;
         };
-        // Values zero and one are the unplanted/arming states. A completely
-        // placed disk starts at two and increments once per gameplay iteration.
-        if planted.countdown <= 1 {
-            self.planted_red_disk = Some(planted);
+        if countdown <= 1 {
             return;
         }
-        planted.countdown = planted.countdown.saturating_add(1);
-
-        // The concealed fuse keeps running under Murphy. Reaching 0x28 detonates
-        // the stored position regardless of which actor currently covers it.
-        if planted.countdown >= RED_DISK_DETONATION_COUNTDOWN {
-            self.detonate_position(planted.position);
+        let next = countdown.saturating_add(1);
+        if next >= RED_DISK_DETONATION_COUNTDOWN {
+            self.detonate_position(position);
+            self.board.set_planted_fuse(position, None);
             return;
         }
-
-        let Some(state) = self.board.state(planted.position) else {
-            return;
-        };
-        match state.actor() {
-            Actor::Murphy(_) => self.planted_red_disk = Some(planted),
-            Actor::Empty(Empty::Reserved(Reservation::Vacating { .. })) => {
-                // Murphy's just-vacated source remains collision-reserved until
-                // his movement finishes, so the concealed fuse stays hidden.
-                self.planted_red_disk = Some(planted);
+        let actor = self.board.state(position).unwrap().actor();
+        match actor {
+            Actor::Murphy(_) | Actor::Empty(Empty::Reserved(Reservation::Vacating { .. })) => {
+                self.board.set_planted_fuse(position, Some(next));
             }
-            Actor::Empty(Empty::Space) | Actor::RedDisk(RedDisk::Planted(_)) => {
-                // A visible State exposes the current animation frame, while
-                // this retained record lets Murphy cross without losing time.
-                let state = State::planted_red_disk(planted.countdown);
+            Actor::Empty(Empty::Space) | Actor::RedDisk(RedDisk::Planted) => {
                 self.board
-                    .set(planted.position, state)
-                    .expect("stored planted-disk position must remain in bounds");
-                self.planted_red_disk = Some(planted);
+                    .set(position, State::planted_red_disk(next))
+                    .expect("planted fuse cell remains in bounds");
             }
-            // Another actor or blast already consumed the concealed disk.
-            _ => {}
+            // An unrelated actor or blast has consumed this cell's fuse.
+            _ => self.board.set_planted_fuse(position, None),
         }
     }
 
@@ -895,7 +880,6 @@ impl Game {
             Input::default(),
             self.remaining_infotrons,
             self.red_disks,
-            self.planted_red_disk.map(|disk| disk.position),
             self.gravity,
             self.freeze_zonks,
             self.freeze_enemies,
@@ -949,8 +933,6 @@ pub(crate) struct WorldView<'board> {
     remaining_infotrons: u16,
     /// Red Disk inventory after all earlier events in this linear step.
     red_disks: u16,
-    /// Position owning the single concealed or visible planted Red Disk fuse.
-    active_red_disk_position: Option<Position>,
     /// Current player-gravity toggle after earlier events in this tick.
     gravity: bool,
     /// Current Zonk-freeze toggle after earlier events in this tick.
@@ -971,7 +953,6 @@ impl<'board> WorldView<'board> {
         input: Input,
         remaining_infotrons: u16,
         red_disks: u16,
-        active_red_disk_position: Option<Position>,
         gravity: bool,
         freeze_zonks: bool,
         freeze_enemies: bool,
@@ -983,7 +964,6 @@ impl<'board> WorldView<'board> {
             input,
             remaining_infotrons,
             red_disks,
-            active_red_disk_position,
             gravity,
             freeze_zonks,
             freeze_enemies,
@@ -1014,12 +994,14 @@ impl<'board> WorldView<'board> {
 
     /// Reports whether the level already has its one permitted planted fuse.
     pub(crate) fn has_active_red_disk(&self) -> bool {
-        self.active_red_disk_position.is_some()
+        self.board.planted_fuse().is_some()
     }
 
     /// Reports whether one cell owns the active fuse and may conceal it again.
     pub(crate) fn is_active_red_disk(&self, position: Position) -> bool {
-        self.active_red_disk_position == Some(position)
+        self.board
+            .state(position)
+            .is_some_and(|state| state.planted_fuse().is_some())
     }
 
     /// Returns whether Murphy gravity is currently enabled.
@@ -1169,7 +1151,7 @@ mod tests {
     }
     use snapshots::SnapshotExt;
 
-    use super::{Board, Game, GameStatus, Input, PlantedRedDisk, SoundEffect};
+    use super::{Board, Game, GameStatus, Input, SoundEffect};
     use crate::actors::{
         Actor, Base, Bug, CHAIN_REACTION_FRAMES, Direction, Electron, Empty, EnemyTurn, Exit,
         Explosion, ExplosionResidue, Hardware, Infotron, InvisibleWall, Murphy, MurphyAnimation,
@@ -1207,7 +1189,6 @@ mod tests {
             title: "TEST".to_owned(),
             remaining_infotrons: required_infotrons,
             red_disks: 0,
-            planted_red_disk: None,
             gravity: false,
             freeze_zonks: false,
             freeze_enemies: false,
@@ -1220,6 +1201,35 @@ mod tests {
             explosion_started: false,
             quit_countdown: 0,
             pending_sound_effects: Vec::new(),
+        }
+    }
+
+    /// Electron residue waits one more quarter callback after its last picture.
+    #[test]
+    fn infotron_explosion_retains_final_picture_before_residue() {
+        use crate::actors::{Explosion, ExplosionResidue};
+        let position = Position::new(3, 2);
+        let mut game = game_with(
+            &[
+                (
+                    Position::new(2, 2),
+                    State::new(Actor::Murphy(Murphy::new())),
+                ),
+                (
+                    position,
+                    State::new(Actor::Explosion(Explosion::new(ExplosionResidue::Infotron))),
+                ),
+            ],
+            0,
+        );
+        for tick in 1..=33 {
+            game.tick(Input::default());
+            let actor = game.board().state(position).unwrap().actor();
+            if tick <= 32 {
+                assert!(matches!(actor, Actor::Explosion(_)), "tick {tick}");
+            } else {
+                assert!(matches!(actor, Actor::Infotron(_)), "tick {tick}");
+            }
         }
     }
 
@@ -2958,7 +2968,7 @@ mod tests {
         }
         assert_eq!(game.red_disks(), 1);
         assert_eq!(
-            game.planted_red_disk.map(|disk| disk.position),
+            game.board.planted_fuse().map(|(position, _)| position),
             Some(origin)
         );
         assert!(matches!(actor_at(&game, 3, 2), Actor::Empty(_)));
@@ -2990,7 +3000,7 @@ mod tests {
         assert!(matches!(planted.actor(), Actor::RedDisk(_)));
         assert_eq!(planted.snapshot().label(), "RedDiskFuse");
         assert_eq!(
-            game.planted_red_disk.map(|disk| disk.position),
+            game.board.planted_fuse().map(|(position, _)| position),
             Some(origin)
         );
 
@@ -3001,7 +3011,7 @@ mod tests {
             ..Input::default()
         });
         assert_eq!(game.red_disks(), 1);
-        assert!(game.planted_red_disk.is_some());
+        assert!(game.board.planted_fuse().is_some());
 
         // Crossing the visible disk conceals it without collecting it or
         // cancelling the timer stored independently of board occupancy.
@@ -3026,7 +3036,7 @@ mod tests {
             )
         );
         assert_eq!(game.red_disks(), 1);
-        assert!(game.planted_red_disk.is_some());
+        assert!(game.board.planted_fuse().is_some());
     }
 
     /// Confirms releasing Space cancels planting without spending inventory.
@@ -3042,11 +3052,14 @@ mod tests {
             ..Input::default()
         });
         assert_eq!(game.red_disks(), 1);
-        assert_eq!(game.planted_red_disk.map(|disk| disk.countdown), Some(1));
+        assert_eq!(
+            game.board.planted_fuse().map(|(_, countdown)| countdown),
+            Some(1)
+        );
 
         game.tick(Input::default());
         assert_eq!(game.red_disks(), 1);
-        assert!(game.planted_red_disk.is_none());
+        assert!(game.board.planted_fuse().is_none());
         assert_eq!(
             game.board()
                 .state(origin)
@@ -3415,17 +3428,12 @@ mod tests {
             ],
             0,
         );
-        game.planted_red_disk = Some(PlantedRedDisk {
-            position: disk_position,
-            countdown: 5,
-        });
-
         for _ in 0..10 {
             game.tick(Input::default());
         }
 
         assert!(matches!(actor_at(&game, 3, 3), Actor::Explosion(_)));
-        assert!(game.planted_red_disk.is_none());
+        assert!(game.board.planted_fuse().is_none());
     }
 
     /// Confirms an Electron crushed at the seed leaves Infotron residue.
@@ -3536,25 +3544,15 @@ mod tests {
             ],
             0,
         );
-        game.planted_red_disk = Some(PlantedRedDisk {
-            position: disk_position,
-            countdown: 2,
-        });
-
         // Thirty-seven updates leave countdown 39 and the disk intact.
         for _ in 0..37 {
             game.tick(Input::default());
         }
         assert!(matches!(actor_at(&game, 3, 2), Actor::RedDisk(_)));
-        assert_eq!(
-            game.planted_red_disk
-                .expect("fuse should remain active before value forty")
-                .countdown,
-            39
-        );
+        assert_eq!(game.board.planted_fuse().unwrap().1, 39);
 
         game.tick(Input::default());
-        assert!(game.planted_red_disk.is_none());
+        assert!(game.board.planted_fuse().is_none());
         assert!(matches!(actor_at(&game, 3, 2), Actor::Explosion(_)));
     }
 

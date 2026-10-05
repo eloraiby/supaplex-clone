@@ -6,11 +6,11 @@
 
 use super::cell::{Sprite as Blit, actor_sprites, cell_sprites, fixed_tile, murphy_sprites};
 use super::{
-    BlackPixelPolicy, Camera, DecodedPng, MOVING_SCALE, RenderError, apply_black_pixel_policy,
-    decode_sized_png, terminal_source_row, upload_texture,
+    BlackPixelPolicy, Camera, DecodedPng, MOVING_SCALE, RenderError, SourcePoint, SpritePart,
+    apply_black_pixel_policy, decode_sized_png, terminal_source_row, upload_texture,
 };
 use crate::{
-    actors::{Actor, Position},
+    actors::{Actor, Direction, Position, rounded::RoundedPhase},
     assets::{FIXED_GRAPHICS_PATH, MOVING_GRAPHICS_PATH},
     game::{Board, Game},
     platform::{
@@ -20,7 +20,7 @@ use crate::{
     },
 };
 
-/// Two reusable cell-state buffers, swapped only after a complete simulation frame.
+/// Two reusable cell-state buffers, swapped after each complete frame.
 struct CellFrames {
     /// Tick of the previously rendered state, including immediate commands between ticks.
     tick: u64,
@@ -139,7 +139,7 @@ impl LevelBitmap {
         Ok(())
     }
 
-    /// Renders one previous/current cell pair and then swaps the reusable buffers.
+    /// Resolves old and new cells in Murphy-first, row-major drawing order.
     fn update(&mut self, game: &Game) {
         let mut frames = self
             .frames
@@ -150,8 +150,6 @@ impl LevelBitmap {
             return;
         }
         frames.current.copy_from(game.board());
-        // Murphy's callback precedes the row-major actor pass. Completion uses
-        // the old cell/action; movement can use the new destination cell.
         if let Some((position, sprites)) = murphy_sprites(&frames.previous, &frames.current) {
             for sprite in sprites.iter() {
                 self.copy(position, sprite);
@@ -159,9 +157,6 @@ impl LevelBitmap {
         }
         for index in 0..frames.current.cells().len() {
             let position = frames.current.position(index).unwrap();
-            // Immediate commands can replace cells without a simulation update.
-            // Only their changed cells need resolution; unrelated actors must
-            // keep the picture already displayed for this tick.
             if frames.tick == game.tick_count()
                 && frames.previous.state(position) == frames.current.state(position)
             {
@@ -177,10 +172,80 @@ impl LevelBitmap {
             {
                 self.copy(position, sprite);
             }
+            let before = frames.previous.state(position).unwrap().actor();
+            let after = frames.current.state(position).unwrap().actor();
+            if matches!(after, Actor::Explosion(_)) {
+                let phase = match before {
+                    Actor::Zonk(actor) => Some(actor.phase()),
+                    Actor::Infotron(actor) => Some(actor.phase()),
+                    _ => None,
+                };
+                if let Some(phase) = phase {
+                    self.clear_rounded_footprint(&frames.current, position, phase);
+                }
+            }
+        }
+        // The independent fuse draws after the actor pass. Its cell state is
+        // present in both board snapshots, even when Murphy covers the disk.
+        if frames.tick != game.tick_count() {
+            for index in 0..frames.current.cells().len() {
+                let before = frames.previous.cells()[index].planted_fuse();
+                let after = frames.current.cells()[index].planted_fuse();
+                if after.is_some_and(|countdown| countdown >= 2)
+                    || (before.is_some_and(|countdown| countdown >= 2) && after.is_none())
+                {
+                    self.copy(
+                        frames.current.position(index).unwrap(),
+                        Blit::Moving(SpritePart {
+                            source: SourcePoint { x: 256, y: 164 },
+                            width: 16,
+                            height: 16,
+                            offset_x: 0,
+                            offset_y: 0,
+                        }),
+                    );
+                }
+            }
         }
         frames.tick = game.tick_count();
         std::mem::swap(&mut frames.previous, &mut frames.current);
         self.frames = Some(frames);
+    }
+
+    /// The original detonation helper erases a rounded actor's neighboring strip.
+    fn clear_rounded_footprint(&mut self, board: &Board, position: Position, phase: RoundedPhase) {
+        let directions: &[Direction] = match phase {
+            RoundedPhase::Falling(_) => &[Direction::Up],
+            RoundedPhase::Momentum => &[Direction::Up, Direction::Down],
+            RoundedPhase::Rolling { direction, .. } => match direction {
+                crate::actors::Horizontal::Left => &[Direction::Right, Direction::Down],
+                crate::actors::Horizontal::Right => &[Direction::Left, Direction::Down],
+            },
+            RoundedPhase::PreparingRoll { direction, .. } => match direction {
+                crate::actors::Horizontal::Left => &[Direction::Left],
+                crate::actors::Horizontal::Right => &[Direction::Right],
+            },
+            _ => &[],
+        };
+        for &direction in directions {
+            let neighbor = match direction {
+                Direction::Up => position
+                    .y
+                    .checked_sub(1)
+                    .map(|y| Position::new(position.x, y)),
+                Direction::Down => Some(Position::new(position.x, position.y + 1)),
+                Direction::Left => position
+                    .x
+                    .checked_sub(1)
+                    .map(|x| Position::new(x, position.y)),
+                Direction::Right => Some(Position::new(position.x + 1, position.y)),
+            };
+            if let Some(neighbor) = neighbor.filter(|&cell| board.index(cell).is_some())
+                && !matches!(board.state(neighbor).unwrap().actor(), Actor::Explosion(_))
+            {
+                self.copy(neighbor, fixed_tile(0));
+            }
+        }
     }
 
     /// Copies one full opaque rectangle, clipped only at the level's outer edge.

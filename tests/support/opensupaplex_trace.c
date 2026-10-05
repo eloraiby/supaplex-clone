@@ -21,6 +21,11 @@ int main(int argc, char **argv)
     int snap = strcmp(mode, "snap") == 0;
     int walk = strcmp(mode, "walk") == 0;
     int push = strcmp(mode, "push") == 0;
+    int blast = strcmp(mode, "blast") == 0;
+    int orange = strcmp(mode, "orange") == 0;
+    int bug = strcmp(mode, "bug") == 0;
+    int snik = strcmp(mode, "snik") == 0;
+    int electron = strcmp(mode, "electron") == 0;
     int left = direction == UserInputLeft;
     int source, target;
 
@@ -29,7 +34,34 @@ int main(int argc, char **argv)
         gCurrentLevelState[i].tile = LevelTileTypeHardware;
         gCurrentLevelState[i].state = 0;
     }
-    if (snap || walk) {
+    if (snik || electron) {
+        source = 2 * 60 + 2;
+        target = 4 * 60 + 4;
+        gCurrentLevelState[target].tile = snik ? LevelTileTypeSnikSnak : LevelTileTypeElectron;
+        gCurrentLevelState[target].state = 1;
+        gCurrentLevelState[target - 60].tile = LevelTileTypeSpace;
+        gCurrentLevelState[target - 1].tile = LevelTileTypeSpace;
+    } else if (bug) {
+        source = 2 * 60 + 2;
+        target = 2 * 60 + 4;
+        gCurrentLevelState[target].tile = LevelTileTypeBug;
+    } else if (orange) {
+        for (int y = 1; y < 9; ++y)
+            for (int x = 2; x < 7; ++x)
+                gCurrentLevelState[y * 60 + x].tile = LevelTileTypeSpace;
+        source = 2 * 60 + 2;
+        target = 2 * 60 + 4;
+        gCurrentLevelState[target].tile = LevelTileTypeOrangeDisk;
+        gCurrentLevelState[6 * 60 + 4].tile = LevelTileTypeHardware;
+    } else if (blast) {
+        for (int y = 1; y < 8; ++y)
+            for (int x = 2; x < 7; ++x)
+                gCurrentLevelState[y * 60 + x].tile = LevelTileTypeSpace;
+        source = 4 * 60 + 4;
+        target = 2 * 60 + 4;
+        gCurrentLevelState[target].tile = LevelTileTypeZonk;
+        gCurrentLevelState[5 * 60 + 4].tile = LevelTileTypeHardware;
+    } else if (snap || walk) {
         source = 3 * 60 + 4;
         target = source + offsets[direction];
         gCurrentLevelState[target].tile = tile;
@@ -55,13 +87,18 @@ int main(int argc, char **argv)
     gMurphyPositionY = gMurphyTileY * 16;
 
     /* Reversals revisit the eaten cell while the rounded actor keeps updating. */
-    int ticks = snap ? 8 : walk ? 24 : push ? 48 : 40;
+    int ticks = snap ? 8 : walk ? 24 : push ? 48 : blast ? 48 : orange ? 65 : bug ? 60 : snik || electron ? 48 : 40;
     for (referenceTick = 1; referenceTick <= ticks; ++referenceTick) {
         int reverse = walk ? referenceTick > 8 && referenceTick <= 16
                            : !snap && !push && referenceTick > 16 && referenceTick <= 24;
-        gCurrentUserInput = snap ? direction + 4 : reverse ? opposite[direction] : direction;
+        gCurrentUserInput = (blast || orange || bug || snik || electron) ? 0 : snap ? direction + 4 : reverse ? opposite[direction] : direction;
         updateMovingObjects();
-        if (snap) {
+        if (blast || orange || bug || snik || electron) {
+            updatePlantedRedDisk();
+            updateExplosionTimers();
+            printf("STATE %d\n", referenceTick);
+            gFrameCounter++;
+        } else if (snap) {
             printf("STATE %d %u %u\n", referenceTick,
                    gCurrentLevelState[target].tile, gNumberOfRemainingInfotrons);
         } else if (walk) {

@@ -12,7 +12,7 @@ use super::{
 use crate::{
     actors::{
         Actor, Bug, Direction, Empty, Frame, Murphy, MurphyAnimation, Position, empty::Reservation,
-        murphy::MurphyPhase, orange_disk::OrangePhase, rounded::RoundedPhase,
+        enemy::EnemyPhase, murphy::MurphyPhase, orange_disk::OrangePhase, rounded::RoundedPhase,
     },
     game::Board,
 };
@@ -121,7 +121,11 @@ pub(super) fn actor_sprites(actor: &Actor) -> Sprites {
         Actor::Murphy(actor) => return player_sprite(actor),
         Actor::SnikSnak(a) => Some(snik_snak_sprite_part(a.phase())),
         Actor::Electron(a) => Some(electron_sprite_part(a.phase())),
-        Actor::Explosion(a) => Some(explosion_sprite_part(a.residue(), a.frame())),
+        Actor::Explosion(a) => {
+            return a.next_picture().map_or(Sprites::None, |frame| {
+                Sprites::One(Sprite::Moving(explosion_sprite_part(a.residue(), frame)))
+            });
+        }
         Actor::Bug(Bug::Active(f)) => Some(bug_sprite_part(*f)),
         Actor::Bug(Bug::Dormant(_)) => return Sprites::One(fixed_tile(2)),
         Actor::Terminal(a) => {
@@ -223,6 +227,15 @@ fn rounded(actor: &Actor) -> Option<RoundedPhase> {
     }
 }
 
+/// Reads either enemy's turn or movement state at its old callback cell.
+fn enemy_phase(actor: &Actor) -> Option<EnemyPhase> {
+    match actor {
+        Actor::SnikSnak(a) => Some(a.phase()),
+        Actor::Electron(a) => Some(a.phase()),
+        _ => None,
+    }
+}
+
 /// Resolves a rounded picture with the concrete actor's original atlas coordinates.
 fn rounded_sprite(actor: &Actor, phase: RoundedPhase) -> Sprites {
     let part = match actor {
@@ -287,13 +300,34 @@ pub(super) fn cell_sprites(
     if matches!(after, Actor::Murphy(_)) {
         return Sprites::None;
     }
-    // An explosion owns its cell even when an earlier actor occupied it at frame
-    // start. Its current bounded phase supplies the complete replacement sprite.
-    if matches!(after, Actor::Explosion(_)) {
+    // Explosion pictures are copied by the explosion callback, not when the
+    // blast first replaces a cell. Its regular last picture precedes Space.
+    if matches!(before, Actor::Explosion(_)) {
         return if before == after {
             Sprites::None
         } else {
-            actor_sprites(after)
+            actor_sprites(before)
+        };
+    }
+    // The Orange Disk owns its source through the last falling picture. The
+    // destination's post-update phase cannot identify that picture.
+    if let Actor::OrangeDisk(disk) = before
+        && let OrangePhase::Falling(frame) = disk.phase()
+    {
+        return Sprites::One(Sprite::Moving(orange_sprite_part(frame)));
+    }
+    if let Some(phase) = enemy_phase(before) {
+        return match phase {
+            EnemyPhase::Turning { .. } => {
+                if matches!(enemy_phase(after), Some(EnemyPhase::Turning { .. })) && before != after
+                {
+                    actor_sprites(before)
+                } else {
+                    Sprites::None
+                }
+            }
+            EnemyPhase::Moving { .. } if before != after => actor_sprites(before),
+            EnemyPhase::Moving { .. } => Sprites::None,
         };
     }
     if let Some(phase) = rounded(before) {
@@ -317,37 +351,10 @@ pub(super) fn cell_sprites(
             _ => {}
         }
     }
-    // Enemy and Orange Disk transfers are evaluated at the source's row-major
-    // slot. Their new destination must not contribute a duplicate sprite later.
-    if matches!(
-        after,
-        Actor::Empty(Empty::Reserved(_)) | Actor::Empty(Empty::Space)
-    ) {
-        let transfer = match (before, after) {
-            (Actor::SnikSnak(_), Actor::Empty(Empty::Reserved(Reservation::SnikSnakSource(d)))) => {
-                Some(*d)
-            }
-            (Actor::Electron(_), Actor::Empty(Empty::Reserved(Reservation::ElectronSource(d)))) => {
-                Some(*d)
-            }
-            (Actor::OrangeDisk(a), _) if matches!(a.phase(), OrangePhase::Falling(_)) => {
-                Some(Direction::Down)
-            }
-            _ => None,
-        };
-        if let Some(direction) = transfer
-            && let Some(destination) = neighbor(current, position, direction)
-        {
-            let actor = current.state(destination).unwrap().actor();
-            if matches!(
-                (before, actor),
-                (Actor::SnikSnak(_), Actor::SnikSnak(_))
-                    | (Actor::Electron(_), Actor::Electron(_))
-                    | (Actor::OrangeDisk(_), Actor::OrangeDisk(_))
-            ) {
-                return actor_sprites(actor).translated(direction);
-            }
-        }
+    // Installation of explosion cells changes collision state immediately;
+    // their first opaque picture waits for a later quarter-rate callback.
+    if matches!(after, Actor::Explosion(_)) {
+        return Sprites::None;
     }
     match (before, after) {
         (_, Actor::Empty(Empty::Reserved(_))) => Sprites::None,
@@ -358,7 +365,6 @@ pub(super) fn cell_sprites(
                 Sprites::None
             }
         }
-        (Actor::Explosion(_), Actor::Empty(Empty::Space)) => Sprites::One(fixed_tile(0)),
         (_, Actor::Empty(Empty::Space)) => Sprites::None,
         (_, Actor::Zonk(_) | Actor::Infotron(_)) => match rounded(after).unwrap() {
             RoundedPhase::PreparingRoll { direction, frame } if frame.index() == 1 => {
@@ -370,29 +376,18 @@ pub(super) fn cell_sprites(
                     },
                 )
             }
-            RoundedPhase::Resting if matches!(before, Actor::Explosion(_)) => actor_sprites(after),
             _ => Sprites::None,
         },
+        // At the active-cycle boundary the original only installs a safe
+        // countdown; its last Bug picture remains in the level bitmap.
+        (Actor::Bug(Bug::Active(_)), Actor::Bug(Bug::Dormant(_))) => Sprites::None,
         (Actor::Bug(Bug::Dormant(_)), Actor::Bug(Bug::Dormant(_) | Bug::Held)) => Sprites::None,
         (_, actor) if actor.is_held() => Sprites::None,
         (Actor::Terminal(a), Actor::Terminal(b)) if a.screen_frame() == b.screen_frame() => {
             Sprites::None
         }
-        (Actor::SnikSnak(_), Actor::SnikSnak(_)) | (Actor::Electron(_), Actor::Electron(_)) => {
-            if before == after {
-                Sprites::None
-            } else {
-                actor_sprites(after)
-            }
-        }
         (_, Actor::SnikSnak(_) | Actor::Electron(_)) => Sprites::None,
-        (_, Actor::OrangeDisk(_)) if !matches!(before, Actor::OrangeDisk(_)) => Sprites::None,
-        (Actor::OrangeDisk(a), Actor::OrangeDisk(b))
-            if !matches!(a.phase(), OrangePhase::Falling(_))
-                && !matches!(b.phase(), OrangePhase::Falling(_)) =>
-        {
-            Sprites::None
-        }
+        (_, Actor::OrangeDisk(_)) => Sprites::None,
         _ if before == after => Sprites::None,
         _ => actor_sprites(after),
     }

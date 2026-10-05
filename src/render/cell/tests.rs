@@ -120,11 +120,11 @@ fn cell_pairs_distinguish_normal_source_release_from_destroyed_ownership() {
         cell_sprites(&previous, &destroyed, source, false),
         Sprites::One(fixed_tile(0))
     );
-    // When both cells are inside the wave, the source belongs to its explosion.
+    // A newly installed blast waits for its first explosion callback to draw.
     let covered = board(&[(source, blast.clone()), (destination, blast.clone())]);
     assert_eq!(
         cell_sprites(&previous, &covered, source, false),
-        actor_sprites(&blast)
+        Sprites::None
     );
 }
 
@@ -148,7 +148,7 @@ fn orange_transfer_contributes_once_whether_it_continues_or_lands() {
         let current = board(&[(destination, disk.clone())]);
         assert_eq!(
             cell_sprites(&previous, &current, source, false),
-            actor_sprites(&disk).translated(Direction::Down)
+            Sprites::One(Sprite::Moving(orange_sprite_part(Frame::last())))
         );
         assert_eq!(
             cell_sprites(&previous, &current, destination, false),
